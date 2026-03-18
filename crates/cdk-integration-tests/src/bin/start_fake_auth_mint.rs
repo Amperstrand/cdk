@@ -60,6 +60,7 @@ async fn start_fake_auth_mint(
         reserve_fee_min: cdk::Amount::from(1),
         min_delay_time: 1,
         max_delay_time: 3,
+        manual_approval_incoming: false,
     };
 
     let mut settings = shared::create_fake_wallet_settings(

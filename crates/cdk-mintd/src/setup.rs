@@ -202,10 +202,7 @@ impl LnBackendSetup for config::FakeWallet {
             delay_time,
             unit,
         )
-        .with_manual_approval_incoming(self.manual_approval_incoming)
-        .with_manual_approval_outgoing(self.manual_approval_outgoing)
-        .with_accept_arbitrary_melt_requests(self.accept_arbitrary_melt_requests)
-        .with_arbitrary_melt_fee_sat(self.arbitrary_melt_fee_sat);
+        .with_manual_approval_incoming(self.manual_approval_incoming);
 
         Ok(fake_wallet)
     }

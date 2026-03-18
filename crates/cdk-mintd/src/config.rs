@@ -415,12 +415,6 @@ pub struct FakeWallet {
     pub max_delay_time: u64,
     #[serde(default)]
     pub manual_approval_incoming: bool,
-    #[serde(default)]
-    pub manual_approval_outgoing: bool,
-    #[serde(default)]
-    pub accept_arbitrary_melt_requests: bool,
-    #[serde(default = "default_arbitrary_melt_fee")]
-    pub arbitrary_melt_fee_sat: u64,
 }
 
 #[cfg(feature = "fakewallet")]
@@ -433,9 +427,6 @@ impl Default for FakeWallet {
             min_delay_time: 1,
             max_delay_time: 3,
             manual_approval_incoming: false,
-            manual_approval_outgoing: false,
-            accept_arbitrary_melt_requests: false,
-            arbitrary_melt_fee_sat: default_arbitrary_melt_fee(),
         }
     }
 }
@@ -460,11 +451,6 @@ fn default_min_delay_time() -> u64 {
 #[cfg(feature = "fakewallet")]
 fn default_max_delay_time() -> u64 {
     3
-}
-
-#[cfg(feature = "fakewallet")]
-fn default_arbitrary_melt_fee() -> u64 {
-    1
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -1070,15 +1056,6 @@ max_melt = 500000
             crate::env_vars::ENV_FAKE_WALLET_MANUAL_APPROVAL_INCOMING,
             "true",
         );
-        env::set_var(
-            crate::env_vars::ENV_FAKE_WALLET_MANUAL_APPROVAL_OUTGOING,
-            "true",
-        );
-        env::set_var(
-            crate::env_vars::ENV_FAKE_WALLET_ACCEPT_ARBITRARY_MELT,
-            "true",
-        );
-        env::set_var(crate::env_vars::ENV_FAKE_WALLET_ARBITRARY_MELT_FEE, "7");
 
         // Load settings and apply environment variables (same as production code)
         let mut settings = Settings::new(Some(&config_path));
@@ -1093,9 +1070,6 @@ max_melt = 500000
         assert_eq!(fakewallet_config.min_delay_time, 0);
         assert_eq!(fakewallet_config.max_delay_time, 5);
         assert!(fakewallet_config.manual_approval_incoming);
-        assert!(fakewallet_config.manual_approval_outgoing);
-        assert!(fakewallet_config.accept_arbitrary_melt_requests);
-        assert_eq!(fakewallet_config.arbitrary_melt_fee_sat, 7);
 
         // Cleanup env vars
         env::remove_var(crate::env_vars::ENV_LN_BACKEND);
@@ -1105,9 +1079,6 @@ max_melt = 500000
         env::remove_var(crate::env_vars::ENV_FAKE_WALLET_MIN_DELAY);
         env::remove_var(crate::env_vars::ENV_FAKE_WALLET_MAX_DELAY);
         env::remove_var(crate::env_vars::ENV_FAKE_WALLET_MANUAL_APPROVAL_INCOMING);
-        env::remove_var(crate::env_vars::ENV_FAKE_WALLET_MANUAL_APPROVAL_OUTGOING);
-        env::remove_var(crate::env_vars::ENV_FAKE_WALLET_ACCEPT_ARBITRARY_MELT);
-        env::remove_var(crate::env_vars::ENV_FAKE_WALLET_ARBITRARY_MELT_FEE);
 
         // Cleanup test file
         let _ = fs::remove_dir_all(&temp_dir);

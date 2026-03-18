@@ -57,19 +57,6 @@ struct PendingIncomingPayment {
     is_any_amount: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-/// In-memory state for custom non-BOLT melt requests.
-pub struct ArbitraryPayment {
-    /// Original custom request payload.
-    pub request: String,
-    /// Parsed logical identifier extracted from the request payload.
-    pub identifier: String,
-    /// Requested amount in sats.
-    pub amount: u64,
-    /// Current payment state for the melt request.
-    pub status: MeltQuoteState,
-}
-
 /// Cache duration for exchange rate (5 minutes)
 const RATE_CACHE_DURATION: Duration = Duration::from_secs(300);
 
@@ -359,13 +346,7 @@ pub struct FakeWallet {
     wait_invoice_is_active: Arc<AtomicBool>,
     incoming_payments: Arc<RwLock<HashMap<PaymentIdentifier, Vec<WaitPaymentResponse>>>>,
     pending_incoming_payments: Arc<Mutex<HashMap<PaymentIdentifier, PendingIncomingPayment>>>,
-    manually_approved_incoming: Arc<Mutex<HashSet<PaymentIdentifier>>>,
-    pending_outgoing_approvals: Arc<Mutex<HashMap<String, Amount<CurrencyUnit>>>>,
-    arbitrary_payments: Arc<Mutex<HashMap<String, ArbitraryPayment>>>,
     manual_approval_incoming: bool,
-    manual_approval_outgoing: bool,
-    accept_arbitrary_melt_requests: bool,
-    arbitrary_melt_fee_sat: u64,
     unit: CurrencyUnit,
     secondary_repayment_queue: SecondaryRepaymentQueue,
     exchange_rate_cache: ExchangeRateCache,
@@ -416,13 +397,7 @@ impl FakeWallet {
             wait_invoice_is_active: Arc::new(AtomicBool::new(false)),
             incoming_payments,
             pending_incoming_payments: Arc::new(Mutex::new(HashMap::new())),
-            manually_approved_incoming: Arc::new(Mutex::new(HashSet::new())),
-            pending_outgoing_approvals: Arc::new(Mutex::new(HashMap::new())),
-            arbitrary_payments: Arc::new(Mutex::new(HashMap::new())),
             manual_approval_incoming: false,
-            manual_approval_outgoing: false,
-            accept_arbitrary_melt_requests: false,
-            arbitrary_melt_fee_sat: 1,
             unit,
             secondary_repayment_queue,
             exchange_rate_cache: ExchangeRateCache::new(),
@@ -435,46 +410,6 @@ impl FakeWallet {
         self
     }
 
-    /// Enables or disables manual approval for outgoing payments.
-    pub fn with_manual_approval_outgoing(mut self, enabled: bool) -> Self {
-        self.manual_approval_outgoing = enabled;
-        self
-    }
-
-    /// Enables or disables support for arbitrary custom melt requests.
-    pub fn with_accept_arbitrary_melt_requests(mut self, enabled: bool) -> Self {
-        self.accept_arbitrary_melt_requests = enabled;
-        self
-    }
-
-    /// Sets additional fee in sats charged for arbitrary custom melts.
-    pub fn with_arbitrary_melt_fee_sat(mut self, fee_sat: u64) -> Self {
-        self.arbitrary_melt_fee_sat = fee_sat;
-        self
-    }
-
-    fn is_bolt11(request: &str) -> bool {
-        let lowered = request.to_lowercase();
-        lowered.starts_with("lnbc") || lowered.starts_with("lntb") || lowered.starts_with("lnbcrt")
-    }
-
-    fn parse_arbitrary_request(request: &str) -> (String, u64) {
-        if let Some(pos) = request.rfind(":AMOUNT:") {
-            let identifier = request[..pos].to_string();
-            let amount_str = &request[pos + 8..];
-
-            if let Ok(amount) = amount_str.parse::<u64>() {
-                return (identifier, amount);
-            }
-        }
-
-        (request.to_string(), 0)
-    }
-
-    fn checking_id_for_arbitrary(request: &str) -> String {
-        sha256::Hash::hash(request.as_bytes()).to_string()
-    }
-
     /// Marks a pending incoming payment as approved and emits the payment event.
     pub async fn approve_incoming_payment(&self, payment_identifier: &PaymentIdentifier) -> bool {
         let pending_payment = {
@@ -483,17 +418,18 @@ impl FakeWallet {
         };
 
         let Some(pending_payment) = pending_payment else {
+            tracing::warn!(
+                "approve_incoming_payment: payment not found in pending: {:?}",
+                payment_identifier
+            );
             return false;
         };
 
-        {
-            let mut approved = self.manually_approved_incoming.lock().await;
-            approved.insert(payment_identifier.clone());
-        }
+        let payment_amount = pending_payment.payment_amount;
 
         let response = WaitPaymentResponse {
             payment_identifier: payment_identifier.clone(),
-            payment_amount: pending_payment.payment_amount,
+            payment_amount: payment_amount.clone(),
             payment_id: payment_identifier.to_string(),
         };
 
@@ -511,53 +447,33 @@ impl FakeWallet {
                 .await;
         }
 
-        self.sender.send(response).await.is_ok()
-    }
-
-    /// Returns all incoming payments currently waiting for manual approval.
-    pub async fn get_pending_incoming_payments(&self) -> Vec<PaymentIdentifier> {
-        let pending = self.pending_incoming_payments.lock().await;
-        pending.keys().cloned().collect()
-    }
-
-    /// Marks a pending outgoing payment as paid.
-    pub async fn approve_outgoing_payment(&self, payment_identifier: &PaymentIdentifier) -> bool {
-        let payment_key = payment_identifier.to_string();
-
-        let approved_amount = {
-            let mut pending = self.pending_outgoing_approvals.lock().await;
-            pending.remove(&payment_key)
-        };
-
-        let Some(approved_amount) = approved_amount else {
+        if let Err(e) = self.sender.send(response).await {
+            tracing::error!(
+                "Failed to send approval event for {:?}: {}",
+                payment_identifier,
+                e
+            );
             return false;
-        };
+        }
 
-        let mut states = self.payment_states.lock().await;
-        states.insert(payment_key, (MeltQuoteState::Paid, approved_amount));
+        tracing::info!(
+            "Approved incoming payment: {:?}, amount: {:?}",
+            payment_identifier,
+            payment_amount
+        );
+
         true
     }
 
-    /// Returns custom arbitrary melt requests that are still unpaid.
-    pub async fn get_pending_arbitrary_payments(&self) -> Vec<(String, ArbitraryPayment)> {
-        let payments = self.arbitrary_payments.lock().await;
-        payments
+    /// Returns all incoming payments currently waiting for manual approval.
+    pub async fn get_pending_incoming_payments(
+        &self,
+    ) -> Vec<(PaymentIdentifier, Amount<CurrencyUnit>)> {
+        let pending = self.pending_incoming_payments.lock().await;
+        pending
             .iter()
-            .filter(|(_, payment)| payment.status == MeltQuoteState::Unpaid)
-            .map(|(checking_id, payment)| (checking_id.to_string(), payment.clone()))
+            .map(|(id, payment)| (id.clone(), payment.payment_amount.clone()))
             .collect()
-    }
-
-    /// Marks an arbitrary melt request as paid by checking id.
-    pub async fn approve_arbitrary_payment(&self, checking_id: &str) -> bool {
-        let mut payments = self.arbitrary_payments.lock().await;
-
-        if let Some(payment) = payments.get_mut(checking_id) {
-            payment.status = MeltQuoteState::Paid;
-            true
-        } else {
-            false
-        }
     }
 }
 
@@ -591,12 +507,6 @@ impl MintPayment for FakeWallet {
 
     #[instrument(skip_all)]
     async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
-        let custom = if self.accept_arbitrary_melt_requests {
-            HashMap::from([("arbitrary".to_string(), "enabled".to_string())])
-        } else {
-            HashMap::new()
-        };
-
         Ok(SettingsResponse {
             unit: self.unit.to_string(),
             bolt11: Some(payment::Bolt11Settings {
@@ -605,7 +515,7 @@ impl MintPayment for FakeWallet {
                 invoice_description: true,
             }),
             bolt12: Some(payment::Bolt12Settings { amountless: false }),
-            custom,
+            custom: HashMap::new(),
         })
     }
 
@@ -637,7 +547,7 @@ impl MintPayment for FakeWallet {
         unit: &CurrencyUnit,
         options: OutgoingPaymentOptions,
     ) -> Result<PaymentQuoteResponse, Self::Err> {
-        let (amount_msat, request_lookup_id, arbitrary_fee_sat) = match options {
+        let (amount_msat, request_lookup_id) = match options {
             OutgoingPaymentOptions::Bolt11(bolt11_options) => {
                 // If we have specific amount options, use those
                 let amount_msat: u64 = if let Some(melt_options) = bolt11_options.melt_options {
@@ -668,7 +578,7 @@ impl MintPayment for FakeWallet {
                 };
                 let payment_id =
                     PaymentIdentifier::PaymentHash(*bolt11_options.bolt11.payment_hash().as_ref());
-                (amount_msat, Some(payment_id), 0)
+                (amount_msat, Some(payment_id))
             }
             OutgoingPaymentOptions::Bolt12(bolt12_options) => {
                 let offer = bolt12_options.offer;
@@ -683,49 +593,10 @@ impl MintPayment for FakeWallet {
                         _ => return Err(Error::UnknownInvoiceAmount.into()),
                     }
                 };
-                (amount_msat, None, 0)
+                (amount_msat, None)
             }
-            OutgoingPaymentOptions::Custom(custom_options) => {
-                if !self.accept_arbitrary_melt_requests {
-                    return Err(cdk_common::payment::Error::UnsupportedPaymentOption);
-                }
-
-                let request_str = custom_options.request.as_str();
-                ensure_cdk!(
-                    !Self::is_bolt11(request_str),
-                    cdk_common::payment::Error::UnsupportedPaymentOption
-                );
-
-                let (identifier, parsed_amount_sat) = Self::parse_arbitrary_request(request_str);
-                let amount_msat: u64 = if let Some(melt_options) = custom_options.melt_options {
-                    melt_options.amount_msat().into()
-                } else {
-                    ensure_cdk!(parsed_amount_sat > 0, Error::UnknownInvoiceAmount.into());
-                    parsed_amount_sat
-                        .checked_mul(1000)
-                        .ok_or(Error::UnknownInvoiceAmount)?
-                };
-
-                ensure_cdk!(amount_msat % 1000 == 0, Error::UnknownInvoiceAmount.into());
-
-                let checking_id = Self::checking_id_for_arbitrary(request_str);
-                let amount_sat = amount_msat / 1000;
-
-                let mut payments = self.arbitrary_payments.lock().await;
-                payments
-                    .entry(checking_id.clone())
-                    .or_insert(ArbitraryPayment {
-                        request: request_str.to_string(),
-                        identifier,
-                        amount: amount_sat,
-                        status: MeltQuoteState::Unpaid,
-                    });
-
-                (
-                    amount_msat,
-                    Some(PaymentIdentifier::CustomId(checking_id)),
-                    self.arbitrary_melt_fee_sat,
-                )
+            OutgoingPaymentOptions::Custom(_) => {
+                return Err(cdk_common::payment::Error::UnsupportedPaymentOption);
             }
         };
 
@@ -742,18 +613,7 @@ impl MintPayment for FakeWallet {
 
         let absolute_fee_reserve: u64 = self.fee_reserve.min_fee_reserve.into();
 
-        let mut fee = max(relative_fee_reserve, absolute_fee_reserve);
-
-        if arbitrary_fee_sat > 0 {
-            let arbitrary_fee = convert_currency_amount(
-                arbitrary_fee_sat,
-                &CurrencyUnit::Sat,
-                unit,
-                &self.exchange_rate_cache,
-            )
-            .await?;
-            fee += arbitrary_fee.value();
-        }
+        let fee = max(relative_fee_reserve, absolute_fee_reserve);
 
         Ok(PaymentQuoteResponse {
             request_lookup_id,
@@ -781,30 +641,6 @@ impl MintPayment for FakeWallet {
                         .amount_milli_satoshis()
                         .ok_or(Error::UnknownInvoiceAmount)?
                 };
-
-                if self.manual_approval_outgoing {
-                    {
-                        let mut payment_states = self.payment_states.lock().await;
-                        payment_states.insert(
-                            payment_hash.clone(),
-                            (MeltQuoteState::Unpaid, Amount::new(0, CurrencyUnit::Msat)),
-                        );
-                    }
-
-                    {
-                        let mut pending = self.pending_outgoing_approvals.lock().await;
-                        pending.insert(payment_hash, Amount::new(amount_msat, CurrencyUnit::Msat));
-                    }
-
-                    return Ok(MakePaymentResponse {
-                        payment_lookup_id: PaymentIdentifier::PaymentHash(
-                            *bolt11.payment_hash().as_ref(),
-                        ),
-                        payment_proof: None,
-                        status: MeltQuoteState::Unpaid,
-                        total_spent: Amount::new(0, unit.clone()),
-                    });
-                }
 
                 let description = bolt11.description().to_string();
 
@@ -870,31 +706,6 @@ impl MintPayment for FakeWallet {
                     }
                 };
 
-                if self.manual_approval_outgoing {
-                    {
-                        let mut payment_states = self.payment_states.lock().await;
-                        payment_states.insert(
-                            payment_lookup_id.to_string(),
-                            (MeltQuoteState::Unpaid, Amount::new(0, CurrencyUnit::Msat)),
-                        );
-                    }
-
-                    {
-                        let mut pending = self.pending_outgoing_approvals.lock().await;
-                        pending.insert(
-                            payment_lookup_id.to_string(),
-                            Amount::new(amount_msat, CurrencyUnit::Msat),
-                        );
-                    }
-
-                    return Ok(MakePaymentResponse {
-                        payment_lookup_id,
-                        payment_proof: None,
-                        status: MeltQuoteState::Unpaid,
-                        total_spent: Amount::new(0, unit.clone()),
-                    });
-                }
-
                 let total_spent = convert_currency_amount(
                     amount_msat,
                     &CurrencyUnit::Msat,
@@ -910,83 +721,8 @@ impl MintPayment for FakeWallet {
                     total_spent: Amount::new(total_spent.value() + 1, unit.clone()),
                 })
             }
-            OutgoingPaymentOptions::Custom(custom_options) => {
-                if !self.accept_arbitrary_melt_requests {
-                    return Err(cdk_common::payment::Error::UnsupportedPaymentOption);
-                }
-
-                let request = custom_options.request;
-                ensure_cdk!(
-                    !Self::is_bolt11(request.as_str()),
-                    cdk_common::payment::Error::UnsupportedPaymentOption
-                );
-
-                let checking_id = Self::checking_id_for_arbitrary(request.as_str());
-
-                let (status, amount_sat) = {
-                    let mut payments = self.arbitrary_payments.lock().await;
-
-                    let amount_sat_from_request = Self::parse_arbitrary_request(request.as_str()).1;
-                    let amount_sat = if let Some(melt_options) = custom_options.melt_options {
-                        let amount_msat: u64 = melt_options.amount_msat().into();
-                        ensure_cdk!(amount_msat % 1000 == 0, Error::UnknownInvoiceAmount.into());
-                        amount_msat / 1000
-                    } else {
-                        amount_sat_from_request
-                    };
-
-                    ensure_cdk!(amount_sat > 0, Error::UnknownInvoiceAmount.into());
-
-                    let payment = payments
-                        .entry(checking_id.clone())
-                        .or_insert(ArbitraryPayment {
-                            request: request.clone(),
-                            identifier: Self::parse_arbitrary_request(request.as_str()).0,
-                            amount: amount_sat,
-                            status: MeltQuoteState::Unpaid,
-                        });
-
-                    payment.amount = amount_sat;
-
-                    if !self.manual_approval_outgoing {
-                        payment.status = MeltQuoteState::Paid;
-                    }
-
-                    (payment.status, payment.amount)
-                };
-
-                let amount_msat = amount_sat
-                    .checked_mul(1000)
-                    .ok_or(Error::UnknownInvoiceAmount)?;
-
-                let amount_in_unit = convert_currency_amount(
-                    amount_msat,
-                    &CurrencyUnit::Msat,
-                    unit,
-                    &self.exchange_rate_cache,
-                )
-                .await?;
-
-                let fee_in_unit = convert_currency_amount(
-                    self.arbitrary_melt_fee_sat,
-                    &CurrencyUnit::Sat,
-                    unit,
-                    &self.exchange_rate_cache,
-                )
-                .await?;
-
-                let total_spent = if status == MeltQuoteState::Paid {
-                    Amount::new(amount_in_unit.value() + fee_in_unit.value(), unit.clone())
-                } else {
-                    Amount::new(0, unit.clone())
-                };
-
-                Ok(MakePaymentResponse {
-                    payment_lookup_id: PaymentIdentifier::CustomId(checking_id),
-                    payment_proof: (status == MeltQuoteState::Paid).then(|| "".to_string()),
-                    status,
-                    total_spent,
-                })
+            OutgoingPaymentOptions::Custom(_) => {
+                Err(cdk_common::payment::Error::UnsupportedPaymentOption)
             }
         }
     }
@@ -1139,29 +875,6 @@ impl MintPayment for FakeWallet {
         &self,
         request_lookup_id: &PaymentIdentifier,
     ) -> Result<MakePaymentResponse, Self::Err> {
-        if let PaymentIdentifier::CustomId(checking_id) = request_lookup_id {
-            let payments = self.arbitrary_payments.lock().await;
-
-            if let Some(payment) = payments.get(checking_id) {
-                let total_spent = if payment.status == MeltQuoteState::Paid {
-                    payment
-                        .amount
-                        .checked_add(self.arbitrary_melt_fee_sat)
-                        .and_then(|value| value.checked_mul(1000))
-                        .ok_or(Error::UnknownInvoiceAmount)?
-                } else {
-                    0
-                };
-
-                return Ok(MakePaymentResponse {
-                    payment_lookup_id: request_lookup_id.clone(),
-                    payment_proof: (payment.status == MeltQuoteState::Paid).then(|| "".to_string()),
-                    status: payment.status,
-                    total_spent: Amount::new(total_spent, CurrencyUnit::Msat),
-                });
-            }
-        }
-
         // For fake wallet if the state is not explicitly set default to paid
         let states = self.payment_states.lock().await;
         let status = states.get(&request_lookup_id.to_string()).cloned();
@@ -1224,10 +937,7 @@ pub fn create_fake_invoice(amount_msat: u64, description: String) -> Bolt11Invoi
 mod tests {
     use super::*;
 
-    use cdk_common::payment::{
-        Bolt11IncomingPaymentOptions, Bolt11OutgoingPaymentOptions, CustomOutgoingPaymentOptions,
-        IncomingPaymentOptions, OutgoingPaymentOptions,
-    };
+    use cdk_common::payment::{Bolt11IncomingPaymentOptions, IncomingPaymentOptions};
 
     fn test_wallet() -> FakeWallet {
         FakeWallet::new(
@@ -1263,6 +973,9 @@ mod tests {
             .expect("status query should work");
         assert!(initial.is_empty());
 
+        let pending = wallet.get_pending_incoming_payments().await;
+        assert_eq!(pending.len(), 1);
+
         let approved = wallet
             .approve_incoming_payment(&created.request_lookup_id)
             .await;
@@ -1273,101 +986,25 @@ mod tests {
             .await
             .expect("status query should work after approval");
         assert_eq!(after_approval.len(), 1);
+        assert_eq!(after_approval[0].payment_amount.value(), 1234);
     }
 
     #[tokio::test]
-    async fn outgoing_manual_approval_keeps_payment_unpaid_until_approved() {
-        let wallet = test_wallet().with_manual_approval_outgoing(true);
-        let invoice = create_fake_invoice(5_000, "manual outgoing".to_string());
+    async fn auto_mode_does_not_require_approval() {
+        let wallet = test_wallet().with_manual_approval_incoming(false);
 
-        let payment_response = wallet
-            .make_payment(
-                &CurrencyUnit::Sat,
-                OutgoingPaymentOptions::Bolt11(Box::new(Bolt11OutgoingPaymentOptions {
-                    bolt11: invoice,
-                    max_fee_amount: None,
-                    timeout_secs: None,
-                    melt_options: None,
-                })),
-            )
+        let _created = wallet
+            .create_incoming_payment_request(IncomingPaymentOptions::Bolt11(
+                Bolt11IncomingPaymentOptions {
+                    description: Some("auto mode".to_string()),
+                    amount: Amount::new(5000, CurrencyUnit::Sat),
+                    unix_expiry: None,
+                },
+            ))
             .await
-            .expect("manual outgoing payment should be created");
+            .expect("incoming request should be created");
 
-        assert_eq!(payment_response.status, MeltQuoteState::Unpaid);
-
-        let status_before = wallet
-            .check_outgoing_payment(&payment_response.payment_lookup_id)
-            .await
-            .expect("check outgoing should work");
-        assert_eq!(status_before.status, MeltQuoteState::Unpaid);
-
-        let approved = wallet
-            .approve_outgoing_payment(&payment_response.payment_lookup_id)
-            .await;
-        assert!(approved);
-
-        let status_after = wallet
-            .check_outgoing_payment(&payment_response.payment_lookup_id)
-            .await
-            .expect("check outgoing should work after approval");
-        assert_eq!(status_after.status, MeltQuoteState::Paid);
-        assert!(status_after.total_spent.value() > 0);
-    }
-
-    #[tokio::test]
-    async fn arbitrary_request_flow_supports_pending_and_manual_approval() {
-        let wallet = test_wallet()
-            .with_accept_arbitrary_melt_requests(true)
-            .with_manual_approval_outgoing(true)
-            .with_arbitrary_melt_fee_sat(1);
-
-        let custom_options = CustomOutgoingPaymentOptions {
-            method: "vote".to_string(),
-            request: "Red:AMOUNT:2".to_string(),
-            max_fee_amount: None,
-            timeout_secs: None,
-            melt_options: None,
-            extra_json: None,
-        };
-
-        let quote = wallet
-            .get_payment_quote(
-                &CurrencyUnit::Sat,
-                OutgoingPaymentOptions::Custom(Box::new(custom_options.clone())),
-            )
-            .await
-            .expect("arbitrary quote should be created");
-
-        let expected_checking_id = FakeWallet::checking_id_for_arbitrary("Red:AMOUNT:2");
-        let quote_lookup_id = quote
-            .request_lookup_id
-            .clone()
-            .expect("quote should include lookup id");
-        assert_eq!(quote_lookup_id.to_string(), expected_checking_id);
-
-        let pay_response = wallet
-            .make_payment(
-                &CurrencyUnit::Sat,
-                OutgoingPaymentOptions::Custom(Box::new(custom_options)),
-            )
-            .await
-            .expect("arbitrary payment should be created");
-        assert_eq!(pay_response.status, MeltQuoteState::Unpaid);
-
-        let pending = wallet.get_pending_arbitrary_payments().await;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].0, expected_checking_id);
-
-        let approved = wallet
-            .approve_arbitrary_payment(expected_checking_id.as_str())
-            .await;
-        assert!(approved);
-
-        let checked = wallet
-            .check_outgoing_payment(&PaymentIdentifier::CustomId(expected_checking_id))
-            .await
-            .expect("arbitrary payment status should be queryable");
-        assert_eq!(checked.status, MeltQuoteState::Paid);
-        assert!(checked.total_spent.value() > 0);
+        let pending = wallet.get_pending_incoming_payments().await;
+        assert!(pending.is_empty());
     }
 }
