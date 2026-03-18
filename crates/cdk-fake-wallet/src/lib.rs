@@ -57,6 +57,35 @@ struct PendingIncomingPayment {
     is_any_amount: bool,
 }
 
+/// A vote tally for a single voting option.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteTally {
+    /// The voting option (e.g., "RED", "BLUE")
+    pub option: String,
+    /// Total satoshis melted to this option (vote weight)
+    pub total_amount: u64,
+    /// Number of individual votes cast
+    pub vote_count: u64,
+}
+
+/// The complete vote ledger tracking all options.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteLedger {
+    /// Map of option -> tally
+    pub options: HashMap<String, VoteTally>,
+    /// Topic/title of the voting session
+    pub topic: String,
+    /// Unix timestamp when voting started
+    pub created_at: u64,
+}
+
+fn unix_timestamp_now() -> u64 {
+    match web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    }
+}
+
 /// Cache duration for exchange rate (5 minutes)
 const RATE_CACHE_DURATION: Duration = Duration::from_secs(300);
 
@@ -347,6 +376,11 @@ pub struct FakeWallet {
     incoming_payments: Arc<RwLock<HashMap<PaymentIdentifier, Vec<WaitPaymentResponse>>>>,
     pending_incoming_payments: Arc<Mutex<HashMap<PaymentIdentifier, PendingIncomingPayment>>>,
     manual_approval_incoming: bool,
+    accept_voting_requests: bool,
+    voting_fee_sat: u64,
+    voting_options: Vec<String>,
+    voting_topic: String,
+    vote_ledger: Arc<Mutex<VoteLedger>>,
     unit: CurrencyUnit,
     secondary_repayment_queue: SecondaryRepaymentQueue,
     exchange_rate_cache: ExchangeRateCache,
@@ -398,6 +432,15 @@ impl FakeWallet {
             incoming_payments,
             pending_incoming_payments: Arc::new(Mutex::new(HashMap::new())),
             manual_approval_incoming: false,
+            accept_voting_requests: false,
+            voting_fee_sat: 1,
+            voting_options: Vec::new(),
+            voting_topic: "Vote".to_string(),
+            vote_ledger: Arc::new(Mutex::new(VoteLedger {
+                options: HashMap::new(),
+                topic: "Vote".to_string(),
+                created_at: unix_timestamp_now(),
+            })),
             unit,
             secondary_repayment_queue,
             exchange_rate_cache: ExchangeRateCache::new(),
@@ -408,6 +451,115 @@ impl FakeWallet {
     pub fn with_manual_approval_incoming(mut self, enabled: bool) -> Self {
         self.manual_approval_incoming = enabled;
         self
+    }
+
+    /// Enable voting mode with specified options.
+    ///
+    /// When enabled, the wallet accepts arbitrary melt requests matching
+    /// the configured options (e.g., "RED", "BLUE").
+    pub fn with_voting(mut self, options: Vec<String>, topic: Option<String>) -> Self {
+        self.accept_voting_requests = true;
+        self.voting_options = options
+            .into_iter()
+            .map(|option| option.trim().to_uppercase())
+            .collect();
+
+        let voting_topic = topic.unwrap_or_else(|| "Vote".to_string());
+        self.voting_topic = voting_topic.clone();
+
+        self.vote_ledger = Arc::new(Mutex::new(VoteLedger {
+            options: HashMap::new(),
+            topic: voting_topic,
+            created_at: unix_timestamp_now(),
+        }));
+
+        self
+    }
+
+    /// Set the fee for voting melt requests (default: 1 sat).
+    pub fn with_voting_fee(mut self, fee_sat: u64) -> Self {
+        self.voting_fee_sat = fee_sat;
+        self
+    }
+
+    /// Check if a request string is a valid vote option.
+    fn normalized_vote_option(request: &str) -> String {
+        request.trim().to_uppercase()
+    }
+
+    /// Check if a request string is a valid vote option.
+    fn is_vote_option(&self, request: &str) -> bool {
+        if !self.accept_voting_requests {
+            return false;
+        }
+
+        let option = Self::normalized_vote_option(request);
+        self.voting_options.contains(&option)
+    }
+
+    fn checking_id_for_vote(request: &str) -> PaymentIdentifier {
+        let option = Self::normalized_vote_option(request);
+        PaymentIdentifier::CustomId(sha256::Hash::hash(option.as_bytes()).to_string())
+    }
+
+    /// Record a vote for an option.
+    async fn record_vote(&self, option: &str, amount_sat: u64) {
+        let option_key = Self::normalized_vote_option(option);
+
+        let mut ledger = self.vote_ledger.lock().await;
+
+        let tally = ledger
+            .options
+            .entry(option_key.clone())
+            .or_insert(VoteTally {
+                option: option_key,
+                total_amount: 0,
+                vote_count: 0,
+            });
+
+        tally.total_amount += amount_sat;
+        tally.vote_count += 1;
+
+        tracing::info!(
+            "Recorded vote: {} +{} sats (total: {}, votes: {})",
+            tally.option,
+            amount_sat,
+            tally.total_amount,
+            tally.vote_count
+        );
+    }
+
+    /// Get current vote results.
+    pub async fn get_vote_results(&self) -> VoteLedger {
+        self.vote_ledger.lock().await.clone()
+    }
+
+    /// Get results for a specific option.
+    pub async fn get_vote_tally(&self, option: &str) -> Option<VoteTally> {
+        let ledger = self.vote_ledger.lock().await;
+        ledger
+            .options
+            .get(&Self::normalized_vote_option(option))
+            .cloned()
+    }
+
+    /// Reset all votes and start fresh.
+    pub async fn reset_votes(&self) {
+        let mut ledger = self.vote_ledger.lock().await;
+        ledger.options.clear();
+        ledger.created_at = unix_timestamp_now();
+    }
+
+    /// Get total votes cast across all options.
+    pub async fn get_total_votes(&self) -> (u64, u64) {
+        let ledger = self.vote_ledger.lock().await;
+        let total_amount = ledger
+            .options
+            .values()
+            .map(|tally| tally.total_amount)
+            .sum();
+        let total_count = ledger.options.values().map(|tally| tally.vote_count).sum();
+        (total_amount, total_count)
     }
 
     /// Marks a pending incoming payment as approved and emits the payment event.
@@ -507,6 +659,13 @@ impl MintPayment for FakeWallet {
 
     #[instrument(skip_all)]
     async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
+        let mut custom = HashMap::new();
+        if self.accept_voting_requests {
+            custom.insert("voting".to_string(), "enabled".to_string());
+            custom.insert("voting_options".to_string(), self.voting_options.join(","));
+            custom.insert("voting_topic".to_string(), self.voting_topic.clone());
+        }
+
         Ok(SettingsResponse {
             unit: self.unit.to_string(),
             bolt11: Some(payment::Bolt11Settings {
@@ -515,7 +674,7 @@ impl MintPayment for FakeWallet {
                 invoice_description: true,
             }),
             bolt12: Some(payment::Bolt12Settings { amountless: false }),
-            custom: HashMap::new(),
+            custom,
         })
     }
 
@@ -547,7 +706,7 @@ impl MintPayment for FakeWallet {
         unit: &CurrencyUnit,
         options: OutgoingPaymentOptions,
     ) -> Result<PaymentQuoteResponse, Self::Err> {
-        let (amount_msat, request_lookup_id) = match options {
+        let (amount_msat, request_lookup_id, custom_fee_override) = match options {
             OutgoingPaymentOptions::Bolt11(bolt11_options) => {
                 // If we have specific amount options, use those
                 let amount_msat: u64 = if let Some(melt_options) = bolt11_options.melt_options {
@@ -578,7 +737,7 @@ impl MintPayment for FakeWallet {
                 };
                 let payment_id =
                     PaymentIdentifier::PaymentHash(*bolt11_options.bolt11.payment_hash().as_ref());
-                (amount_msat, Some(payment_id))
+                (amount_msat, Some(payment_id), None)
             }
             OutgoingPaymentOptions::Bolt12(bolt12_options) => {
                 let offer = bolt12_options.offer;
@@ -593,10 +752,35 @@ impl MintPayment for FakeWallet {
                         _ => return Err(Error::UnknownInvoiceAmount.into()),
                     }
                 };
-                (amount_msat, None)
+                (amount_msat, None, None)
             }
-            OutgoingPaymentOptions::Custom(_) => {
-                return Err(cdk_common::payment::Error::UnsupportedPaymentOption);
+            OutgoingPaymentOptions::Custom(custom_options) => {
+                let request = custom_options.request.as_str();
+
+                if !self.is_vote_option(request) {
+                    return Err(cdk_common::payment::Error::UnsupportedPaymentOption);
+                }
+
+                let amount_msat: u64 = custom_options
+                    .melt_options
+                    .ok_or(Error::UnknownInvoiceAmount)?
+                    .amount_msat()
+                    .into();
+                ensure_cdk!(amount_msat % 1000 == 0, Error::UnknownInvoiceAmount.into());
+
+                let fee = convert_currency_amount(
+                    self.voting_fee_sat,
+                    &CurrencyUnit::Sat,
+                    unit,
+                    &self.exchange_rate_cache,
+                )
+                .await?;
+
+                (
+                    amount_msat,
+                    Some(Self::checking_id_for_vote(request)),
+                    Some(fee),
+                )
             }
         };
 
@@ -608,17 +792,21 @@ impl MintPayment for FakeWallet {
         )
         .await?;
 
-        let relative_fee_reserve =
-            (self.fee_reserve.percent_fee_reserve * amount.value() as f32) as u64;
+        let fee = if let Some(custom_fee) = custom_fee_override {
+            custom_fee
+        } else {
+            let relative_fee_reserve =
+                (self.fee_reserve.percent_fee_reserve * amount.value() as f32) as u64;
 
-        let absolute_fee_reserve: u64 = self.fee_reserve.min_fee_reserve.into();
+            let absolute_fee_reserve: u64 = self.fee_reserve.min_fee_reserve.into();
 
-        let fee = max(relative_fee_reserve, absolute_fee_reserve);
+            Amount::new(max(relative_fee_reserve, absolute_fee_reserve), unit.clone())
+        };
 
         Ok(PaymentQuoteResponse {
             request_lookup_id,
             amount,
-            fee: Amount::new(fee, unit.clone()),
+            fee,
             state: MeltQuoteState::Unpaid,
         })
     }
@@ -721,8 +909,50 @@ impl MintPayment for FakeWallet {
                     total_spent: Amount::new(total_spent.value() + 1, unit.clone()),
                 })
             }
-            OutgoingPaymentOptions::Custom(_) => {
-                Err(cdk_common::payment::Error::UnsupportedPaymentOption)
+            OutgoingPaymentOptions::Custom(custom_options) => {
+                let request = custom_options.request.as_str();
+
+                if !self.is_vote_option(request) {
+                    return Err(cdk_common::payment::Error::UnsupportedPaymentOption);
+                }
+
+                let amount_msat: u64 = custom_options
+                    .melt_options
+                    .ok_or(Error::UnknownInvoiceAmount)?
+                    .amount_msat()
+                    .into();
+                ensure_cdk!(amount_msat % 1000 == 0, Error::UnknownInvoiceAmount.into());
+
+                let amount_sat = amount_msat / 1000;
+                self.record_vote(request, amount_sat).await;
+
+                let payment_lookup_id = Self::checking_id_for_vote(request);
+
+                let amount_in_unit = convert_currency_amount(
+                    amount_msat,
+                    &CurrencyUnit::Msat,
+                    unit,
+                    &self.exchange_rate_cache,
+                )
+                .await?;
+
+                let fee_in_unit = convert_currency_amount(
+                    self.voting_fee_sat,
+                    &CurrencyUnit::Sat,
+                    unit,
+                    &self.exchange_rate_cache,
+                )
+                .await?;
+
+                Ok(MakePaymentResponse {
+                    payment_lookup_id,
+                    payment_proof: Some("voted".to_string()),
+                    status: MeltQuoteState::Paid,
+                    total_spent: Amount::new(
+                        amount_in_unit.value() + fee_in_unit.value(),
+                        unit.clone(),
+                    ),
+                })
             }
         }
     }
@@ -875,6 +1105,15 @@ impl MintPayment for FakeWallet {
         &self,
         request_lookup_id: &PaymentIdentifier,
     ) -> Result<MakePaymentResponse, Self::Err> {
+        if self.accept_voting_requests && matches!(request_lookup_id, PaymentIdentifier::CustomId(_)) {
+            return Ok(MakePaymentResponse {
+                payment_lookup_id: request_lookup_id.clone(),
+                payment_proof: Some("voted".to_string()),
+                status: MeltQuoteState::Paid,
+                total_spent: Amount::new(0, CurrencyUnit::Msat),
+            });
+        }
+
         // For fake wallet if the state is not explicitly set default to paid
         let states = self.payment_states.lock().await;
         let status = states.get(&request_lookup_id.to_string()).cloned();
@@ -937,7 +1176,11 @@ pub fn create_fake_invoice(amount_msat: u64, description: String) -> Bolt11Invoi
 mod tests {
     use super::*;
 
-    use cdk_common::payment::{Bolt11IncomingPaymentOptions, IncomingPaymentOptions};
+    use cdk_common::nuts::MeltOptions;
+    use cdk_common::payment::{
+        Bolt11IncomingPaymentOptions, CustomOutgoingPaymentOptions, IncomingPaymentOptions,
+        OutgoingPaymentOptions,
+    };
 
     fn test_wallet() -> FakeWallet {
         FakeWallet::new(
@@ -950,6 +1193,26 @@ mod tests {
             0,
             CurrencyUnit::Sat,
         )
+    }
+
+    fn test_wallet_with_voting() -> FakeWallet {
+        test_wallet()
+            .with_voting(
+                vec!["RED".to_string(), "BLUE".to_string()],
+                Some("Red vs Blue".to_string()),
+            )
+            .with_voting_fee(1)
+    }
+
+    fn vote_payment_options(option: &str, amount_msat: u64) -> OutgoingPaymentOptions {
+        OutgoingPaymentOptions::Custom(Box::new(CustomOutgoingPaymentOptions {
+            method: "vote".to_string(),
+            request: option.to_string(),
+            max_fee_amount: None,
+            timeout_secs: None,
+            melt_options: Some(MeltOptions::new_amountless(amount_msat)),
+            extra_json: None,
+        }))
     }
 
     #[tokio::test]
@@ -1006,5 +1269,181 @@ mod tests {
 
         let pending = wallet.get_pending_incoming_payments().await;
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn voting_records_votes_correctly() {
+        let wallet = test_wallet_with_voting();
+
+        let red_response = wallet
+            .make_payment(&CurrencyUnit::Sat, vote_payment_options("RED", 100_000))
+            .await
+            .expect("vote should succeed");
+        assert_eq!(red_response.status, MeltQuoteState::Paid);
+
+        let blue_response = wallet
+            .make_payment(&CurrencyUnit::Sat, vote_payment_options("BLUE", 200_000))
+            .await
+            .expect("vote should succeed");
+        assert_eq!(blue_response.status, MeltQuoteState::Paid);
+
+        let results = wallet.get_vote_results().await;
+        assert_eq!(results.options.len(), 2);
+        assert_eq!(results.topic, "Red vs Blue");
+
+        let red = results.options.get("RED").expect("RED should exist");
+        assert_eq!(red.total_amount, 100);
+        assert_eq!(red.vote_count, 1);
+
+        let blue = results.options.get("BLUE").expect("BLUE should exist");
+        assert_eq!(blue.total_amount, 200);
+        assert_eq!(blue.vote_count, 1);
+
+        let (total_amount, total_count) = wallet.get_total_votes().await;
+        assert_eq!(total_amount, 300);
+        assert_eq!(total_count, 2);
+    }
+
+    #[tokio::test]
+    async fn voting_is_case_insensitive() {
+        let wallet = test_wallet_with_voting();
+
+        wallet
+            .make_payment(&CurrencyUnit::Sat, vote_payment_options("red", 50_000))
+            .await
+            .expect("vote should succeed");
+
+        wallet
+            .make_payment(&CurrencyUnit::Sat, vote_payment_options("RED", 50_000))
+            .await
+            .expect("vote should succeed");
+
+        let tally = wallet
+            .get_vote_tally("RED")
+            .await
+            .expect("RED should exist");
+        assert_eq!(tally.total_amount, 100);
+        assert_eq!(tally.vote_count, 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_vote_option_is_rejected() {
+        let wallet = test_wallet_with_voting();
+
+        let result = wallet
+            .make_payment(&CurrencyUnit::Sat, vote_payment_options("GREEN", 100_000))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn voting_disabled_rejects_votes() {
+        let wallet = test_wallet();
+
+        let result = wallet
+            .make_payment(&CurrencyUnit::Sat, vote_payment_options("RED", 100_000))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reset_votes_clears_vote_data() {
+        let wallet = test_wallet_with_voting();
+
+        wallet
+            .make_payment(&CurrencyUnit::Sat, vote_payment_options("RED", 100_000))
+            .await
+            .expect("vote should succeed");
+
+        wallet.reset_votes().await;
+
+        let results = wallet.get_vote_results().await;
+        assert!(results.options.is_empty());
+
+        let (total_amount, total_count) = wallet.get_total_votes().await;
+        assert_eq!(total_amount, 0);
+        assert_eq!(total_count, 0);
+    }
+
+    #[tokio::test]
+    async fn get_settings_advertises_voting_when_enabled() {
+        let wallet = test_wallet_with_voting();
+
+        let settings = wallet.get_settings().await.expect("settings should work");
+        assert_eq!(settings.custom.get("voting"), Some(&"enabled".to_string()));
+        assert_eq!(
+            settings.custom.get("voting_options"),
+            Some(&"RED,BLUE".to_string())
+        );
+        assert_eq!(
+            settings.custom.get("voting_topic"),
+            Some(&"Red vs Blue".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn get_payment_quote_for_vote_requires_whole_sat_amount() {
+        let wallet = test_wallet_with_voting();
+
+        let result = wallet
+            .get_payment_quote(&CurrencyUnit::Sat, vote_payment_options("RED", 100_001))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_payment_quote_for_vote_rejects_sub_sat_amount() {
+        let wallet = test_wallet_with_voting();
+
+        let result = wallet
+            .get_payment_quote(&CurrencyUnit::Sat, vote_payment_options("RED", 500))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_payment_quote_for_vote_uses_voting_fee() {
+        let wallet = test_wallet()
+            .with_voting(
+                vec!["RED".to_string(), "BLUE".to_string()],
+                Some("Red vs Blue".to_string()),
+            )
+            .with_voting_fee(7);
+
+        let quote = wallet
+            .get_payment_quote(&CurrencyUnit::Sat, vote_payment_options("RED", 100_000))
+            .await
+            .expect("quote should succeed");
+
+        assert_eq!(quote.amount.value(), 100);
+        assert_eq!(quote.fee.value(), 7);
+    }
+
+    #[tokio::test]
+    async fn check_outgoing_payment_for_vote_returns_paid() {
+        let wallet = test_wallet_with_voting();
+        let response = wallet
+            .check_outgoing_payment(&PaymentIdentifier::CustomId("vote-lookup".to_string()))
+            .await
+            .expect("check should work");
+
+        assert_eq!(response.status, MeltQuoteState::Paid);
+        assert_eq!(response.payment_proof, Some("voted".to_string()));
+    }
+
+    #[tokio::test]
+    async fn check_outgoing_payment_custom_without_voting_is_unknown() {
+        let wallet = test_wallet();
+        let response = wallet
+            .check_outgoing_payment(&PaymentIdentifier::CustomId("vote-lookup".to_string()))
+            .await
+            .expect("check should work");
+
+        assert_eq!(response.status, MeltQuoteState::Unknown);
+        assert_eq!(response.payment_proof, None);
     }
 }
