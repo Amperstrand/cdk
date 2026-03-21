@@ -140,4 +140,12 @@ PY
 
 echo
 echo "Demo setup complete."
-echo "Next: each user mints approved tokens, then melts to RED/BLUE destination."
+echo
+echo "Next steps for each voter:"
+echo "  1. Mint approved tokens (claim your quote)"
+echo "  2. (Optional) Swap tokens for extra privacy - creates fresh unlinkable tokens"
+echo "  3. Melt tokens to vote RED or BLUE"
+echo
+echo "Privacy note: Blind signatures already hide which voter cast which vote."
+echo "Swapping (step 2) adds another unlinkability layer but is optional."
+echo "See VOTING_ANONYMITY.md for full privacy model explanation."

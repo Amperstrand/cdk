@@ -175,15 +175,16 @@ ln_backend = "fakewallet"
 
 [fake_wallet]
 supported_units = ["sat"]
-fee_percent = 0.02
-reserve_fee_min = 1
-min_delay_time = 1
-max_delay_time = 3
+# For voting: set fees to 0 (swap/melt fees make no sense for voting)
+fee_percent = 0.0
+reserve_fee_min = 0
+min_delay_time = 0
+max_delay_time = 1
 manual_approval_incoming = true
 voting_enabled = false
 voting_options = ["RED", "BLUE"]
 voting_topic = "Red vs Blue"
-voting_fee_sat = 1
+voting_fee_sat = 0
 
 # [grpc_processor]
 # gRPC Payment Processor configuration

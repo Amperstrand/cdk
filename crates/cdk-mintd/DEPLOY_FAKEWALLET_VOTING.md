@@ -8,6 +8,8 @@ This guide deploys `cdk-mintd` as a FakeWallet-backed mint with RED/BLUE voting 
 
 Incoming mint quotes are manually approved (`manual_approval_incoming = true`) via management RPC.
 
+**For anonymity and privacy details, see [VOTING_ANONYMITY.md](./VOTING_ANONYMITY.md).**
+
 ## 1) Build `cdk-mintd` with required features
 
 ```bash
@@ -88,7 +90,7 @@ manual_approval_incoming = true
 voting_enabled = true
 voting_options = ["RED", "BLUE"]
 voting_topic = "Red vs Blue"
-voting_fee_sat = 1
+voting_fee_sat = 0
 
 [limits]
 max_inputs = 1000
