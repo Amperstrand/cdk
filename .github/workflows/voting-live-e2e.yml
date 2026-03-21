@@ -2,6 +2,9 @@ name: Voting Live E2E
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feat/fakewallet-voting-poc
   schedule:
     - cron: "17 */6 * * *"
 
