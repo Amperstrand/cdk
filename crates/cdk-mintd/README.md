@@ -197,7 +197,7 @@ fee_percent = 0.0
 reserve_fee_min = 0
 min_delay_time = 0
 max_delay_time = 1
-manual_approval_incoming = false
+manual_approval_incoming = true
 voting_enabled = true
 voting_options = ["RED", "BLUE"]
 voting_topic = "Red vs Blue"
@@ -325,6 +325,7 @@ cdk-mintd --help
 - `CDK_MINTD_LISTEN_PORT`: Port to bind to (default: `8085`)
 
 FakeWallet voting environment variables:
+- `CDK_MINTD_FAKE_WALLET_MANUAL_APPROVAL_INCOMING`
 - `CDK_MINTD_FAKE_WALLET_VOTING_ENABLED`
 - `CDK_MINTD_FAKE_WALLET_VOTING_OPTIONS` (comma-separated, example: `RED,BLUE`)
 - `CDK_MINTD_FAKE_WALLET_VOTING_TOPIC`
@@ -336,6 +337,8 @@ For complete configuration options, see the [example configuration file](./examp
 
 - **[Configuration Examples](./example.config.toml)** - Complete configuration reference
 - **[FakeWallet Voting Deployment](./DEPLOY_FAKEWALLET_VOTING.md)** - End-to-end HTTPS deployment and voting usage
+- **[Voting E2E Demo Script](./scripts/voting_e2e_live_demo.sh)** - Two-voter live walkthrough with manual quote approval
+- **[LN-address Vote Proxy](./scripts/vote_lnurl_proxy.py)** - `red@...` / `blue@...` LNURL adapter for vote descriptions
 - **[PostgreSQL Setup Guide](../../docker-compose.postgres.yaml)** - Database setup with Docker Compose
 - **[Development Guide](../../DEVELOPMENT.md)** - Contributing and development setup
 

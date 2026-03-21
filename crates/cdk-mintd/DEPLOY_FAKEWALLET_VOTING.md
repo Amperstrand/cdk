@@ -1,13 +1,17 @@
 # FakeWallet Voting Deployment (`inr2.cashu.exchange`)
 
-This guide deploys `cdk-mintd` as a FakeWallet-backed mint with RED/BLUE voting over custom melt methods, behind HTTPS using Let's Encrypt.
+This guide deploys `cdk-mintd` as a FakeWallet-backed mint with RED/BLUE voting over:
 
-## 1) Build `cdk-mintd` with fakewallet
+- custom melts (`/v1/melt/quote/vote`, request `RED` / `BLUE`)
+- BOLT11 descriptions encoding vote options
+- LN-address aliases `red@inr2.cashu.exchange` and `blue@inr2.cashu.exchange`
 
-From the repo root:
+Incoming mint quotes are manually approved (`manual_approval_incoming = true`) via management RPC.
+
+## 1) Build `cdk-mintd` with required features
 
 ```bash
-cargo build -p cdk-mintd --release --features fakewallet
+cargo build -p cdk-mintd --release --no-default-features --features "fakewallet,sqlite,management-rpc"
 ```
 
 Binary path:
@@ -18,24 +22,15 @@ target/release/cdk-mintd
 
 ## 2) Server prep (`root@inr2.cashu.exchange`)
 
-Install reverse proxy and TLS tooling:
-
 ```bash
 apt update
 apt install -y nginx certbot python3-certbot-nginx
-```
-
-Create runtime user and directories:
-
-```bash
 id -u cdk-mintd >/dev/null 2>&1 || useradd --system --home /var/lib/cdk-mintd --create-home --shell /usr/sbin/nologin cdk-mintd
 mkdir -p /etc/cdk-mintd /var/lib/cdk-mintd
 chown -R cdk-mintd:cdk-mintd /var/lib/cdk-mintd
 ```
 
 ## 3) Install binary
-
-Copy binary from local machine:
 
 ```bash
 scp target/release/cdk-mintd root@inr2.cashu.exchange:/usr/local/bin/cdk-mintd
@@ -51,7 +46,7 @@ Create `/etc/cdk-mintd/config.toml`:
 url = "https://inr2.cashu.exchange/"
 listen_host = "127.0.0.1"
 listen_port = 8085
-mnemonic = "replace with a secure 12-or-24-word mnemonic"
+seed = "replace with a secure 32-byte hex seed"
 
 [info.quote_ttl]
 mint_ttl = 600
@@ -61,6 +56,11 @@ melt_ttl = 120
 backend = "memory"
 ttl = 60
 tti = 60
+
+[mint_management_rpc]
+enabled = true
+address = "127.0.0.1"
+port = 8086
 
 [mint_info]
 name = "INR2 Voting Mint"
@@ -83,7 +83,7 @@ fee_percent = 0.0
 reserve_fee_min = 0
 min_delay_time = 0
 max_delay_time = 1
-manual_approval_incoming = false
+manual_approval_incoming = true
 voting_enabled = true
 voting_options = ["RED", "BLUE"]
 voting_topic = "Red vs Blue"
@@ -124,15 +124,58 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 ```
 
-Enable and start:
-
 ```bash
 systemctl daemon-reload
 systemctl enable --now cdk-mintd
 systemctl status cdk-mintd --no-pager
 ```
 
-## 6) Nginx reverse proxy
+## 6) Deploy LN-address vote proxy (`red@` / `blue@`)
+
+Install script from repo:
+
+```bash
+install -m 0755 crates/cdk-mintd/scripts/vote_lnurl_proxy.py /usr/local/bin/vote-lnurl-proxy
+```
+
+Create `/etc/default/vote-lnurl-proxy`:
+
+```bash
+cat >/etc/default/vote-lnurl-proxy <<'EOF'
+VOTE_LNURL_HOST=127.0.0.1
+VOTE_LNURL_PORT=8090
+VOTE_LNURL_DOMAIN=inr2.cashu.exchange
+VOTE_LNURL_MINT_URL=http://127.0.0.1:8085
+VOTE_LNURL_MIN_SENDABLE_MSAT=1000
+VOTE_LNURL_MAX_SENDABLE_MSAT=100000000
+EOF
+```
+
+Create `/etc/systemd/system/vote-lnurl-proxy.service`:
+
+```ini
+[Unit]
+Description=Vote LNURL Proxy (RED/BLUE)
+After=network.target cdk-mintd.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/vote-lnurl-proxy
+ExecStart=/usr/local/bin/vote-lnurl-proxy
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now vote-lnurl-proxy
+systemctl status vote-lnurl-proxy --no-pager
+```
+
+## 7) Nginx reverse proxy
 
 Create `/etc/nginx/sites-available/inr2.cashu.exchange`:
 
@@ -140,6 +183,22 @@ Create `/etc/nginx/sites-available/inr2.cashu.exchange`:
 server {
     listen 80;
     server_name inr2.cashu.exchange;
+
+    location ^~ /.well-known/lnurlp/ {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location ^~ /lnurl/cb/ {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8085;
@@ -151,78 +210,81 @@ server {
 }
 ```
 
-Enable site and reload:
-
 ```bash
 ln -sf /etc/nginx/sites-available/inr2.cashu.exchange /etc/nginx/sites-enabled/inr2.cashu.exchange
 nginx -t
 systemctl reload nginx
 ```
 
-## 7) Issue Let's Encrypt cert
+## 8) Issue Let's Encrypt cert
 
 ```bash
 certbot --nginx -d inr2.cashu.exchange --non-interactive --agree-tos -m admin@inr2.cashu.exchange --redirect
-```
-
-Verify renewal:
-
-```bash
 certbot renew --dry-run
 ```
 
-## 8) Verify deployment
+## 9) Verify deployment
 
 ```bash
-curl -sS https://inr2.cashu.exchange/v1/info | jq .name
-curl -sS https://inr2.cashu.exchange/v1/info | jq '.nuts.nut05.methods'
+curl -sS https://inr2.cashu.exchange/v1/info | jq .
+curl -sS https://inr2.cashu.exchange/.well-known/lnurlp/red | jq .
+curl -sS https://inr2.cashu.exchange/.well-known/lnurlp/blue | jq .
 ```
 
-You should see custom method `vote` available when using this FakeWallet voting setup.
+## 10) Manual authorization command (operator)
 
-## 9) Use the voting flow
-
-Voting is implemented as custom melt method `vote`, with request string `RED` or `BLUE`.
-
-Create a vote quote:
+Approve a mint quote:
 
 ```bash
-curl -sS -X POST https://inr2.cashu.exchange/v1/melt/quote/vote \
-  -H 'content-type: application/json' \
-  -d '{
-    "method": "vote",
-    "request": "RED",
-    "unit": "sat",
-    "melt_options": {
-      "amountless": { "amount_msat": 10000 }
-    }
-  }' | jq .
+cdk-mint-cli --addr http://127.0.0.1:8086 update-nut04-quote-state <QUOTE_ID> PAID
 ```
 
-Cast the vote by calling `/v1/melt/vote` with a valid quote and valid proofs (Cashu tokens). The vote weight equals melted sats.
+## 11) End-to-end live demo (2 voters)
 
-## 10) Operations
-
-Service logs:
+Helper script:
 
 ```bash
-journalctl -u cdk-mintd -f
+bash crates/cdk-mintd/scripts/voting_e2e_live_demo.sh
 ```
 
-Nginx logs:
+Auto-approve via SSH mode:
 
 ```bash
-journalctl -u nginx -f
+RPC_SSH_HOST=root@inr2.cashu.exchange \
+bash crates/cdk-mintd/scripts/voting_e2e_live_demo.sh --auto-approve
 ```
 
-Restart service:
+### Sequence diagram
 
-```bash
-systemctl restart cdk-mintd
+```mermaid
+sequenceDiagram
+    participant A as Alice Wallet
+    participant B as Bob Wallet
+    participant M as cdk-mintd
+    participant O as Operator
+    participant R as cdk-mint-cli
+    participant L as vote-lnurl-proxy
+
+    A->>M: POST /v1/mint/quote/bolt11
+    B->>M: POST /v1/mint/quote/bolt11
+    A->>M: Pays mint invoice
+    B->>M: Pays mint invoice
+    O->>R: update-nut04-quote-state Alice PAID
+    O->>R: update-nut04-quote-state Bob PAID
+    R->>M: gRPC quote state update
+    A->>M: Mint tokens
+    B->>M: Mint tokens
+    A->>L: Pay red@inr2.cashu.exchange
+    B->>L: Pay blue@inr2.cashu.exchange
+    L->>M: create BOLT11 quote with description RED/BLUE
+    A->>M: melt tokens using returned invoice
+    B->>M: melt tokens using returned invoice
+    M->>M: FakeWallet records weighted vote
 ```
 
-## 11) Notes
+## 12) Notes
 
-- Vote tallies are in-memory in `cdk-fake-wallet` and do not persist across restarts.
-- `voting_options` are case-insensitive in runtime logic.
-- `voting_fee_sat` sets quote fee for vote melts.
+- Vote tallies are in-memory in `cdk-fake-wallet` and reset on restart.
+- Vote options are case-insensitive.
+- `manual_approval_incoming = true` disables automint; quotes stay `UNPAID` until operator approval.
+- Custom vote strings (`RED`, `BLUE`) and LN-address encoded descriptions are both supported.

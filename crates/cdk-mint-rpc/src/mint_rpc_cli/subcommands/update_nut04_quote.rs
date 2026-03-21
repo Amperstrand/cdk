@@ -1,5 +1,7 @@
 use anyhow::Result;
+use cdk_common::grpc::VERSION_HEADER;
 use clap::Args;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -31,11 +33,18 @@ pub async fn update_nut04_quote_state(
     client: &mut CdkMintClient<Channel>,
     sub_command_args: &UpdateNut04QuoteCommand,
 ) -> Result<()> {
+    let mut request = Request::new(UpdateNut04QuoteRequest {
+        quote_id: sub_command_args.quote_id.clone(),
+        state: sub_command_args.state.clone(),
+    });
+
+    request.metadata_mut().insert(
+        VERSION_HEADER,
+        MetadataValue::from_static(cdk_common::MINT_RPC_PROTOCOL_VERSION),
+    );
+
     let response = client
-        .update_nut04_quote(Request::new(UpdateNut04QuoteRequest {
-            quote_id: sub_command_args.quote_id.clone(),
-            state: sub_command_args.state.clone(),
-        }))
+        .update_nut04_quote(request)
         .await?;
 
     let response = response.into_inner();
