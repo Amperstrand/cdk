@@ -25,6 +25,9 @@ jobs:
         with:
           toolchain: 1.93.0
 
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Validate required secrets
         run: |
           test -n "${{ secrets.VOTING_E2E_BASE_URL }}" || (echo "Missing secret: VOTING_E2E_BASE_URL" && exit 1)
