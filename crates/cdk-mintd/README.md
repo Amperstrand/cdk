@@ -186,6 +186,24 @@ engine = "postgres"
 url = "postgresql://mint_user:password@localhost:5432/cdk_mint"
 ```
 
+### With FakeWallet Voting (RED vs BLUE)
+```toml
+[ln]
+ln_backend = "fakewallet"
+
+[fake_wallet]
+supported_units = ["sat"]
+fee_percent = 0.0
+reserve_fee_min = 0
+min_delay_time = 0
+max_delay_time = 1
+manual_approval_incoming = false
+voting_enabled = true
+voting_options = ["RED", "BLUE"]
+voting_topic = "Red vs Blue"
+voting_fee_sat = 1
+```
+
 ## Directory Structure
 
 After setup and first run, your directory will look like:
@@ -306,11 +324,18 @@ cdk-mintd --help
 - `CDK_MINTD_LISTEN_HOST`: Host to bind to (default: `127.0.0.1`)
 - `CDK_MINTD_LISTEN_PORT`: Port to bind to (default: `8085`)
 
+FakeWallet voting environment variables:
+- `CDK_MINTD_FAKE_WALLET_VOTING_ENABLED`
+- `CDK_MINTD_FAKE_WALLET_VOTING_OPTIONS` (comma-separated, example: `RED,BLUE`)
+- `CDK_MINTD_FAKE_WALLET_VOTING_TOPIC`
+- `CDK_MINTD_FAKE_WALLET_VOTING_FEE_SAT`
+
 For complete configuration options, see the [example configuration file](./example.config.toml).
 
 ## Documentation
 
 - **[Configuration Examples](./example.config.toml)** - Complete configuration reference
+- **[FakeWallet Voting Deployment](./DEPLOY_FAKEWALLET_VOTING.md)** - End-to-end HTTPS deployment and voting usage
 - **[PostgreSQL Setup Guide](../../docker-compose.postgres.yaml)** - Database setup with Docker Compose
 - **[Development Guide](../../DEVELOPMENT.md)** - Contributing and development setup
 

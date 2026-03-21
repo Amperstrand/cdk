@@ -661,9 +661,15 @@ impl MintPayment for FakeWallet {
     async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
         let mut custom = HashMap::new();
         if self.accept_voting_requests {
-            custom.insert("voting".to_string(), "enabled".to_string());
-            custom.insert("voting_options".to_string(), self.voting_options.join(","));
-            custom.insert("voting_topic".to_string(), self.voting_topic.clone());
+            custom.insert(
+                "vote".to_string(),
+                serde_json::json!({
+                    "status": "enabled",
+                    "options": self.voting_options,
+                    "topic": self.voting_topic,
+                })
+                .to_string(),
+            );
         }
 
         Ok(SettingsResponse {
@@ -800,7 +806,10 @@ impl MintPayment for FakeWallet {
 
             let absolute_fee_reserve: u64 = self.fee_reserve.min_fee_reserve.into();
 
-            Amount::new(max(relative_fee_reserve, absolute_fee_reserve), unit.clone())
+            Amount::new(
+                max(relative_fee_reserve, absolute_fee_reserve),
+                unit.clone(),
+            )
         };
 
         Ok(PaymentQuoteResponse {
@@ -944,14 +953,21 @@ impl MintPayment for FakeWallet {
                 )
                 .await?;
 
+                let total_spent = Amount::new(
+                    amount_in_unit.value() + fee_in_unit.value(),
+                    unit.clone(),
+                );
+
+                self.payment_states.lock().await.insert(
+                    payment_lookup_id.to_string(),
+                    (MeltQuoteState::Paid, total_spent.clone()),
+                );
+
                 Ok(MakePaymentResponse {
                     payment_lookup_id,
                     payment_proof: Some("voted".to_string()),
                     status: MeltQuoteState::Paid,
-                    total_spent: Amount::new(
-                        amount_in_unit.value() + fee_in_unit.value(),
-                        unit.clone(),
-                    ),
+                    total_spent,
                 })
             }
         }
@@ -1105,15 +1121,6 @@ impl MintPayment for FakeWallet {
         &self,
         request_lookup_id: &PaymentIdentifier,
     ) -> Result<MakePaymentResponse, Self::Err> {
-        if self.accept_voting_requests && matches!(request_lookup_id, PaymentIdentifier::CustomId(_)) {
-            return Ok(MakePaymentResponse {
-                payment_lookup_id: request_lookup_id.clone(),
-                payment_proof: Some("voted".to_string()),
-                status: MeltQuoteState::Paid,
-                total_spent: Amount::new(0, CurrencyUnit::Msat),
-            });
-        }
-
         // For fake wallet if the state is not explicitly set default to paid
         let states = self.payment_states.lock().await;
         let status = states.get(&request_lookup_id.to_string()).cloned();
@@ -1372,15 +1379,15 @@ mod tests {
         let wallet = test_wallet_with_voting();
 
         let settings = wallet.get_settings().await.expect("settings should work");
-        assert_eq!(settings.custom.get("voting"), Some(&"enabled".to_string()));
-        assert_eq!(
-            settings.custom.get("voting_options"),
-            Some(&"RED,BLUE".to_string())
-        );
-        assert_eq!(
-            settings.custom.get("voting_topic"),
-            Some(&"Red vs Blue".to_string())
-        );
+        let vote_method = settings
+            .custom
+            .get("vote")
+            .expect("vote custom method should be present");
+        let vote_metadata: serde_json::Value =
+            serde_json::from_str(vote_method).expect("vote metadata should be valid json");
+        assert_eq!(vote_metadata["status"], "enabled");
+        assert_eq!(vote_metadata["options"], serde_json::json!(["RED", "BLUE"]));
+        assert_eq!(vote_metadata["topic"], "Red vs Blue");
     }
 
     #[tokio::test]
@@ -1426,13 +1433,20 @@ mod tests {
     #[tokio::test]
     async fn check_outgoing_payment_for_vote_returns_paid() {
         let wallet = test_wallet_with_voting();
+
+        let paid = wallet
+            .make_payment(&CurrencyUnit::Sat, vote_payment_options("RED", 100_000))
+            .await
+            .expect("vote payment should succeed");
+
         let response = wallet
-            .check_outgoing_payment(&PaymentIdentifier::CustomId("vote-lookup".to_string()))
+            .check_outgoing_payment(&paid.payment_lookup_id)
             .await
             .expect("check should work");
 
         assert_eq!(response.status, MeltQuoteState::Paid);
-        assert_eq!(response.payment_proof, Some("voted".to_string()));
+        assert_eq!(response.payment_proof, Some("".to_string()));
+        assert_eq!(response.total_spent.value(), 101);
     }
 
     #[tokio::test]

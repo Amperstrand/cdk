@@ -195,7 +195,7 @@ impl LnBackendSetup for config::FakeWallet {
         let mut rng = thread_rng();
         let delay_time = rng.gen_range(self.min_delay_time..=self.max_delay_time);
 
-        let fake_wallet = cdk_fake_wallet::FakeWallet::new(
+        let mut fake_wallet = cdk_fake_wallet::FakeWallet::new(
             fee_reserve,
             HashMap::default(),
             HashSet::default(),
@@ -203,6 +203,16 @@ impl LnBackendSetup for config::FakeWallet {
             unit,
         )
         .with_manual_approval_incoming(self.manual_approval_incoming);
+
+        if self.voting_enabled {
+            let options = self
+                .voting_options
+                .clone()
+                .unwrap_or_else(|| vec!["RED".to_string(), "BLUE".to_string()]);
+            let topic = self.voting_topic.clone();
+            fake_wallet = fake_wallet.with_voting(options, topic);
+            fake_wallet = fake_wallet.with_voting_fee(self.voting_fee_sat);
+        }
 
         Ok(fake_wallet)
     }

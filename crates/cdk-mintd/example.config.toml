@@ -178,6 +178,11 @@ fee_percent = 0.02
 reserve_fee_min = 1
 min_delay_time = 1
 max_delay_time = 3
+manual_approval_incoming = false
+voting_enabled = false
+voting_options = ["RED", "BLUE"]
+voting_topic = "Red vs Blue"
+voting_fee_sat = 1
 
 # [grpc_processor]
 # gRPC Payment Processor configuration

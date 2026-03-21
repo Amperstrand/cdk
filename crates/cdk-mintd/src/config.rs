@@ -415,6 +415,14 @@ pub struct FakeWallet {
     pub max_delay_time: u64,
     #[serde(default)]
     pub manual_approval_incoming: bool,
+    #[serde(default)]
+    pub voting_enabled: bool,
+    #[serde(default)]
+    pub voting_options: Option<Vec<String>>,
+    #[serde(default)]
+    pub voting_topic: Option<String>,
+    #[serde(default = "default_voting_fee_sat")]
+    pub voting_fee_sat: u64,
 }
 
 #[cfg(feature = "fakewallet")]
@@ -427,6 +435,10 @@ impl Default for FakeWallet {
             min_delay_time: 1,
             max_delay_time: 3,
             manual_approval_incoming: false,
+            voting_enabled: false,
+            voting_options: None,
+            voting_topic: None,
+            voting_fee_sat: default_voting_fee_sat(),
         }
     }
 }
@@ -451,6 +463,11 @@ fn default_min_delay_time() -> u64 {
 #[cfg(feature = "fakewallet")]
 fn default_max_delay_time() -> u64 {
     3
+}
+
+#[cfg(feature = "fakewallet")]
+fn default_voting_fee_sat() -> u64 {
+    1
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -1056,6 +1073,10 @@ max_melt = 500000
             crate::env_vars::ENV_FAKE_WALLET_MANUAL_APPROVAL_INCOMING,
             "true",
         );
+        env::set_var(crate::env_vars::ENV_FAKE_WALLET_VOTING_ENABLED, "true");
+        env::set_var(crate::env_vars::ENV_FAKE_WALLET_VOTING_OPTIONS, "RED,BLUE");
+        env::set_var(crate::env_vars::ENV_FAKE_WALLET_VOTING_TOPIC, "Red vs Blue");
+        env::set_var(crate::env_vars::ENV_FAKE_WALLET_VOTING_FEE_SAT, "7");
 
         // Load settings and apply environment variables (same as production code)
         let mut settings = Settings::new(Some(&config_path));
@@ -1070,6 +1091,16 @@ max_melt = 500000
         assert_eq!(fakewallet_config.min_delay_time, 0);
         assert_eq!(fakewallet_config.max_delay_time, 5);
         assert!(fakewallet_config.manual_approval_incoming);
+        assert!(fakewallet_config.voting_enabled);
+        assert_eq!(
+            fakewallet_config.voting_options,
+            Some(vec!["RED".to_string(), "BLUE".to_string()])
+        );
+        assert_eq!(
+            fakewallet_config.voting_topic,
+            Some("Red vs Blue".to_string())
+        );
+        assert_eq!(fakewallet_config.voting_fee_sat, 7);
 
         // Cleanup env vars
         env::remove_var(crate::env_vars::ENV_LN_BACKEND);
@@ -1079,6 +1110,10 @@ max_melt = 500000
         env::remove_var(crate::env_vars::ENV_FAKE_WALLET_MIN_DELAY);
         env::remove_var(crate::env_vars::ENV_FAKE_WALLET_MAX_DELAY);
         env::remove_var(crate::env_vars::ENV_FAKE_WALLET_MANUAL_APPROVAL_INCOMING);
+        env::remove_var(crate::env_vars::ENV_FAKE_WALLET_VOTING_ENABLED);
+        env::remove_var(crate::env_vars::ENV_FAKE_WALLET_VOTING_OPTIONS);
+        env::remove_var(crate::env_vars::ENV_FAKE_WALLET_VOTING_TOPIC);
+        env::remove_var(crate::env_vars::ENV_FAKE_WALLET_VOTING_FEE_SAT);
 
         // Cleanup test file
         let _ = fs::remove_dir_all(&temp_dir);

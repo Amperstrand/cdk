@@ -35,6 +35,76 @@ mod tests;
 
 use melt_saga::MeltSaga;
 
+fn parse_custom_melt_options(extra: &serde_json::Value) -> Result<Option<MeltOptions>, Error> {
+    if extra.is_null() {
+        return Ok(None);
+    }
+
+    if let Some(melt_options) = extra.get("melt_options") {
+        return serde_json::from_value(melt_options.clone())
+            .map(Some)
+            .map_err(|_| Error::InvalidPaymentMethod);
+    }
+
+    if extra.get("amountless").is_some() || extra.get("mpp").is_some() {
+        return serde_json::from_value(extra.clone())
+            .map(Some)
+            .map_err(|_| Error::InvalidPaymentMethod);
+    }
+
+    Ok(None)
+}
+
+#[cfg(test)]
+mod custom_melt_options_tests {
+    use cdk_common::MeltOptions;
+    use serde_json::json;
+
+    use super::parse_custom_melt_options;
+
+    #[test]
+    fn parses_nested_melt_options_field() {
+        let extra = json!({
+            "melt_options": {
+                "amountless": {
+                    "amount_msat": 42_000
+                }
+            }
+        });
+
+        let parsed = parse_custom_melt_options(&extra)
+            .expect("melt options should parse")
+            .expect("melt options should exist");
+
+        assert_eq!(parsed, MeltOptions::new_amountless(42_000));
+    }
+
+    #[test]
+    fn parses_top_level_melt_options_shape() {
+        let extra = json!({
+            "mpp": {
+                "amount": 12_345
+            }
+        });
+
+        let parsed = parse_custom_melt_options(&extra)
+            .expect("melt options should parse")
+            .expect("melt options should exist");
+
+        assert_eq!(parsed, MeltOptions::new_mpp(12_345));
+    }
+
+    #[test]
+    fn ignores_unrelated_custom_extra() {
+        let extra = json!({
+            "note": "hello"
+        });
+
+        let parsed = parse_custom_melt_options(&extra).expect("parse should succeed");
+        assert!(parsed.is_none());
+    }
+}
+
 /// A pending mint melt that can optionally be awaited.
 #[derive(Debug)]
 pub struct PendingMelt {
@@ -387,6 +457,8 @@ impl Mint {
             extra,
         } = melt_request;
 
+        let melt_options = parse_custom_melt_options(extra)?;
+
         if !extra.is_null() {
             let extra_str = extra.to_string();
             if extra_str.len() > MAX_REQUEST_FIELD_LEN {
@@ -422,7 +494,7 @@ impl Mint {
                 request: request.clone(),
                 max_fee_amount: None,
                 timeout_secs: None,
-                melt_options: None,
+                melt_options,
                 extra_json,
             }));
 
@@ -456,7 +528,7 @@ impl Mint {
             payment_quote.amount.clone(),
             PaymentMethod::from(method.as_str()),
             request.clone(),
-            None, // Custom methods don't use options
+            melt_options,
         )
         .await?;
 
@@ -476,7 +548,7 @@ impl Mint {
             quote_fee,
             unix_time() + melt_ttl,
             payment_quote.request_lookup_id.clone(),
-            None, // Custom methods don't use options
+            melt_options,
             PaymentMethod::from(method.as_str()),
         );
 
