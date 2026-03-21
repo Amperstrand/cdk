@@ -112,7 +112,7 @@ def assert_lnurl_endpoints(base_url: str) -> None:
         raise RuntimeError(f"invalid callback invoice payload: {callback_payload}")
 
 
-def assert_vote_quote(base_url: str) -> None:
+def assert_vote_quote(base_url: str) -> dict[str, Any]:
     quote = request_json(
         "POST",
         f"{base_url}/v1/melt/quote/vote",
@@ -128,6 +128,11 @@ def assert_vote_quote(base_url: str) -> None:
     fee = quote.get("fee_reserve")
     if not isinstance(fee, int) or fee < 1:
         raise RuntimeError(f"unexpected vote quote fee: {quote}")
+    return quote
+
+
+def get_mint_info(base_url: str) -> dict[str, Any]:
+    return request_json("GET", f"{base_url}/v1/info")
 
 
 def assert_bolt11_vote_fee_behavior(base_url: str) -> None:
@@ -156,6 +161,9 @@ def main() -> int:
     try:
         config = load_config()
 
+        mint_info = get_mint_info(config.base_url)
+        mint_name = mint_info.get("name", "unknown")
+
         alice = create_mint_quote(config.base_url, config.alice_sats, "CI Alice voting tokens")
         bob = create_mint_quote(config.base_url, config.bob_sats, "CI Bob voting tokens")
 
@@ -174,12 +182,24 @@ def main() -> int:
         wait_state(config.base_url, bob_id, "PAID", config.timeout_secs)
 
         assert_lnurl_endpoints(config.base_url)
-        assert_vote_quote(config.base_url)
+        vote_quote = assert_vote_quote(config.base_url)
         assert_bolt11_vote_fee_behavior(config.base_url)
 
-        print("live voting e2e passed")
-        print(f"alice_quote={alice_id}")
-        print(f"bob_quote={bob_id}")
+        print("=" * 60)
+        print("VOTING E2E TEST PASSED")
+        print("=" * 60)
+        print(f"mint: {mint_name}")
+        print(f"alice_quote: {alice_id} ({config.alice_sats} sats)")
+        print(f"bob_quote: {bob_id} ({config.bob_sats} sats)")
+        print()
+        print("VOTING OPERATIONS TESTED:")
+        print(f"  - LNURL endpoints: red@..., blue@...")
+        print(f"  - Vote melt quote: RED (amount={vote_quote.get('amount')}, fee={vote_quote.get('fee_reserve')})")
+        print(f"  - BOLT11 vote fee detection")
+        print()
+        print("VOTE OPTIONS AVAILABLE: RED, BLUE")
+        print(f"TEST VOTING POWER: {config.alice_sats + config.bob_sats} sats")
+        print("=" * 60)
         return 0
     except HTTPError as error:
         print(f"http error: status={error.code} url={error.url}", file=sys.stderr)
