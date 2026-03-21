@@ -9,7 +9,7 @@ use cdk::nuts::nut05::MeltMethodSettings;
 use cdk::nuts::{CurrencyUnit, MintQuoteState, PaymentMethod};
 use cdk::types::QuoteTTL;
 use cdk::Amount;
-use cdk_common::grpc::create_version_check_interceptor;
+use cdk_common::grpc::{RPC_TOKEN_HEADER, VERSION_HEADER};
 use cdk_common::payment::WaitPaymentResponse;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -49,6 +49,57 @@ pub struct MintRPCServer {
     mint: Arc<Mint>,
     shutdown: Arc<Notify>,
     handle: Option<Arc<JoinHandle<Result<(), Error>>>>,
+    auth_token: Option<String>,
+}
+
+fn create_rpc_interceptor(
+    expected_auth_token: Option<String>,
+) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
+    move |request: Request<()>| {
+        let version = request
+            .metadata()
+            .get(VERSION_HEADER)
+            .ok_or_else(|| Status::failed_precondition("Missing x-cdk-protocol-version header"))?;
+        let version = version
+            .to_str()
+            .map_err(|_| Status::invalid_argument("Invalid protocol version header"))?;
+
+        if version != cdk_common::MINT_RPC_PROTOCOL_VERSION {
+            return Err(Status::failed_precondition(format!(
+                "Protocol version mismatch: server={}, client={}",
+                cdk_common::MINT_RPC_PROTOCOL_VERSION,
+                version
+            )));
+        }
+
+        if let Some(expected_auth_token) = &expected_auth_token {
+            let provided_token = request
+                .metadata()
+                .get(RPC_TOKEN_HEADER)
+                .ok_or_else(|| Status::unauthenticated("Invalid RPC authentication token"))?;
+            let provided_token = provided_token
+                .to_str()
+                .map_err(|_| Status::unauthenticated("Invalid RPC authentication token"))?;
+
+            if !constant_time_token_eq(provided_token, expected_auth_token) {
+                return Err(Status::unauthenticated("Invalid RPC authentication token"));
+            }
+        }
+
+        Ok(request)
+    }
+}
+
+fn constant_time_token_eq(left: &str, right: &str) -> bool {
+    let left_bytes = left.as_bytes();
+    let right_bytes = right.as_bytes();
+
+    let mut diff = left_bytes.len() ^ right_bytes.len();
+    for (l, r) in left_bytes.iter().zip(right_bytes.iter()) {
+        diff |= usize::from(l ^ r);
+    }
+
+    diff == 0
 }
 
 impl MintRPCServer {
@@ -58,12 +109,18 @@ impl MintRPCServer {
     /// * `addr` - The address to bind to
     /// * `port` - The port to listen on
     /// * `mint` - The Mint instance to serve
-    pub fn new(addr: &str, port: u16, mint: Arc<Mint>) -> Result<Self, Error> {
+    pub fn new(
+        addr: &str,
+        port: u16,
+        mint: Arc<Mint>,
+        auth_token: Option<String>,
+    ) -> Result<Self, Error> {
         Ok(Self {
             socket_addr: format!("{addr}:{port}").parse()?,
             mint,
             shutdown: Arc::new(Notify::new()),
             handle: None,
+            auth_token,
         })
     }
 
@@ -78,6 +135,8 @@ impl MintRPCServer {
     /// - ca.pem: CA certificate for client authentication
     pub async fn start(&mut self, tls_dir: Option<PathBuf>) -> Result<(), Error> {
         tracing::info!("Starting RPC server {}", self.socket_addr);
+
+        let auth_token = self.auth_token.clone();
 
         #[cfg(not(target_arch = "wasm32"))]
         if rustls::crypto::CryptoProvider::get_default().is_none() {
@@ -136,24 +195,16 @@ impl MintRPCServer {
                     .identity(server_identity)
                     .client_ca_root(client_ca_cert);
 
-                Server::builder().tls_config(tls_config)?.add_service(
-                    CdkMintServer::with_interceptor(
-                        self.clone(),
-                        create_version_check_interceptor(
-                            cdk_common::grpc::VERSION_HEADER,
-                            cdk_common::MINT_RPC_PROTOCOL_VERSION,
-                        ),
-                    ),
-                )
+                Server::builder().tls_config(tls_config)?.add_service(CdkMintServer::with_interceptor(
+                    self.clone(),
+                    create_rpc_interceptor(auth_token.clone()),
+                ))
             }
             None => {
                 tracing::warn!("No valid TLS configuration found, starting insecure server");
                 Server::builder().add_service(CdkMintServer::with_interceptor(
                     self.clone(),
-                    create_version_check_interceptor(
-                        cdk_common::grpc::VERSION_HEADER,
-                        cdk_common::MINT_RPC_PROTOCOL_VERSION,
-                    ),
+                    create_rpc_interceptor(auth_token),
                 ))
             }
         };

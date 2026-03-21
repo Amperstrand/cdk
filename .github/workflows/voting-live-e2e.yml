@@ -1,0 +1,43 @@
+name: Voting Live E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-voting-e2e:
+    name: Live Voting E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Validate required secrets
+        run: |
+          test -n "${{ secrets.VOTING_E2E_BASE_URL }}" || (echo "Missing secret: VOTING_E2E_BASE_URL" && exit 1)
+          test -n "${{ secrets.VOTING_E2E_RPC_ADDR }}" || (echo "Missing secret: VOTING_E2E_RPC_ADDR" && exit 1)
+          test -n "${{ secrets.VOTING_E2E_RPC_TOKEN }}" || (echo "Missing secret: VOTING_E2E_RPC_TOKEN" && exit 1)
+
+      - name: Build cdk-mint-cli
+        run: cargo build -p cdk-mint-rpc --bin cdk-mint-cli
+
+      - name: Run live voting e2e
+        env:
+          VOTING_E2E_BASE_URL: ${{ secrets.VOTING_E2E_BASE_URL }}
+          VOTING_E2E_RPC_ADDR: ${{ secrets.VOTING_E2E_RPC_ADDR }}
+          VOTING_E2E_RPC_TOKEN: ${{ secrets.VOTING_E2E_RPC_TOKEN }}
+          VOTING_E2E_RPC_CLI_BIN: target/debug/cdk-mint-cli
+          VOTING_E2E_ALICE_SATS: "19"
+          VOTING_E2E_BOB_SATS: "29"
+          VOTING_E2E_TIMEOUT_SECS: "60"
+        run: python3 crates/cdk-mintd/scripts/ci_live_voting_e2e.py

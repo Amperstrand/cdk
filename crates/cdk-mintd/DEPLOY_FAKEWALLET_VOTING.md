@@ -61,6 +61,7 @@ tti = 60
 enabled = true
 address = "127.0.0.1"
 port = 8086
+auth_token = "replace-with-a-long-random-rpc-token"
 
 [mint_info]
 name = "INR2 Voting Mint"
@@ -236,7 +237,14 @@ curl -sS https://inr2.cashu.exchange/.well-known/lnurlp/blue | jq .
 Approve a mint quote:
 
 ```bash
+CDK_MINT_RPC_TOKEN="replace-with-a-long-random-rpc-token" \
 cdk-mint-cli --addr http://127.0.0.1:8086 update-nut04-quote-state <QUOTE_ID> PAID
+```
+
+You can also set the token with environment variable on the mint host:
+
+```bash
+export CDK_MINTD_MANAGEMENT_AUTH_TOKEN="replace-with-a-long-random-rpc-token"
 ```
 
 ## 11) End-to-end live demo (2 voters)
@@ -288,3 +296,27 @@ sequenceDiagram
 - Vote options are case-insensitive.
 - `manual_approval_incoming = true` disables automint; quotes stay `UNPAID` until operator approval.
 - Custom vote strings (`RED`, `BLUE`) and LN-address encoded descriptions are both supported.
+
+## 13) GitHub CI live E2E
+
+Workflow file:
+
+```text
+.github/workflows/voting-live-e2e.yml
+```
+
+CI script:
+
+```text
+crates/cdk-mintd/scripts/ci_live_voting_e2e.py
+```
+
+Required GitHub repository secrets:
+
+- `VOTING_E2E_BASE_URL` (for example `https://inr2.cashu.exchange`)
+- `VOTING_E2E_RPC_ADDR` (publicly reachable gRPC endpoint for `cdk-mintd` management RPC, for example `http://inr2.cashu.exchange:8086`)
+- `VOTING_E2E_RPC_TOKEN` (same value as `auth_token` / `CDK_MINTD_MANAGEMENT_AUTH_TOKEN`)
+
+The CI workflow does not use SSH. It approves mint quotes over gRPC with `cdk-mint-cli` and an RPC token header.
+
+If you expose management RPC publicly, restrict network access to trusted CIDRs and rotate `auth_token` regularly.

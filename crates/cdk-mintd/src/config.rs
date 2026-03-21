@@ -722,6 +722,7 @@ pub struct MintManagementRpc {
     pub address: Option<String>,
     pub port: Option<u16>,
     pub tls_dir_path: Option<PathBuf>,
+    pub auth_token: Option<String>,
 }
 
 impl Settings {

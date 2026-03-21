@@ -928,7 +928,12 @@ async fn start_services_with_shutdown(
             if rpc_settings.enabled {
                 let addr = rpc_settings.address.unwrap_or("127.0.0.1".to_string());
                 let port = rpc_settings.port.unwrap_or(8086);
-                let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(&addr, port, mint.clone())?;
+                let mut mint_rpc = cdk_mint_rpc::MintRPCServer::new(
+                    &addr,
+                    port,
+                    mint.clone(),
+                    rpc_settings.auth_token.clone(),
+                )?;
 
                 let tls_dir = rpc_settings.tls_dir_path.unwrap_or(_work_dir.join("tls"));
 

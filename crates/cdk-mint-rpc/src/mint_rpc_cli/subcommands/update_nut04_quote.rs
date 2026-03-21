@@ -1,11 +1,9 @@
 use anyhow::Result;
-use cdk_common::grpc::VERSION_HEADER;
 use clap::Args;
-use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
-use tonic::Request;
 
 use crate::cdk_mint_client::CdkMintClient;
+use crate::mint_rpc_cli::subcommands::with_version_header;
 use crate::UpdateNut04QuoteRequest;
 
 /// Command to update the state of a NUT-04 quote
@@ -33,15 +31,10 @@ pub async fn update_nut04_quote_state(
     client: &mut CdkMintClient<Channel>,
     sub_command_args: &UpdateNut04QuoteCommand,
 ) -> Result<()> {
-    let mut request = Request::new(UpdateNut04QuoteRequest {
+    let request = with_version_header(tonic::Request::new(UpdateNut04QuoteRequest {
         quote_id: sub_command_args.quote_id.clone(),
         state: sub_command_args.state.clone(),
-    });
-
-    request.metadata_mut().insert(
-        VERSION_HEADER,
-        MetadataValue::from_static(cdk_common::MINT_RPC_PROTOCOL_VERSION),
-    );
+    }));
 
     let response = client
         .update_nut04_quote(request)

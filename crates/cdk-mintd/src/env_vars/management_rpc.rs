@@ -9,6 +9,7 @@ pub const ENV_MINT_MANAGEMENT_ENABLED: &str = "CDK_MINTD_MINT_MANAGEMENT_ENABLED
 pub const ENV_MINT_MANAGEMENT_ADDRESS: &str = "CDK_MINTD_MANAGEMENT_ADDRESS";
 pub const ENV_MINT_MANAGEMENT_PORT: &str = "CDK_MINTD_MANAGEMENT_PORT";
 pub const ENV_MINT_MANAGEMENT_TLS_DIR_PATH: &str = "CDK_MINTD_MANAGEMENT_TLS_DIR_PATH";
+pub const ENV_MINT_MANAGEMENT_AUTH_TOKEN: &str = "CDK_MINTD_MANAGEMENT_AUTH_TOKEN";
 
 impl MintManagementRpc {
     pub fn from_env(mut self) -> Self {
@@ -30,6 +31,10 @@ impl MintManagementRpc {
 
         if let Ok(tls_path) = env::var(ENV_MINT_MANAGEMENT_TLS_DIR_PATH) {
             self.tls_dir_path = Some(tls_path.into());
+        }
+
+        if let Ok(auth_token) = env::var(ENV_MINT_MANAGEMENT_AUTH_TOKEN) {
+            self.auth_token = Some(auth_token);
         }
 
         self

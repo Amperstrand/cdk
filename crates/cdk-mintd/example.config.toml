@@ -31,6 +31,7 @@ melt_ttl = 120
 enabled = false
 # address = "127.0.0.1"
 # port = 8086
+# auth_token = "set-a-strong-rpc-token"
 
 #[prometheus]
 #enabled = true

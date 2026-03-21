@@ -1,6 +1,6 @@
 //! Subcommands for the mint RPC CLI
 
-use cdk_common::grpc::VERSION_HEADER;
+use cdk_common::grpc::{RPC_TOKEN_HEADER, VERSION_HEADER};
 use tonic::metadata::MetadataValue;
 use tonic::Request;
 
@@ -10,6 +10,13 @@ pub fn with_version_header<T>(mut request: Request<T>) -> Request<T> {
         VERSION_HEADER,
         MetadataValue::from_static(cdk_common::MINT_RPC_PROTOCOL_VERSION),
     );
+
+    if let Ok(token) = std::env::var("CDK_MINT_RPC_TOKEN") {
+        if let Ok(value) = MetadataValue::try_from(token.as_str()) {
+            request.metadata_mut().insert(RPC_TOKEN_HEADER, value);
+        }
+    }
+
     request
 }
 

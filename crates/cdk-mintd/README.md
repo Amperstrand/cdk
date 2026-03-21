@@ -331,6 +331,9 @@ FakeWallet voting environment variables:
 - `CDK_MINTD_FAKE_WALLET_VOTING_TOPIC`
 - `CDK_MINTD_FAKE_WALLET_VOTING_FEE_SAT`
 
+Management RPC token environment variable:
+- `CDK_MINTD_MANAGEMENT_AUTH_TOKEN`
+
 For complete configuration options, see the [example configuration file](./example.config.toml).
 
 ## Documentation

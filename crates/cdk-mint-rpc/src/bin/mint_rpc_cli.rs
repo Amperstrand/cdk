@@ -3,23 +3,13 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
-use cdk_common::grpc::VERSION_HEADER;
 use cdk_mint_rpc::cdk_mint_client::CdkMintClient;
 use cdk_mint_rpc::mint_rpc_cli::subcommands;
 use cdk_mint_rpc::GetInfoRequest;
 use clap::{Parser, Subcommand};
-use tonic::metadata::MetadataValue;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 use tonic::Request;
 
-/// Helper function to add version header to a request
-fn with_version_header<T>(mut request: Request<T>) -> Request<T> {
-    request.metadata_mut().insert(
-        VERSION_HEADER,
-        MetadataValue::from_static(cdk_common::MINT_RPC_PROTOCOL_VERSION),
-    );
-    request
-}
 use tracing_subscriber::EnvFilter;
 
 /// Common CLI arguments for CDK binaries
@@ -154,6 +144,16 @@ async fn main() -> Result<()> {
             .tls_config(tls)?
             .connect()
             .await?
+    } else if cli.addr.starts_with("https://") {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+
+        let tls = ClientTlsConfig::new().with_enabled_roots();
+        Channel::from_shared(cli.addr.to_string())?
+            .tls_config(tls)?
+            .connect()
+            .await?
     } else {
         // No TLS directory, skip TLS configuration
         Channel::from_shared(cli.addr.to_string())?
@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::GetInfo => {
             let response = client
-                .get_info(with_version_header(Request::new(GetInfoRequest {})))
+                .get_info(subcommands::with_version_header(Request::new(GetInfoRequest {})))
                 .await?;
             let info = response.into_inner();
             println!(

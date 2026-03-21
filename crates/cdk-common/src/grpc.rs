@@ -4,6 +4,8 @@ use tonic::{Request, Status};
 
 /// Header name for protocol version
 pub const VERSION_HEADER: &str = "x-cdk-protocol-version";
+/// Header name for management RPC token authentication
+pub const RPC_TOKEN_HEADER: &str = "x-cdk-rpc-token";
 /// Header for version of the signatory protofile
 pub const VERSION_SIGNATORY_HEADER: &str = "x-signatory-schema-version";
 
