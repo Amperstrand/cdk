@@ -21,6 +21,8 @@ pub mod common;
 pub mod database;
 pub mod error;
 pub mod melt;
+pub mod merkle;
+pub mod vote_ledger;
 #[cfg(feature = "mint")]
 pub mod mint;
 pub mod mint_quote;

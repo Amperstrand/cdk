@@ -182,3 +182,14 @@ For maximum privacy-conscious voters:
 4. Vote
 
 The result: The mint records "RED +50 sats" but cannot prove which voter cast it.
+
+---
+
+## Verifiability: Proving Your Vote Was Counted
+
+**See [VOTING_VERIFIABILITY.md](./VOTING_VERIFIABILITY.md)** for how voters can verify their vote was included in the final tally using Merkle proofs.
+
+**Key points:**
+- DLEQ (NUT-12) proves token validity
+- Merkle tree inclusion proofs prove tally inclusion
+- Voters can verify: "My vote appears in the published list"
