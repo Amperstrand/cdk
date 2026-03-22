@@ -9,6 +9,7 @@ use cdk::nuts::{
     CheckStateRequest, CheckStateResponse, Id, KeysResponse, KeysetResponse, MintInfo,
     RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
+use cdk::util::hex;
 use cdk::util::unix_time;
 use paste::paste;
 use tracing::instrument;
@@ -307,6 +308,133 @@ pub(crate) async fn post_restore(
     })?;
 
     Ok(Json(restore_response))
+}
+
+#[derive(serde::Serialize)]
+pub struct VoteLedgerResponse {
+    pub topic: String,
+    pub votes: Vec<VoteEntryResponse>,
+    pub tally: std::collections::HashMap<String, TallyResponse>,
+    pub merkle_root: Option<String>,
+    pub finalized: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct VoteEntryResponse {
+    pub index: usize,
+    pub commitment: String,
+    pub option: String,
+    pub amount_sat: u64,
+    pub timestamp: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct TallyResponse {
+    pub option: String,
+    pub total_amount: u64,
+    pub vote_count: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct VoteProofResponse {
+    pub entry: VoteEntryResponse,
+    pub proof: cdk::merkle::MerkleProof,
+}
+
+#[derive(serde::Serialize)]
+pub struct FinalizeVoteResponse {
+    pub merkle_root: String,
+    pub vote_count: usize,
+}
+
+#[instrument(skip_all)]
+pub(crate) async fn get_votes(
+    State(state): State<MintState>,
+) -> Result<Json<VoteLedgerResponse>, Response> {
+    let ledger = state.mint.get_vote_ledger().await;
+
+    let votes: Vec<VoteEntryResponse> = ledger
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, v)| VoteEntryResponse {
+            index: i,
+            commitment: hex::encode(v.commitment),
+            option: v.option.clone(),
+            amount_sat: v.amount_sat,
+            timestamp: v.timestamp,
+        })
+        .collect();
+
+    let tally: std::collections::HashMap<String, TallyResponse> = ledger
+        .tallies
+        .iter()
+        .map(|(k, t)| {
+            (
+                k.clone(),
+                TallyResponse {
+                    option: t.option.clone(),
+                    total_amount: t.total_amount,
+                    vote_count: t.vote_count,
+                },
+            )
+        })
+        .collect();
+
+    Ok(Json(VoteLedgerResponse {
+        topic: ledger.topic,
+        votes,
+        tally,
+        merkle_root: ledger.merkle_root.map(hex::encode),
+        finalized: ledger.finalized,
+    }))
+}
+
+#[instrument(skip_all)]
+pub(crate) async fn post_votes_finalize(
+    State(state): State<MintState>,
+) -> Result<Json<FinalizeVoteResponse>, Response> {
+    let root = state.mint.finalize_vote_ledger().await.map_err(|err| {
+        tracing::error!("Could not finalize vote ledger: {}", err);
+        into_response(err)
+    })?;
+
+    let ledger = state.mint.get_vote_ledger().await;
+
+    Ok(Json(FinalizeVoteResponse {
+        merkle_root: hex::encode(root),
+        vote_count: ledger.entries.len(),
+    }))
+}
+
+#[instrument(skip_all)]
+pub(crate) async fn get_vote_proof(
+    State(state): State<MintState>,
+    Path(index): Path<usize>,
+) -> Result<Json<VoteProofResponse>, Response> {
+    let (entry, proof) = state
+        .mint
+        .get_vote_proof(index)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not get vote proof: {}", err);
+            into_response(err)
+        })?
+        .ok_or_else(|| {
+            tracing::error!("Vote not found at index {}", index);
+            into_response(cdk::error::Error::UnknownQuote)
+        })?;
+
+    Ok(Json(VoteProofResponse {
+        entry: VoteEntryResponse {
+            index: entry.index,
+            commitment: hex::encode(entry.commitment),
+            option: entry.option,
+            amount_sat: entry.amount_sat,
+            timestamp: entry.timestamp,
+        },
+        proof,
+    }))
 }
 
 #[instrument(skip_all)]

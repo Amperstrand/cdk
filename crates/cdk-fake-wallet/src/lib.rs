@@ -381,6 +381,7 @@ pub struct FakeWallet {
     voting_options: Vec<String>,
     voting_topic: String,
     vote_ledger: Arc<Mutex<VoteLedger>>,
+    pending_vote: Arc<Mutex<Option<payment::VoteInfo>>>,
     unit: CurrencyUnit,
     secondary_repayment_queue: SecondaryRepaymentQueue,
     exchange_rate_cache: ExchangeRateCache,
@@ -441,6 +442,7 @@ impl FakeWallet {
                 topic: "Vote".to_string(),
                 created_at: unix_timestamp_now(),
             })),
+            pending_vote: Arc::new(Mutex::new(None)),
             unit,
             secondary_repayment_queue,
             exchange_rate_cache: ExchangeRateCache::new(),
@@ -1030,6 +1032,12 @@ impl MintPayment for FakeWallet {
                 let amount_sat = amount_msat / 1000;
                 self.record_vote(&option, amount_sat).await;
 
+                // Store pending vote info for melt saga to retrieve
+                *self.pending_vote.lock().await = Some(payment::VoteInfo {
+                    option: option.clone(),
+                    amount_sat,
+                });
+
                 let payment_lookup_id = Self::checking_id_for_vote(&option);
 
                 let amount_in_unit = convert_currency_amount(
@@ -1233,6 +1241,20 @@ impl MintPayment for FakeWallet {
             status,
             total_spent,
         })
+    }
+
+    fn as_vote_backend(&self) -> Option<&dyn payment::VoteBackend> {
+        Some(self)
+    }
+}
+
+impl payment::VoteBackend for FakeWallet {
+    fn get_vote_info(&self) -> Option<payment::VoteInfo> {
+        futures::executor::block_on(async { self.pending_vote.lock().await.clone() })
+    }
+
+    fn clear_vote_info(&self) {
+        futures::executor::block_on(async { *self.pending_vote.lock().await = None });
     }
 }
 

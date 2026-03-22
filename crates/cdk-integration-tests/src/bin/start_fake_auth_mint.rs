@@ -61,6 +61,10 @@ async fn start_fake_auth_mint(
         min_delay_time: 1,
         max_delay_time: 3,
         manual_approval_incoming: false,
+        voting_enabled: false,
+        voting_options: None,
+        voting_topic: None,
+        voting_fee_sat: 1,
     };
 
     let mut settings = shared::create_fake_wallet_settings(

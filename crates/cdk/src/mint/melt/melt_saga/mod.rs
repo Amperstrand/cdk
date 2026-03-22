@@ -585,13 +585,13 @@ impl MeltSaga<SetupComplete> {
         self,
         settlement: SettlementDecision,
     ) -> Result<MeltSaga<PaymentConfirmed>, Error> {
-        let payment_result = match settlement {
-            SettlementDecision::Internal { amount } => self.handle_internal_payment(amount),
+        let (payment_result, vote_info) = match settlement {
+            SettlementDecision::Internal { amount } => (self.handle_internal_payment(amount), None),
             SettlementDecision::RequiresExternalPayment => {
-                let response = self.attempt_external_payment().await?;
+                let (response, vote_info) = self.attempt_external_payment().await?;
 
                 match response.status {
-                    MeltQuoteState::Paid => response,
+                    MeltQuoteState::Paid => (response, vote_info),
                     MeltQuoteState::Unpaid | MeltQuoteState::Failed => {
                         tracing::info!(
                             "Lightning payment for quote {} failed.",
@@ -618,7 +618,6 @@ impl MeltSaga<SetupComplete> {
             }
         };
 
-        // Transition to PaymentConfirmed state
         Ok(MeltSaga {
             mint: self.mint,
             db: self.db,
@@ -634,6 +633,7 @@ impl MeltSaga<SetupComplete> {
                 payment_result,
                 operation: self.state_data.operation,
                 fee_breakdown: self.state_data.fee_breakdown,
+                vote_info,
             },
         })
     }
@@ -661,7 +661,9 @@ impl MeltSaga<SetupComplete> {
         }
     }
 
-    async fn attempt_external_payment(&self) -> Result<MakePaymentResponse, Error> {
+    async fn attempt_external_payment(
+        &self,
+    ) -> Result<(MakePaymentResponse, Option<cdk_common::payment::VoteInfo>), Error> {
         // Get LN payment processor
         let ln = self
             .mint
@@ -699,16 +701,29 @@ impl MeltSaga<SetupComplete> {
         ln: Arc<
             dyn cdk_common::payment::MintPayment<Err = cdk_common::payment::Error> + Send + Sync,
         >,
-    ) -> Result<MakePaymentResponse, Error> {
-        // Make payment with idempotent verification
+    ) -> Result<(MakePaymentResponse, Option<cdk_common::payment::VoteInfo>), Error> {
         let quote = &self.state_data.quote;
         let payment_options = OutgoingPaymentOptions::from_melt_quote_with_fee(quote.clone())?;
 
-        match ln.make_payment(&quote.unit, payment_options).await {
+        let result = match ln.make_payment(&quote.unit, payment_options).await {
             Ok(pay) if pay.status == MeltQuoteState::Paid => Ok(pay),
-            Ok(pay) => self.verify_ambiguous_payment(ln, pay).await,
-            Err(err) => self.handle_payment_error(ln, err).await,
+            Ok(pay) => self.verify_ambiguous_payment(Arc::clone(&ln), pay).await,
+            Err(err) => self.handle_payment_error(Arc::clone(&ln), err).await,
+        };
+
+        let payment_result = result?;
+
+        // Get vote info from backend if it supports voting
+        let vote_info = ln
+            .as_vote_backend()
+            .and_then(|vb| vb.get_vote_info());
+
+        // Clear pending vote from backend after retrieving
+        if let Some(vb) = ln.as_vote_backend() {
+            vb.clear_vote_info();
         }
+
+        Ok((payment_result, vote_info))
     }
 
     async fn verify_ambiguous_payment(
@@ -984,6 +999,31 @@ impl MeltSaga<PaymentConfirmed> {
             .await?;
 
         tx.commit().await?;
+
+        // Record vote if this was a voting payment
+        if let Some(ref vote_info) = self.state_data.vote_info {
+            let commitment = {
+                use bitcoin::hashes::{Hash, HashEngine};
+                use bitcoin::hashes::sha256::Hash as Sha256Hash;
+                let mut hasher = Sha256Hash::engine();
+                for y in &self.state_data.input_ys {
+                    hasher.input(&y.to_bytes());
+                }
+                Sha256Hash::from_engine(hasher).to_byte_array()
+            };
+
+            match self.mint.record_vote(commitment, &vote_info.option, vote_info.amount_sat).await {
+                Ok(index) => {
+                    tracing::info!(
+                        "Recorded vote for option '{}' with {} sats at index {}",
+                        vote_info.option, vote_info.amount_sat, index
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to record vote: {}", e);
+                }
+            }
+        }
 
         self.pubsub.melt_quote_status(
             &quote,

@@ -149,6 +149,10 @@ pub enum Error {
     #[error("Failed to request invoice from Lightning address service: {0}")]
     LightningAddressRequest(String),
 
+    /// Vote ledger error
+    #[error("Vote ledger error: {0}")]
+    VoteLedger(#[from] crate::vote_ledger::VoteLedgerError),
+
     /// Internal Error - Send error
     #[error("Internal send error: {0}")]
     SendError(String),

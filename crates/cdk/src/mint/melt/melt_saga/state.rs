@@ -32,12 +32,15 @@ pub struct SetupComplete {
 /// Only the `finalize` method is available.
 pub struct PaymentConfirmed {
     pub quote: MeltQuote,
+    #[allow(dead_code)]
     pub input_ys: Vec<PublicKey>,
-    #[allow(dead_code)] // Stored for completeness, accessed from DB in finalize
+    #[allow(dead_code)]
     pub blinded_messages: Vec<BlindedMessage>,
     pub payment_result: MakePaymentResponse,
+    #[allow(dead_code)]
     pub operation: Operation,
     pub fee_breakdown: crate::fees::ProofsFeeBreakdown,
+    pub vote_info: Option<cdk_common::payment::VoteInfo>,
 }
 
 /// Result of attempting internal settlement for a melt operation.

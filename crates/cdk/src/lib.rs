@@ -78,6 +78,10 @@ pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 /// Re-export subscription
 pub use cdk_common::subscription;
+/// Re-export merkle tree for vote verification
+pub use cdk_common::merkle;
+/// Re-export vote ledger for vote verification
+pub use cdk_common::vote_ledger;
 #[cfg(any(feature = "wallet", feature = "mint"))]
 pub mod http_client {
     //! Re-export HTTP client types from cdk-http-client (via cdk-common)

@@ -76,6 +76,8 @@ pub struct Mint {
     max_inputs: usize,
     /// Maximum number of outputs allowed per transaction
     max_outputs: usize,
+    /// Verifiable vote ledger for recording votes with Merkle proofs
+    vote_ledger: Arc<Mutex<crate::vote_ledger::VerifiableVoteLedger>>,
 }
 
 impl std::fmt::Debug for Mint {
@@ -247,6 +249,9 @@ impl Mint {
             task_state: Arc::new(Mutex::new(TaskState::default())),
             max_inputs,
             max_outputs,
+            vote_ledger: Arc::new(Mutex::new(
+                crate::vote_ledger::VerifiableVoteLedger::new("Vote".to_string()),
+            )),
         })
     }
 
@@ -1073,6 +1078,45 @@ impl Mint {
         global::dec_in_flight_requests("total_redeemed");
 
         total_redeemed
+    }
+
+    /// Record a vote in the verifiable vote ledger
+    #[instrument(skip_all)]
+    pub async fn record_vote(
+        &self,
+        commitment: [u8; 32],
+        option: &str,
+        amount_sat: u64,
+    ) -> Result<usize, Error> {
+        let mut ledger = self.vote_ledger.lock().await;
+        ledger
+            .record_vote(commitment, &option.to_string(), amount_sat)
+            .map_err(Error::VoteLedger)
+    }
+
+    /// Finalize the vote ledger and build the Merkle tree
+    ///
+    /// Returns the Merkle root hash for publication
+    #[instrument(skip_all)]
+    pub async fn finalize_vote_ledger(&self) -> Result<[u8; 32], Error> {
+        let mut ledger = self.vote_ledger.lock().await;
+        ledger.finalize().map_err(Error::VoteLedger)
+    }
+
+    /// Get the current vote ledger state
+    #[instrument(skip_all)]
+    pub async fn get_vote_ledger(&self) -> crate::vote_ledger::VerifiableVoteLedger {
+        self.vote_ledger.lock().await.clone()
+    }
+
+    /// Get a vote entry with its Merkle proof
+    #[instrument(skip_all)]
+    pub async fn get_vote_proof(
+        &self,
+        index: usize,
+    ) -> Result<Option<(crate::vote_ledger::VoteEntry, crate::merkle::MerkleProof)>, Error> {
+        let ledger = self.vote_ledger.lock().await;
+        ledger.proof(index).map(Some).map_err(Error::VoteLedger)
     }
 }
 

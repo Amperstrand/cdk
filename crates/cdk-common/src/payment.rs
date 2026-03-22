@@ -396,6 +396,14 @@ pub trait MintPayment {
         &self,
         payment_identifier: &PaymentIdentifier,
     ) -> Result<MakePaymentResponse, Self::Err>;
+
+    /// Optional: Cast to VoteBackend if this backend supports voting
+    ///
+    /// Default implementation returns `None`. Backends that support voting
+    /// (like FakeWallet) should override this to return `Some(self)`.
+    fn as_vote_backend(&self) -> Option<&dyn VoteBackend> {
+        None
+    }
 }
 
 /// An event emitted which should be handled by the mint
@@ -465,6 +473,29 @@ pub struct MakePaymentResponse {
     pub status: MeltQuoteState,
     /// Total Amount Spent (typed with unit for compile-time safety)
     pub total_spent: Amount<CurrencyUnit>,
+}
+
+/// Vote information for voting-enabled payment backends
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteInfo {
+    /// The vote option (e.g., "RED", "BLUE")
+    pub option: String,
+    /// Amount in satoshis (vote weight)
+    pub amount_sat: u64,
+}
+
+/// Trait for payment backends that support voting
+///
+/// This trait allows backends like FakeWallet to expose vote information
+/// without polluting the common `MakePaymentResponse` type.
+pub trait VoteBackend: Send + Sync {
+    /// Get pending vote info from the last payment
+    ///
+    /// Returns `None` if the last payment was not a vote or if no payment has been made.
+    fn get_vote_info(&self) -> Option<VoteInfo>;
+
+    /// Clear pending vote info (called after vote is recorded)
+    fn clear_vote_info(&self);
 }
 
 impl MakePaymentResponse {
