@@ -404,6 +404,13 @@ fn default_webserver_port() -> Option<u16> {
 }
 
 #[cfg(feature = "fakewallet")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoteKeyset {
+    pub issue: String,
+    pub options: Vec<String>,
+}
+
+#[cfg(feature = "fakewallet")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FakeWallet {
     pub supported_units: Vec<CurrencyUnit>,
@@ -423,6 +430,8 @@ pub struct FakeWallet {
     pub voting_topic: Option<String>,
     #[serde(default = "default_voting_fee_sat")]
     pub voting_fee_sat: u64,
+    #[serde(default)]
+    pub vote_keysets: Option<Vec<VoteKeyset>>,
 }
 
 #[cfg(feature = "fakewallet")]
@@ -439,6 +448,7 @@ impl Default for FakeWallet {
             voting_options: None,
             voting_topic: None,
             voting_fee_sat: default_voting_fee_sat(),
+            vote_keysets: None,
         }
     }
 }

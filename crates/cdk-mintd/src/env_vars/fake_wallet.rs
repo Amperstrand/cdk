@@ -4,7 +4,7 @@ use std::env;
 
 use cdk::nuts::CurrencyUnit;
 
-use crate::config::FakeWallet;
+use crate::config::{FakeWallet, VoteKeyset};
 
 // Fake Wallet environment variables
 pub const ENV_FAKE_WALLET_SUPPORTED_UNITS: &str = "CDK_MINTD_FAKE_WALLET_SUPPORTED_UNITS";
@@ -18,6 +18,47 @@ pub const ENV_FAKE_WALLET_VOTING_ENABLED: &str = "CDK_MINTD_FAKE_WALLET_VOTING_E
 pub const ENV_FAKE_WALLET_VOTING_OPTIONS: &str = "CDK_MINTD_FAKE_WALLET_VOTING_OPTIONS";
 pub const ENV_FAKE_WALLET_VOTING_TOPIC: &str = "CDK_MINTD_FAKE_WALLET_VOTING_TOPIC";
 pub const ENV_FAKE_WALLET_VOTING_FEE_SAT: &str = "CDK_MINTD_FAKE_WALLET_VOTING_FEE_SAT";
+pub const ENV_FAKE_WALLET_VOTE_KEYSETS: &str = "CDK_MINTD_FAKE_WALLET_VOTE_KEYSETS";
+
+fn parse_vote_keysets(value: &str) -> Option<Vec<VoteKeyset>> {
+    let keysets: Vec<VoteKeyset> = value
+        .split(';')
+        .filter_map(|raw_keyset| {
+            let raw_keyset = raw_keyset.trim();
+            if raw_keyset.is_empty() {
+                return None;
+            }
+
+            let (issue, options_raw) = raw_keyset.split_once(':')?;
+            let issue = issue.trim();
+            if issue.is_empty() {
+                return None;
+            }
+
+            let options: Vec<String> = options_raw
+                .split('|')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+
+            if options.is_empty() {
+                return None;
+            }
+
+            Some(VoteKeyset {
+                issue: issue.to_owned(),
+                options,
+            })
+        })
+        .collect();
+
+    if keysets.is_empty() {
+        None
+    } else {
+        Some(keysets)
+    }
+}
 
 impl FakeWallet {
     pub fn from_env(mut self) -> Self {
@@ -92,6 +133,10 @@ impl FakeWallet {
             if let Ok(voting_fee_sat) = voting_fee_sat_str.parse::<u64>() {
                 self.voting_fee_sat = voting_fee_sat;
             }
+        }
+
+        if let Ok(vote_keysets_raw) = env::var(ENV_FAKE_WALLET_VOTE_KEYSETS) {
+            self.vote_keysets = parse_vote_keysets(&vote_keysets_raw);
         }
 
         self

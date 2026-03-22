@@ -330,6 +330,7 @@ FakeWallet voting environment variables:
 - `CDK_MINTD_FAKE_WALLET_VOTING_OPTIONS` (comma-separated, example: `RED,BLUE`)
 - `CDK_MINTD_FAKE_WALLET_VOTING_TOPIC`
 - `CDK_MINTD_FAKE_WALLET_VOTING_FEE_SAT`
+- `CDK_MINTD_FAKE_WALLET_VOTE_KEYSETS` (semi-colon separated issues, example: `election2026:RED|BLUE;budget2026:YES|NO`)
 
 Management RPC token environment variable:
 - `CDK_MINTD_MANAGEMENT_AUTH_TOKEN`
@@ -340,7 +341,9 @@ For complete configuration options, see the [example configuration file](./examp
 
 - **[Configuration Examples](./example.config.toml)** - Complete configuration reference
 - **[FakeWallet Voting Deployment](./DEPLOY_FAKEWALLET_VOTING.md)** - End-to-end HTTPS deployment and voting usage
+- **[Keyset Voting PoC](./VOTING_KEYSET_POC.md)** - Keyset-based voting exploration and policy model
 - **[Voting E2E Demo Script](./scripts/voting_e2e_live_demo.sh)** - Two-voter live walkthrough with manual quote approval
+- **[Keyset Voting CI Demo Script](./scripts/ci_keyset_voting_e2e.py)** - Deploy-targeted keyset voting checks for CI
 - **[LN-address Vote Proxy](./scripts/vote_lnurl_proxy.py)** - `red@...` / `blue@...` LNURL adapter for vote descriptions
 - **[PostgreSQL Setup Guide](../../docker-compose.postgres.yaml)** - Database setup with Docker Compose
 - **[Development Guide](../../DEVELOPMENT.md)** - Contributing and development setup

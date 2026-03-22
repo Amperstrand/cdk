@@ -77,6 +77,11 @@ async fn start_fake_mint(
         min_delay_time: 1,
         max_delay_time: 3,
         manual_approval_incoming: false,
+        voting_enabled: false,
+        voting_options: None,
+        voting_topic: None,
+        voting_fee_sat: 1,
+        vote_keysets: None,
     });
 
     // Create settings struct for fake mint using shared function

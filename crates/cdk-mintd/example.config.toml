@@ -185,6 +185,11 @@ voting_enabled = false
 voting_options = ["RED", "BLUE"]
 voting_topic = "Red vs Blue"
 voting_fee_sat = 0
+# Optional keyset-based voting exploration
+# vote_keysets = [
+#   { issue = "election2026", options = ["RED", "BLUE"] },
+#   { issue = "budget2026", options = ["YES", "NO"] },
+# ]
 
 # [grpc_processor]
 # gRPC Payment Processor configuration

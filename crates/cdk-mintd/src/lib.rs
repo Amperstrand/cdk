@@ -73,6 +73,91 @@ pub mod setup;
 const CARGO_PKG_VERSION: Option<&'static str> = option_env!("CARGO_PKG_VERSION");
 const DEFAULT_BATCH_MINT_SIZE: u64 = 100;
 
+#[cfg(feature = "fakewallet")]
+fn sanitize_vote_unit_component(input: &str) -> String {
+    let normalized: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    normalized.trim_matches('_').to_string()
+}
+
+#[cfg(feature = "fakewallet")]
+fn vote_keyset_units(settings: &config::Settings) -> Vec<cdk::nuts::CurrencyUnit> {
+    let Some(fake_wallet) = settings.fake_wallet.as_ref() else {
+        return Vec::new();
+    };
+
+    let Some(vote_keysets) = fake_wallet.vote_keysets.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut units = Vec::new();
+    for vote_keyset in vote_keysets {
+        let issue = sanitize_vote_unit_component(&vote_keyset.issue);
+        if issue.is_empty() {
+            continue;
+        }
+
+        for option in &vote_keyset.options {
+            let option = sanitize_vote_unit_component(option);
+            if option.is_empty() {
+                continue;
+            }
+
+            units.push(cdk::nuts::CurrencyUnit::custom(format!(
+                "vote_{}_{}",
+                issue, option
+            )));
+        }
+    }
+
+    units
+}
+
+#[cfg(feature = "fakewallet")]
+fn default_vote_amounts() -> Vec<u64> {
+    vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+}
+
+#[cfg(feature = "fakewallet")]
+async fn ensure_vote_keysets(settings: &config::Settings, mint: &Mint) -> Result<()> {
+    let units = vote_keyset_units(settings);
+    if units.is_empty() {
+        return Ok(());
+    }
+
+    let active_keysets = mint.keysets();
+    for unit in units {
+        let exists = active_keysets
+            .keysets
+            .iter()
+            .any(|keyset| keyset.active && keyset.unit == unit);
+
+        if exists {
+            continue;
+        }
+
+        mint.rotate_keyset(
+            unit,
+            default_vote_amounts(),
+            settings.info.input_fee_ppk.unwrap_or(0),
+            settings.info.use_keyset_v2.unwrap_or(true),
+            None,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 fn extract_supported_payment_methods(mint_info: &cdk::nuts::MintInfo) -> Vec<String> {
     let mut seen = HashSet::new();
     mint_info
@@ -1402,6 +1487,9 @@ pub async fn run_mintd_with_shutdown(
     let config_mint_info = mint_builder.current_mint_info();
 
     let mint = build_mint(settings, keystore, mint_builder).await?;
+
+    #[cfg(feature = "fakewallet")]
+    ensure_vote_keysets(settings, &mint).await?;
 
     tracing::debug!("Mint built from builder.");
 

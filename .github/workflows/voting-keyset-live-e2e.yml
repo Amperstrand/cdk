@@ -1,0 +1,33 @@
+name: Voting Keyset Live E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/keyset-voting-exploration
+  schedule:
+    - cron: "47 */6 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  keyset-voting-live-e2e:
+    name: Keyset Voting Live E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          test -n "${{ secrets.KEYSET_VOTING_E2E_BASE_URL }}" || (echo "Missing secret: KEYSET_VOTING_E2E_BASE_URL" && exit 1)
+          test -n "${{ secrets.KEYSET_VOTING_E2E_EXPECTED_UNITS }}" || (echo "Missing secret: KEYSET_VOTING_E2E_EXPECTED_UNITS" && exit 1)
+
+      - name: Run keyset voting e2e checks
+        env:
+          KEYSET_VOTING_E2E_BASE_URL: ${{ secrets.KEYSET_VOTING_E2E_BASE_URL }}
+          KEYSET_VOTING_E2E_EXPECTED_UNITS: ${{ secrets.KEYSET_VOTING_E2E_EXPECTED_UNITS }}
+        run: python3 crates/cdk-mintd/scripts/ci_keyset_voting_e2e.py
