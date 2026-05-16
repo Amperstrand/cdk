@@ -65,7 +65,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
-          targets: ${{ matrix.target }}
+
+      - name: Add musl target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Discover OpenWrt SDK filename
         id: sdk-url
