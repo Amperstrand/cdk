@@ -64,7 +64,7 @@ jobs:
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools
+          sudo apt-get install -y -qq musl-tools protobuf-compiler
           if [ "${{ matrix.compile_key }}" = "arm64" ]; then
             sudo apt-get install -y -qq gcc-aarch64-linux-gnu
           fi
