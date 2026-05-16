@@ -58,6 +58,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Add musl target (override rust-toolchain.toml)
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update -qq
