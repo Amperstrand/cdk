@@ -21,8 +21,8 @@ jobs:
           cat > matrix.json << 'EOF'
           {
             "include": [
-              { "compile_key": "x86_64", "target": "x86_64-unknown-linux-musl",  "toolchain": "stable", "architecture": "x86_64" },
-              { "compile_key": "arm64",  "target": "aarch64-unknown-linux-musl", "toolchain": "stable", "architecture": "aarch64_cortex-a53" }
+              { "compile_key": "x86_64", "target": "x86_64-unknown-linux-musl",  "toolchain": "stable", "architecture": "x86_64", "openwrt_target": "x86/64" },
+              { "compile_key": "arm64",  "target": "aarch64-unknown-linux-musl", "toolchain": "stable", "architecture": "aarch64_cortex-a53", "openwrt_target": "mediatek/filogic" }
             ]
           }
           EOF
@@ -65,34 +65,116 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.target }}
 
-      - name: Cache cross binary
-        id: cache-cross
+      - name: Discover OpenWrt toolchain filename
+        id: toolchain-url
+        run: |
+          set -euo pipefail
+          BASE_URL="https://downloads.openwrt.org/snapshots/targets/${{ matrix.openwrt_target }}"
+          TOOLCHAIN_FILE=$(curl -sL "$BASE_URL/" | grep -oP 'openwrt-toolchain-[^"]*\.tar\.zst' | head -1)
+          if [ -z "$TOOLCHAIN_FILE" ]; then
+            echo "ERROR: Could not discover toolchain filename from $BASE_URL"
+            exit 1
+          fi
+          echo "filename=$TOOLCHAIN_FILE" >> $GITHUB_OUTPUT
+          echo "url=${BASE_URL}/${TOOLCHAIN_FILE}" >> $GITHUB_OUTPUT
+          echo "Discovered toolchain: $TOOLCHAIN_FILE"
+
+      - name: Cache OpenWrt toolchain
+        id: cache-toolchain
         uses: actions/cache@v5
         with:
-          path: ~/.cargo/bin/cross
-          key: ${{ runner.os }}-cross-git-main
+          path: /tmp/openwrt-toolchain.tar.zst
+          key: openwrt-toolchain-${{ steps.toolchain-url.outputs.filename }}
 
-      - name: Install cross
-        if: steps.cache-cross.outputs.cache-hit != 'true'
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Download OpenWrt toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -L -o /tmp/openwrt-toolchain.tar.zst "${{ steps.toolchain-url.outputs.url }}"
+
+      - name: Extract toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/openwrt-sdk
+          tar --zstd -xf /tmp/openwrt-toolchain.tar.zst -C /tmp/openwrt-sdk
+          # Find the extracted directory (named like openwrt-toolchain-...)
+          TOOLCHAIN_DIR=$(find /tmp/openwrt-sdk -maxdepth 1 -type d -name 'openwrt-toolchain-*' | head -1)
+          echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR" >> $GITHUB_ENV
+
+      - name: Configure cross-compilation environment
+        run: |
+          set -euo pipefail
+          TC_DIR="$TOOLCHAIN_DIR"
+
+          # Discover the cross-compiler binary
+          GCC_BIN=$(find "$TC_DIR/bin" -name '*-openwrt-linux-musl-gcc' | head -1)
+          if [ -z "$GCC_BIN" ]; then
+            echo "ERROR: No cross-compiler found in $TC_DIR/bin"
+            ls -la "$TC_DIR/bin"
+            exit 1
+          fi
+          echo "Found GCC: $GCC_BIN"
+
+          GCC_PREFIX=$(basename "$GCC_BIN" | sed 's/-gcc$//')
+          TARGET_STAGING=$(find "$TC_DIR/staging_dir" -maxdepth 1 -type d -name 'target-*' | head -1)
+          STRIP_BIN="${GCC_BIN%gcc}strip"
+
+          echo "GCC prefix: $GCC_PREFIX"
+          echo "Target staging: $TARGET_STAGING"
+          echo "Strip binary: $STRIP_BIN"
+
+          # Set environment for cargo build
+          # Convert target triple to env var formats:
+          #   x86_64-unknown-linux-musl -> X86_64_UNKNOWN_LINUX_MUSL  (for CARGO_TARGET_*_LINKER)
+          #   x86_64-unknown-linux-musl -> x86_64_unknown_linux_musl  (for CC_*/CXX_* — cc crate convention)
+          TARGET_ENV_UPPER=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          TARGET_ENV_LOWER=$(echo "${{ matrix.target }}" | tr '-' '_')
+
+          # C/C++ compilers for build scripts (openssl-sys, rusqlite)
+          echo "CC_${TARGET_ENV_LOWER}=${GCC_BIN}" >> $GITHUB_ENV
+          echo "CXX_${TARGET_ENV_LOWER}=${GCC_BIN%gcc}g++" >> $GITHUB_ENV
+
+          # Cargo linker
+          echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=${GCC_BIN}" >> $GITHUB_ENV
+
+          # OpenSSL / pkg-config
+          echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=${TARGET_STAGING}/usr/lib/pkgconfig" >> $GITHUB_ENV
+          echo "PKG_CONFIG_SYSROOT_DIR=${TARGET_STAGING}" >> $GITHUB_ENV
+
+          # OpenWrt toolchain expects STAGING_DIR
+          echo "STAGING_DIR=${TC_DIR}/staging_dir" >> $GITHUB_ENV
+
+          # Add toolchain to PATH
+          echo "${TC_DIR}/bin" >> $GITHUB_PATH
+
+          # Store strip binary path for later step
+          echo "STRIP_BIN=${STRIP_BIN}" >> $GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "cross-${{ matrix.compile_key }}"
-          cache-targets: "false"
+          shared-key: "openwrt-${{ matrix.compile_key }}"
+          cache-targets: "true"
 
-      - name: Cross-compile cdk-mintd
+      - name: Build cdk-mintd
         run: |
-          set -eu
-          mkdir -p bin
+          set -euo pipefail
           echo "Building ${{ env.BINARY_NAME }} for ${{ matrix.target }} with features: ${{ env.CDK_MINTD_FEATURES }}"
-          cross build --release --target ${{ matrix.target }} \
+          cargo build --release --target ${{ matrix.target }} \
             --bin ${{ env.BINARY_NAME }} \
             --no-default-features \
             --features "${{ env.CDK_MINTD_FEATURES }}"
-          cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" bin/${{ env.BINARY_NAME }}
+
+      - name: Strip binary
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "bin/${{ env.BINARY_NAME }}"
+          "$STRIP_BIN" "bin/${{ env.BINARY_NAME }}"
           ls -lh bin/
+          file "bin/${{ env.BINARY_NAME }}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
