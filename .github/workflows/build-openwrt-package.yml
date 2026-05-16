@@ -67,73 +67,72 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           targets: ${{ matrix.target }}
 
-      - name: Discover OpenWrt toolchain filename
-        id: toolchain-url
+      - name: Discover OpenWrt SDK filename
+        id: sdk-url
         run: |
           set -euo pipefail
           BASE_URL="https://downloads.openwrt.org/snapshots/targets/${{ matrix.openwrt_target }}"
-          TOOLCHAIN_FILE=$(curl -sL "$BASE_URL/" | grep -oP 'openwrt-toolchain-[^"]*\.tar\.zst' | head -1)
-          if [ -z "$TOOLCHAIN_FILE" ]; then
-            echo "ERROR: Could not discover toolchain filename from $BASE_URL"
+          SDK_FILE=$(curl -sL "$BASE_URL/" | grep -oP 'openwrt-sdk-[^"]*\.tar\.zst' | head -1)
+          if [ -z "$SDK_FILE" ]; then
+            echo "ERROR: Could not discover SDK filename from $BASE_URL"
             exit 1
           fi
-          echo "filename=$TOOLCHAIN_FILE" >> $GITHUB_OUTPUT
-          echo "url=${BASE_URL}/${TOOLCHAIN_FILE}" >> $GITHUB_OUTPUT
-          echo "Discovered toolchain: $TOOLCHAIN_FILE"
+          echo "filename=$SDK_FILE" >> $GITHUB_OUTPUT
+          echo "url=${BASE_URL}/${SDK_FILE}" >> $GITHUB_OUTPUT
+          echo "Discovered SDK: $SDK_FILE"
 
-      - name: Cache OpenWrt toolchain
-        id: cache-toolchain
+      - name: Cache OpenWrt SDK
+        id: cache-sdk
         uses: actions/cache@v5
         with:
-          path: /tmp/openwrt-toolchain.tar.zst
-          key: openwrt-toolchain-${{ steps.toolchain-url.outputs.filename }}
+          path: /tmp/openwrt-sdk.tar.zst
+          key: openwrt-sdk-${{ steps.sdk-url.outputs.filename }}
 
-      - name: Download OpenWrt toolchain
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      - name: Download OpenWrt SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          curl -L -o /tmp/openwrt-toolchain.tar.zst "${{ steps.toolchain-url.outputs.url }}"
+          curl -L -o /tmp/openwrt-sdk.tar.zst "${{ steps.sdk-url.outputs.url }}"
 
-      - name: Extract toolchain
+      - name: Extract SDK
         run: |
           set -euo pipefail
           mkdir -p /tmp/openwrt-sdk
-          tar --zstd -xf /tmp/openwrt-toolchain.tar.zst -C /tmp/openwrt-sdk
-          # Find the extracted directory (named like openwrt-toolchain-...)
-          TOOLCHAIN_DIR=$(find /tmp/openwrt-sdk -maxdepth 1 -type d -name 'openwrt-toolchain-*' | head -1)
-          echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR" >> $GITHUB_ENV
+          tar --zstd -xf /tmp/openwrt-sdk.tar.zst -C /tmp/openwrt-sdk
+          SDK_DIR=$(find /tmp/openwrt-sdk -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -1)
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
 
-      - name: Debug toolchain structure
+      - name: Debug SDK structure
         run: |
-          echo "=== TOOLCHAIN_DIR=$TOOLCHAIN_DIR ==="
-          find "$TOOLCHAIN_DIR" -maxdepth 3 -type d | head -40
-          echo "=== Looking for GCC ==="
-          find "$TOOLCHAIN_DIR" -name '*-gcc' -type f | head -10
-          echo "=== Looking for staging_dir/target-* ==="
-          find "$TOOLCHAIN_DIR/staging_dir" -maxdepth 2 -type d -name 'target-*' 2>/dev/null | head -5
+          echo "=== SDK_DIR=$SDK_DIR ==="
+          find "$SDK_DIR" -maxdepth 3 -type d | head -50
+          echo "=== GCC binaries ==="
+          find "$SDK_DIR" -name '*-gcc' \( -type f -o -type l \) | head -10
+          echo "=== staging_dir ==="
+          find "$SDK_DIR/staging_dir" -maxdepth 2 -type d 2>/dev/null | head -20
+          echo "=== pkgconfig ==="
+          find "$SDK_DIR" -name '*.pc' -type f | head -10
           echo "=== Looking for pkgconfig ==="
           find "$TOOLCHAIN_DIR" -name '*.pc' -type f | head -10
 
       - name: Configure cross-compilation environment
         run: |
           set -euo pipefail
-          TC_DIR="$TOOLCHAIN_DIR"
+          SDK="$SDK_DIR"
 
-          GCC_BIN=$(find "$TC_DIR" -name '*-openwrt-linux-musl-gcc' -type f | head -1)
+          GCC_BIN=$(find "$SDK" -name '*-openwrt-linux-musl-gcc' \( -type f -o -type l \) | head -1)
           if [ -z "$GCC_BIN" ]; then
-            echo "ERROR: No cross-compiler found anywhere in $TC_DIR"
-            find "$TC_DIR" -name '*-gcc' -type f
+            echo "ERROR: No cross-compiler found anywhere in $SDK"
+            find "$SDK" -name '*-gcc' \( -type f -o -type l \)
             exit 1
           fi
           echo "Found GCC: $GCC_BIN"
 
           GCC_DIR=$(dirname "$GCC_BIN")
-          GCC_PREFIX=$(basename "$GCC_BIN" | sed 's/-gcc$//')
-          TARGET_STAGING=$(find "$TC_DIR/staging_dir" -maxdepth 1 -type d -name 'target-*' | head -1)
+          TARGET_STAGING=$(find "$SDK/staging_dir" -maxdepth 1 -type d -name 'target-*' | head -1)
           STRIP_BIN="${GCC_BIN%gcc}strip"
 
           echo "GCC dir: $GCC_DIR"
-          echo "GCC prefix: $GCC_PREFIX"
           echo "Target staging: $TARGET_STAGING"
           echo "Strip binary: $STRIP_BIN"
 
@@ -147,7 +146,7 @@ jobs:
           echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=${TARGET_STAGING}/usr/lib/pkgconfig" >> $GITHUB_ENV
           echo "PKG_CONFIG_SYSROOT_DIR=${TARGET_STAGING}" >> $GITHUB_ENV
-          echo "STAGING_DIR=${TC_DIR}/staging_dir" >> $GITHUB_ENV
+          echo "STAGING_DIR=${SDK}/staging_dir" >> $GITHUB_ENV
 
           echo "${GCC_DIR}" >> $GITHUB_PATH
           echo "STRIP_BIN=${STRIP_BIN}" >> $GITHUB_ENV
