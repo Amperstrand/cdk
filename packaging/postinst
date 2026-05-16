@@ -1,0 +1,17 @@
+#!/bin/sh
+
+echo "Running cdk-mintd-wrt post-installation"
+
+if [ -x /etc/init.d/cdk-mintd-wrt ]; then
+    /etc/init.d/cdk-mintd-wrt enable 2>/dev/null || true
+    /etc/init.d/cdk-mintd-wrt stop 2>/dev/null || true
+    /etc/init.d/cdk-mintd-wrt start 2>/dev/null || true
+else
+    echo "Warning: /etc/init.d/cdk-mintd-wrt not found, skipping service start"
+fi
+
+echo "Reloading firewall..."
+/etc/init.d/firewall reload 2>/dev/null || true
+
+echo "Post-installation completed"
+exit 0

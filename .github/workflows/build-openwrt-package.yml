@@ -1,0 +1,162 @@
+name: Build OpenWrt Package
+
+on:
+  push:
+    branches: [experimentalaislop]
+
+env:
+  PACKAGE_NAME: "cdk-mintd-wrt"
+  BINARY_NAME: "cdk-mintd"
+  CDK_MINTD_FEATURES: "sqlite fakewallet"
+
+jobs:
+  define-compile-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          : ${GITHUB_OUTPUT:=/tmp/github_output}
+          cat > matrix.json << 'EOF'
+          {
+            "include": [
+              { "compile_key": "x86_64", "target": "x86_64-unknown-linux-musl",  "toolchain": "stable", "architecture": "x86_64" },
+              { "compile_key": "arm64",  "target": "aarch64-unknown-linux-musl", "toolchain": "stable", "architecture": "aarch64_cortex-a53" }
+            ]
+          }
+          EOF
+          echo "matrix=$(jq -c . matrix.json)" >> $GITHUB_OUTPUT
+
+  determine-versioning:
+    runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.determine-package-version.outputs.package_version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - id: commit-hash
+        shell: bash
+        run: |
+          : ${GITHUB_OUTPUT:=/tmp/github_output}
+          echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set package_version variable
+        id: determine-package-version
+        shell: bash
+        run: |
+          : ${GITHUB_OUTPUT:=/tmp/github_output}
+          SANITIZED_BRANCH_NAME=$(echo "${GITHUB_REF_NAME}" | sed 's/\//-/g')
+          COMMIT_HEIGHT=$(git rev-list --count HEAD)
+          echo "package_version=${SANITIZED_BRANCH_NAME}.${COMMIT_HEIGHT}.${{ steps.commit-hash.outputs.short }}" >> $GITHUB_OUTPUT
+
+  compile-binaries:
+    needs: [define-compile-matrix, determine-versioning]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.define-compile-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cache cross binary
+        id: cache-cross
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cross
+          key: ${{ runner.os }}-cross-git-main
+
+      - name: Install cross
+        if: steps.cache-cross.outputs.cache-hit != 'true'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "cross-${{ matrix.compile_key }}"
+          cache-targets: "false"
+
+      - name: Cross-compile cdk-mintd
+        run: |
+          set -eu
+          mkdir -p bin
+          echo "Building ${{ env.BINARY_NAME }} for ${{ matrix.target }} with features: ${{ env.CDK_MINTD_FEATURES }}"
+          cross build --release --target ${{ matrix.target }} \
+            --bin ${{ env.BINARY_NAME }} \
+            --no-default-features \
+            --features "${{ env.CDK_MINTD_FEATURES }}"
+          cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" bin/${{ env.BINARY_NAME }}
+          ls -lh bin/
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.compile_key }}
+          path: bin/
+          retention-days: 5
+
+  package-ipk:
+    needs: [define-compile-matrix, determine-versioning, compile-binaries]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.define-compile-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: binaries-${{ matrix.compile_key }}
+          path: bin/
+
+      - name: Build .ipk
+        run: |
+          set -euo pipefail
+          PACKAGE_FILENAME=${PACKAGE_NAME}_${{ needs.determine-versioning.outputs.package_version }}_${{ matrix.architecture }}.ipk
+          echo "PACKAGE_FILENAME=$PACKAGE_FILENAME" >> $GITHUB_ENV
+
+          PAYLOAD=$(mktemp -d)
+          install -D -m 0755 bin/${{ env.BINARY_NAME }} "$PAYLOAD/usr/bin/cdk-mintd-wrt"
+
+          install -D -m 0755 packaging/files/etc/init.d/cdk-mintd-wrt     "$PAYLOAD/etc/init.d/cdk-mintd-wrt"
+          install -D -m 0644 packaging/files/etc/config/firewall-cdk-mintd  "$PAYLOAD/etc/config/firewall-cdk-mintd"
+          install -D -m 0644 packaging/files/etc/tollgate/mintd.toml        "$PAYLOAD/etc/tollgate/mintd.toml"
+          install -D -m 0644 LICENSE "$PAYLOAD/usr/share/doc/cdk-mintd-wrt/LICENSE"
+
+          mkdir -p artifacts
+          env \
+            PKG_NAME="$PACKAGE_NAME" \
+            PKG_VERSION="${{ needs.determine-versioning.outputs.package_version }}" \
+            ARCH="${{ matrix.architecture }}" \
+            MAINTAINER="Amperstrand" \
+            LICENSE="MIT" \
+            DESCRIPTION="CDK Mint Daemon for OpenWrt — Cashu ecash mint with fakewallet backend" \
+            packaging/build-ipk.sh "$PAYLOAD" "artifacts/$PACKAGE_FILENAME"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE_FILENAME }}
+          path: artifacts/${{ env.PACKAGE_FILENAME }}
+          retention-days: 5
+
+      - name: Summary
+        run: |
+          echo "### Built: \`${{ env.PACKAGE_FILENAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Architecture | \`${{ matrix.architecture }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | \`${{ matrix.target }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Features | \`sqlite fakewallet\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ needs.determine-versioning.outputs.package_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          ls -lh artifacts/

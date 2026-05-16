@@ -1,0 +1,6 @@
+config rule
+	option name 'Allow-CDK-Mint-In'
+	option src 'lan'
+	option proto 'tcp'
+	option dest_port '8085'
+	option target 'ACCEPT'
