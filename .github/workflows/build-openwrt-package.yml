@@ -103,54 +103,53 @@ jobs:
           TOOLCHAIN_DIR=$(find /tmp/openwrt-sdk -maxdepth 1 -type d -name 'openwrt-toolchain-*' | head -1)
           echo "TOOLCHAIN_DIR=$TOOLCHAIN_DIR" >> $GITHUB_ENV
 
+       - name: Debug toolchain structure
+        run: |
+          echo "=== TOOLCHAIN_DIR=$TOOLCHAIN_DIR ==="
+          find "$TOOLCHAIN_DIR" -maxdepth 3 -type d | head -40
+          echo "=== Looking for GCC ==="
+          find "$TOOLCHAIN_DIR" -name '*-gcc' -type f | head -10
+          echo "=== Looking for staging_dir/target-* ==="
+          find "$TOOLCHAIN_DIR/staging_dir" -maxdepth 2 -type d -name 'target-*' 2>/dev/null | head -5
+          echo "=== Looking for pkgconfig ==="
+          find "$TOOLCHAIN_DIR" -name '*.pc' -type f | head -10
+
       - name: Configure cross-compilation environment
         run: |
           set -euo pipefail
           TC_DIR="$TOOLCHAIN_DIR"
 
-          # Discover the cross-compiler binary
-          GCC_BIN=$(find "$TC_DIR/bin" -name '*-openwrt-linux-musl-gcc' | head -1)
+          GCC_BIN=$(find "$TC_DIR" -name '*-openwrt-linux-musl-gcc' -type f | head -1)
           if [ -z "$GCC_BIN" ]; then
-            echo "ERROR: No cross-compiler found in $TC_DIR/bin"
-            ls -la "$TC_DIR/bin"
+            echo "ERROR: No cross-compiler found anywhere in $TC_DIR"
+            find "$TC_DIR" -name '*-gcc' -type f
             exit 1
           fi
           echo "Found GCC: $GCC_BIN"
 
+          GCC_DIR=$(dirname "$GCC_BIN")
           GCC_PREFIX=$(basename "$GCC_BIN" | sed 's/-gcc$//')
           TARGET_STAGING=$(find "$TC_DIR/staging_dir" -maxdepth 1 -type d -name 'target-*' | head -1)
           STRIP_BIN="${GCC_BIN%gcc}strip"
 
+          echo "GCC dir: $GCC_DIR"
           echo "GCC prefix: $GCC_PREFIX"
           echo "Target staging: $TARGET_STAGING"
           echo "Strip binary: $STRIP_BIN"
 
-          # Set environment for cargo build
-          # Convert target triple to env var formats:
-          #   x86_64-unknown-linux-musl -> X86_64_UNKNOWN_LINUX_MUSL  (for CARGO_TARGET_*_LINKER)
-          #   x86_64-unknown-linux-musl -> x86_64_unknown_linux_musl  (for CC_*/CXX_* — cc crate convention)
           TARGET_ENV_UPPER=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
           TARGET_ENV_LOWER=$(echo "${{ matrix.target }}" | tr '-' '_')
 
-          # C/C++ compilers for build scripts (openssl-sys, rusqlite)
           echo "CC_${TARGET_ENV_LOWER}=${GCC_BIN}" >> $GITHUB_ENV
           echo "CXX_${TARGET_ENV_LOWER}=${GCC_BIN%gcc}g++" >> $GITHUB_ENV
-
-          # Cargo linker
           echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=${GCC_BIN}" >> $GITHUB_ENV
 
-          # OpenSSL / pkg-config
           echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=${TARGET_STAGING}/usr/lib/pkgconfig" >> $GITHUB_ENV
           echo "PKG_CONFIG_SYSROOT_DIR=${TARGET_STAGING}" >> $GITHUB_ENV
-
-          # OpenWrt toolchain expects STAGING_DIR
           echo "STAGING_DIR=${TC_DIR}/staging_dir" >> $GITHUB_ENV
 
-          # Add toolchain to PATH
-          echo "${TC_DIR}/bin" >> $GITHUB_PATH
-
-          # Store strip binary path for later step
+          echo "${GCC_DIR}" >> $GITHUB_PATH
           echo "STRIP_BIN=${STRIP_BIN}" >> $GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
