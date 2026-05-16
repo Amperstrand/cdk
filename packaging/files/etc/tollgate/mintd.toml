@@ -6,7 +6,7 @@
 url = "http://tollgate.lan:8085/"
 listen_host = "0.0.0.0"
 listen_port = 8085
-mnemonic = ""
+mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
 [info.quote_ttl]
 mint_ttl = 600

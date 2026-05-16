@@ -17,16 +17,15 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          : ${GITHUB_OUTPUT:=/tmp/github_output}
           cat > matrix.json << 'EOF'
           {
             "include": [
-              { "compile_key": "x86_64", "target": "x86_64-unknown-linux-musl",  "toolchain": "stable", "architecture": "x86_64", "openwrt_target": "x86/64" },
-              { "compile_key": "arm64",  "target": "aarch64-unknown-linux-musl", "toolchain": "stable", "architecture": "aarch64_cortex-a53", "openwrt_target": "mediatek/filogic" }
+              { "compile_key": "x86_64", "target": "x86_64-unknown-linux-musl",  "architecture": "x86_64" },
+              { "compile_key": "arm64",  "target": "aarch64-unknown-linux-musl", "architecture": "aarch64_cortex-a53" }
             ]
           }
           EOF
-          echo "matrix=$(jq -c . matrix.json)" >> $GITHUB_OUTPUT
+          echo "matrix=$(jq -c . matrix.json)" >> "$GITHUB_OUTPUT"
 
   determine-versioning:
     runs-on: ubuntu-latest
@@ -38,19 +37,14 @@ jobs:
           fetch-depth: 0
 
       - id: commit-hash
-        shell: bash
-        run: |
-          : ${GITHUB_OUTPUT:=/tmp/github_output}
-          echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set package_version variable
         id: determine-package-version
-        shell: bash
         run: |
-          : ${GITHUB_OUTPUT:=/tmp/github_output}
           SANITIZED_BRANCH_NAME=$(echo "${GITHUB_REF_NAME}" | sed 's/\//-/g')
           COMMIT_HEIGHT=$(git rev-list --count HEAD)
-          echo "package_version=${SANITIZED_BRANCH_NAME}.${COMMIT_HEIGHT}.${{ steps.commit-hash.outputs.short }}" >> $GITHUB_OUTPUT
+          echo "package_version=${SANITIZED_BRANCH_NAME}.${COMMIT_HEIGHT}.${{ steps.commit-hash.outputs.short }}" >> "$GITHUB_OUTPUT"
 
   compile-binaries:
     needs: [define-compile-matrix, determine-versioning]
@@ -59,93 +53,18 @@ jobs:
       matrix: ${{ fromJson(needs.define-compile-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0
+          targets: ${{ matrix.target }}
 
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.toolchain }}
-
-      - name: Add musl target
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Discover OpenWrt SDK filename
-        id: sdk-url
+      - name: Install cross-compilation tools
         run: |
-          set -euo pipefail
-          BASE_URL="https://downloads.openwrt.org/snapshots/targets/${{ matrix.openwrt_target }}"
-          SDK_FILE=$(curl -sL "$BASE_URL/" | grep -oP 'openwrt-sdk-[^"]*\.tar\.zst' | head -1)
-          if [ -z "$SDK_FILE" ]; then
-            echo "ERROR: Could not discover SDK filename from $BASE_URL"
-            exit 1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          if [ "${{ matrix.compile_key }}" = "arm64" ]; then
+            sudo apt-get install -y -qq gcc-aarch64-linux-gnu
           fi
-          echo "filename=$SDK_FILE" >> $GITHUB_OUTPUT
-          echo "url=${BASE_URL}/${SDK_FILE}" >> $GITHUB_OUTPUT
-          echo "Discovered SDK: $SDK_FILE"
-
-      - name: Cache OpenWrt SDK
-        id: cache-sdk
-        uses: actions/cache@v5
-        with:
-          path: /tmp/openwrt-sdk.tar.zst
-          key: openwrt-sdk-${{ steps.sdk-url.outputs.filename }}
-
-      - name: Download OpenWrt SDK
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          curl -L -o /tmp/openwrt-sdk.tar.zst "${{ steps.sdk-url.outputs.url }}"
-
-      - name: Extract SDK
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/openwrt-sdk
-          tar --zstd -xf /tmp/openwrt-sdk.tar.zst -C /tmp/openwrt-sdk
-          SDK_DIR=$(find /tmp/openwrt-sdk -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -1)
-          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
-
-      - name: Debug SDK structure
-        run: |
-          echo "=== SDK_DIR=$SDK_DIR ==="
-          find "$SDK_DIR" -maxdepth 3 -type d | head -50
-          echo "=== GCC binaries ==="
-          find "$SDK_DIR" -name '*-gcc' \( -type f -o -type l \) | head -10
-          echo "=== staging_dir ==="
-          find "$SDK_DIR/staging_dir" -maxdepth 2 -type d 2>/dev/null | head -20
-          echo "=== pkgconfig ==="
-          find "$SDK_DIR" -name '*.pc' -type f | head -10
-          echo "=== Looking for pkgconfig ==="
-          find "$TOOLCHAIN_DIR" -name '*.pc' -type f | head -10
-
-      - name: Configure cross-compilation environment
-        run: |
-          set -euo pipefail
-          SDK="$SDK_DIR"
-
-          GCC_BIN=$(find "$SDK" -name '*-openwrt-linux-musl-gcc' \( -type f -o -type l \) | head -1)
-          if [ -z "$GCC_BIN" ]; then
-            echo "ERROR: No cross-compiler found anywhere in $SDK"
-            find "$SDK" -name '*-gcc' \( -type f -o -type l \)
-            exit 1
-          fi
-          echo "Found GCC: $GCC_BIN"
-
-          GCC_DIR=$(dirname "$GCC_BIN")
-          STRIP_BIN="${GCC_BIN%gcc}strip"
-          echo "GCC dir: $GCC_DIR"
-          echo "Strip binary: $STRIP_BIN"
-
-          TARGET_ENV_UPPER=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
-          TARGET_ENV_LOWER=$(echo "${{ matrix.target }}" | tr '-' '_')
-
-          echo "CC_${TARGET_ENV_LOWER}=${GCC_BIN}" >> $GITHUB_ENV
-          echo "CXX_${TARGET_ENV_LOWER}=${GCC_BIN%gcc}g++" >> $GITHUB_ENV
-          echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=${GCC_BIN}" >> $GITHUB_ENV
-
-          echo "STAGING_DIR=${SDK}/staging_dir" >> $GITHUB_ENV
-
-          echo "${GCC_DIR}" >> $GITHUB_PATH
-          echo "STRIP_BIN=${STRIP_BIN}" >> $GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -153,20 +72,24 @@ jobs:
           cache-targets: "true"
 
       - name: Build cdk-mintd
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: |
-          set -euo pipefail
-          echo "Building ${{ env.BINARY_NAME }} for ${{ matrix.target }} with features: ${{ env.CDK_MINTD_FEATURES }}"
-          cargo build --release --target ${{ matrix.target }} \
-            --bin ${{ env.BINARY_NAME }} \
+          cargo build --release \
+            --target ${{ matrix.target }} \
+            -p cdk-mintd \
             --no-default-features \
             --features "${{ env.CDK_MINTD_FEATURES }}"
 
       - name: Strip binary
         run: |
-          set -euo pipefail
           mkdir -p bin
           cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "bin/${{ env.BINARY_NAME }}"
-          "$STRIP_BIN" "bin/${{ env.BINARY_NAME }}"
+          if [ "${{ matrix.compile_key }}" = "arm64" ]; then
+            aarch64-linux-gnu-strip "bin/${{ env.BINARY_NAME }}"
+          else
+            strip "bin/${{ env.BINARY_NAME }}"
+          fi
           ls -lh bin/
           file "bin/${{ env.BINARY_NAME }}"
 
@@ -185,8 +108,6 @@ jobs:
       matrix: ${{ fromJson(needs.define-compile-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
 
       - name: Download prebuilt binaries
         uses: actions/download-artifact@v8
@@ -196,16 +117,15 @@ jobs:
 
       - name: Build .ipk
         run: |
-          set -euo pipefail
           PACKAGE_FILENAME=${PACKAGE_NAME}_${{ needs.determine-versioning.outputs.package_version }}_${{ matrix.architecture }}.ipk
-          echo "PACKAGE_FILENAME=$PACKAGE_FILENAME" >> $GITHUB_ENV
+          echo "PACKAGE_FILENAME=$PACKAGE_FILENAME" >> "$GITHUB_ENV"
 
           PAYLOAD=$(mktemp -d)
           install -D -m 0755 bin/${{ env.BINARY_NAME }} "$PAYLOAD/usr/bin/cdk-mintd-wrt"
 
-          install -D -m 0755 packaging/files/etc/init.d/cdk-mintd-wrt     "$PAYLOAD/etc/init.d/cdk-mintd-wrt"
-          install -D -m 0644 packaging/files/etc/config/firewall-cdk-mintd  "$PAYLOAD/etc/config/firewall-cdk-mintd"
-          install -D -m 0644 packaging/files/etc/tollgate/mintd.toml        "$PAYLOAD/etc/tollgate/mintd.toml"
+          install -D -m 0755 packaging/files/etc/init.d/cdk-mintd-wrt    "$PAYLOAD/etc/init.d/cdk-mintd-wrt"
+          install -D -m 0644 packaging/files/etc/config/firewall-cdk-mintd "$PAYLOAD/etc/config/firewall-cdk-mintd"
+          install -D -m 0644 packaging/files/etc/tollgate/mintd.toml       "$PAYLOAD/etc/tollgate/mintd.toml"
           install -D -m 0644 LICENSE "$PAYLOAD/usr/share/doc/cdk-mintd-wrt/LICENSE"
 
           mkdir -p artifacts
@@ -215,7 +135,7 @@ jobs:
             ARCH="${{ matrix.architecture }}" \
             MAINTAINER="Amperstrand" \
             LICENSE="MIT" \
-            DESCRIPTION="CDK Mint Daemon for OpenWrt — Cashu ecash mint with fakewallet backend" \
+            DESCRIPTION="CDK Mint Daemon for OpenWrt - Cashu ecash mint with fakewallet backend" \
             packaging/build-ipk.sh "$PAYLOAD" "artifacts/$PACKAGE_FILENAME"
 
       - name: Upload package artifact
@@ -227,12 +147,12 @@ jobs:
 
       - name: Summary
         run: |
-          echo "### Built: \`${{ env.PACKAGE_FILENAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Architecture | \`${{ matrix.architecture }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target | \`${{ matrix.target }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Features | \`sqlite fakewallet\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Version | \`${{ needs.determine-versioning.outputs.package_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "### Built: \`${{ env.PACKAGE_FILENAME }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Architecture | \`${{ matrix.architecture }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | \`${{ matrix.target }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Features | \`sqlite fakewallet\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Version | \`${{ needs.determine-versioning.outputs.package_version }}\` |" >> "$GITHUB_STEP_SUMMARY"
           ls -lh artifacts/
