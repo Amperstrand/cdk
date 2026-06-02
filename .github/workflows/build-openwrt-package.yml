@@ -20,8 +20,8 @@ jobs:
           cat > matrix.json << 'EOF'
           {
             "include": [
-              { "compile_key": "x86_64", "target": "x86_64-unknown-linux-musl",  "architecture": "x86_64" },
-              { "compile_key": "arm64",  "target": "aarch64-unknown-linux-musl", "architecture": "aarch64_cortex-a53" }
+              { "compile_key": "x86_64", "target": "x86_64-unknown-linux-musl",  "architecture": "x86_64",  "runner": "ubuntu-latest" },
+              { "compile_key": "arm64",  "target": "aarch64-unknown-linux-musl", "architecture": "aarch64_cortex-a53", "runner": "ubuntu-24.04-arm" }
             ]
           }
           EOF
@@ -48,7 +48,7 @@ jobs:
 
   compile-binaries:
     needs: [define-compile-matrix, determine-versioning]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.define-compile-matrix.outputs.matrix) }}
@@ -63,16 +63,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq protobuf-compiler
-          if [ "${{ matrix.compile_key }}" = "x86_64" ]; then
-            sudo apt-get install -y -qq musl-tools
-          fi
-
-      - name: Install aarch64 musl cross-compiler
-        if: matrix.compile_key == 'arm64'
-        run: |
-          curl -L https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /tmp
-          echo "/tmp/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y -qq musl-tools protobuf-compiler
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -80,9 +71,6 @@ jobs:
           cache-targets: "true"
 
       - name: Build cdk-mintd
-        env:
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
         run: |
           cargo build --release \
             --target ${{ matrix.target }} \
@@ -94,11 +82,7 @@ jobs:
         run: |
           mkdir -p bin
           cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "bin/${{ env.BINARY_NAME }}"
-          if [ "${{ matrix.compile_key }}" = "arm64" ]; then
-            aarch64-linux-musl-strip "bin/${{ env.BINARY_NAME }}"
-          else
-            strip "bin/${{ env.BINARY_NAME }}"
-          fi
+          strip "bin/${{ env.BINARY_NAME }}"
           ls -lh bin/
           file "bin/${{ env.BINARY_NAME }}"
 
