@@ -50,24 +50,18 @@ jobs:
     needs: [define-compile-matrix, determine-versioning]
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix: ${{ fromJson(needs.define-compile-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
-      - name: Add musl target (override rust-toolchain.toml)
+      - name: Add musl target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools protobuf-compiler
-          if [ "${{ matrix.compile_key }}" = "arm64" ]; then
-            sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-          fi
+      - name: Install cross
+        run: cargo install cross --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -75,10 +69,8 @@ jobs:
           cache-targets: "true"
 
       - name: Build cdk-mintd
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
         run: |
-          cargo build --release \
+          cross build --release \
             --target ${{ matrix.target }} \
             -p cdk-mintd \
             --no-default-features \
@@ -89,6 +81,7 @@ jobs:
           mkdir -p bin
           cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "bin/${{ env.BINARY_NAME }}"
           if [ "${{ matrix.compile_key }}" = "arm64" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq binutils-aarch64-linux-gnu
             aarch64-linux-gnu-strip "bin/${{ env.BINARY_NAME }}"
           else
             strip "bin/${{ env.BINARY_NAME }}"
@@ -155,7 +148,7 @@ jobs:
           echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Architecture | \`${{ matrix.architecture }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Target | \`${{ matrix.target }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | \`${{ matrix.target}}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Features | \`sqlite fakewallet\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Version | \`${{ needs.determine-versioning.outputs.package_version }}\` |" >> "$GITHUB_STEP_SUMMARY"
           ls -lh artifacts/
