@@ -9,6 +9,7 @@ pub mod bip321;
 pub mod invoice;
 pub mod keys;
 pub mod mint;
+#[cfg(feature = "nostr")]
 pub mod nostr_backup;
 pub mod payment_request;
 pub mod proof;
@@ -23,6 +24,7 @@ pub use bip321::*;
 pub use invoice::*;
 pub use keys::*;
 pub use mint::*;
+#[cfg(feature = "nostr")]
 pub use nostr_backup::*;
 pub use payment_request::*;
 pub use proof::*;

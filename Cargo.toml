@@ -167,3 +167,8 @@ strip = "debuginfo" # Strip debug info, keep symbol names for backtraces
 
 [workspace.metadata.crane]
 name = "cdk-workspace"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

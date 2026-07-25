@@ -326,40 +326,51 @@ pub fn decode_create_request_params(json: String) -> Result<CreateRequestParams,
 /// Returned by `create_request` when the transport is `nostr`. Pass this to
 /// `wait_for_nostr_payment` to connect, subscribe, and receive the incoming
 /// payment on the specified relays.
+#[cfg(feature = "nostr")]
 #[derive(uniffi::Object)]
 pub struct NostrWaitInfo {
     inner: cdk::wallet::payment_request::NostrWaitInfo,
 }
 
+#[cfg(feature = "nostr")]
 impl NostrWaitInfo {
-    /// Get inner reference
     #[allow(dead_code)]
     pub(crate) fn inner(&self) -> &cdk::wallet::payment_request::NostrWaitInfo {
         &self.inner
     }
 }
 
+#[cfg(feature = "nostr")]
 #[uniffi::export]
 impl NostrWaitInfo {
-    /// Get the Nostr relays to connect to
     pub fn relays(&self) -> Vec<String> {
         self.inner.relays.clone()
     }
 
-    /// Get the recipient public key as a hex string
     pub fn pubkey(&self) -> String {
         self.inner.pubkey.to_hex()
     }
 
-    /// Get the mint URLs accepted or preferred by the original payment request
     pub fn mints(&self) -> Vec<String> {
         self.inner.mints.iter().map(|m| m.to_string()).collect()
     }
 
-    /// Get whether the original request's mint list is preferred instead of strict
     pub fn mint_preferred(&self) -> Option<bool> {
         self.inner.mint_preferred
     }
+}
+
+#[cfg(not(feature = "nostr"))]
+#[derive(uniffi::Object)]
+pub struct NostrWaitInfo;
+
+#[cfg(not(feature = "nostr"))]
+#[uniffi::export]
+impl NostrWaitInfo {
+    pub fn relays(&self) -> Vec<String> { Vec::new() }
+    pub fn pubkey(&self) -> String { String::new() }
+    pub fn mints(&self) -> Vec<String> { Vec::new() }
+    pub fn mint_preferred(&self) -> Option<bool> { None }
 }
 
 /// Result of creating a payment request
