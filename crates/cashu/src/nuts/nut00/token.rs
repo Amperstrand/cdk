@@ -430,9 +430,11 @@ impl From<TokenV4> for TokenV3 {
 
 /// Token V4
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// NUT #00: Optional fields MAY be omitted if not present. Receivers MUST ignore unknown fields to preserve forward compatibility.
 pub struct TokenV4 {
     /// Mint Url
     #[serde(rename = "m")]
+    // NUT #00: The mint URL **MUST** be normalized by stripping any trailing slashes (`/`).
     pub mint_url: MintUrl,
     /// Token Unit
     #[serde(rename = "u")]
@@ -450,7 +452,9 @@ impl TokenV4 {
     pub fn proofs(&self, mint_keysets: &[KeySetInfo]) -> Result<Proofs, Error> {
         let mut proofs: Proofs = vec![];
         for t in self.token.iter() {
+            // NUT #00: Wallets receiving a Token **MUST** support both short and full keyset ID representations. When a short keyset ID is encountered, the wallet **MUST** resolve it to the corresponding full keyset ID before processing the contained `Proof` objects.
             let long_id = Id::from_short_keyset_id(&t.keyset_id, mint_keysets)?;
+            // NUT #00: If a short keyset ID resolves to more than one known full keyset ID, the identifier is considered ambiguous. In this case, the wallet **MUST** fail token parsing and return an error.
             proofs.extend(t.proofs.iter().map(|p| p.into_proof(&long_id)));
         }
         Ok(proofs)
@@ -583,9 +587,11 @@ pub struct TokenV4Token {
         serialize_with = "serialize_v4_keyset_id",
         deserialize_with = "deserialize_v4_keyset_id"
     )]
+    // NUT #00: To reduce the size of the `i` field and the overall Token encoding, wallets **MAY** use the short keyset ID representation (`s_id`).
     pub keyset_id: ShortKeysetId,
     /// Proofs
     #[serde(rename = "p")]
+    // NUT #00: All proofs in the corresponding `p` array MUST belong to the same keyset ID.
     pub proofs: Vec<ProofV4>,
 }
 

@@ -12,6 +12,7 @@ use super::Error;
 use crate::SECP256K1;
 
 /// PublicKey
+// NUT #01: The mint **MUST** use the [compressed Secp256k1 public key format](https://learnmeabitcoin.com/technical/public-key#public-key-format) to represent its public keys.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct PublicKey {

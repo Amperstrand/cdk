@@ -180,6 +180,7 @@ impl Id {
         let mut data = keys_string;
         data.push_str(&format!("|unit:{}", unit));
 
+        // NUT #02: If input_fee_ppk is omitted, null, or 0, it MUST be omitted from the preimage.
         if input_fee_ppk > 0 {
             data.push_str(&format!("|input_fee_ppk:{}", input_fee_ppk));
         }
@@ -525,8 +526,11 @@ pub struct KeySetInfo {
     pub unit: CurrencyUnit,
     /// Keyset state
     /// Mint will only sign from an active keyset
+    // NUT #02: Mints can have multiple keysets at the same time but **MUST** have at least one `active` keyset
+    // NUT #02: new outputs (`BlindedMessages` and `BlindSignatures`) **MUST** be from `active` keysets only.
     pub active: bool,
     /// Input Fee PPK
+    // NUT #02: wallets **MUST** add fees to the inputs or, vice versa, subtract from the outputs
     #[serde(
         deserialize_with = "deserialize_input_fee_ppk",
         default = "default_input_fee_ppk"
@@ -543,6 +547,7 @@ pub type KeySetInfos = Vec<KeySetInfo>;
 /// Utility methods for [KeySetInfos]
 pub trait KeySetInfosMethods {
     /// Filter for active keysets
+    // NUT #02: When constructing outputs for a transaction, wallets **MUST** choose only `active` keysets
     fn active(&self) -> impl Iterator<Item = &KeySetInfo> + '_;
 
     /// Filter keysets for specific unit

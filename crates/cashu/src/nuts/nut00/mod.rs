@@ -547,6 +547,7 @@ impl Hash for ProofV3 {
     }
 }
 
+// NUT #00: Implementations MUST convert between hex strings and raw byte arrays when translating between JSON and CBOR representations.
 fn serialize_v4_pubkey<S>(key: &PublicKey, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,

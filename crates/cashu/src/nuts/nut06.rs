@@ -67,13 +67,16 @@ impl<'de> Deserialize<'de> for MintVersion {
 }
 
 /// Mint Info [NUT-06]
+// NUT #06: This endpoint returns information about the mint that a wallet can show to the user and use to make decisions on how to interact with the mint.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct MintInfo {
     /// name of the mint and should be recognizable
+    // NUT #06: - (optional) `name` is the name of the mint and should be recognizable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// hex pubkey of the mint
+    // NUT #06: - (optional) `pubkey` is the hex pubkey of the mint.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -81,32 +84,42 @@ pub struct MintInfo {
     )]
     pub pubkey: Option<PublicKey>,
     /// implementation name and the version running
+    // NUT #06: - (optional) `version` is the implementation name and the version of the software running on this mint separated with a slash "/".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<MintVersion>,
     /// short description of the mint
+    // NUT #06: - (optional) `description` is a short description of the mint that can be shown in the wallet next to the mint's name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// long description
+    // NUT #06: - (optional) `description_long` is a long description that can be shown in an additional field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description_long: Option<String>,
     /// Contact info
+    // NUT #06: - (optional) `contact` is an array of contact objects to reach the mint operator.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contact: Option<Vec<ContactInfo>>,
     /// shows which NUTs the mint supports
+    // NUT #06: - (optional) `nuts` indicates each NUT specification that the mint supports and its settings. The settings are defined in each NUT separately.
     pub nuts: Nuts,
     /// Mint's icon URL
+    // NUT #06: - (optional) `icon_url` is the URL pointing to an image to be used as an icon for the mint. Recommended to be squared in shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
     /// Mint's endpoint URLs
+    // NUT #06: - (optional) `urls` is the list of endpoint URLs where the mint is reachable from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
     /// message of the day that the wallet must display to the user
+    // NUT #06: - (optional) `motd` is the message of the day that the wallet must display to the user. It should only be used to display important announcements to users, such as scheduled maintenances.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub motd: Option<String>,
     /// server unix timestamp
+    // NUT #06: - (optional) `time` is the current time set on the server. The value is passed as a Unix timestamp integer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<u64>,
     /// terms of url service of the mint
+    // NUT #06: - (optional) `tos_url` is the URL pointing to the Terms of Service of the mint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tos_url: Option<String>,
 }
@@ -484,12 +497,15 @@ pub struct SupportedSettings {
 }
 
 /// Contact Info
+// NUT #06: A contact object consists of two fields.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct ContactInfo {
     /// Contact Method i.e. nostr
+    // NUT #06: The `method` field denotes the contact method (like "email"),
     pub method: String,
     /// Contact info i.e. npub...
+    // NUT #06: the `info` field denotes the identifier (like "contact@me.com").
     pub info: String,
 }
 

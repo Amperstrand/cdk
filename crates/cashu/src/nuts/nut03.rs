@@ -37,13 +37,17 @@ pub struct PreSwap {
 }
 
 /// Swap Request [NUT-03]
+// NUT #03: A swap operation consists of multiple inputs (`Proofs`) and outputs (`BlindedMessages`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct SwapRequest {
     /// Proofs that are to be spent in a `Swap`
+    // NUT #03: "inputs": <Array[Proof]>,
     #[cfg_attr(feature = "swagger", schema(value_type = Vec<crate::Proof>))]
     inputs: Proofs,
     /// Blinded Messages for Mint to sign
+    // NUT #03: "outputs": <Array[BlindedMessage]>,
+    // NUT #03: the client **SHOULD** ensure that the list requested outputs is ordered by amount in ascending order.
     outputs: Vec<BlindedMessage>,
 }
 
@@ -118,10 +122,12 @@ impl super::nut10::SpendingConditionVerification for SwapRequest {
 }
 
 /// Split Response [NUT-06]
+// NUT #03: Mints verify and invalidate the inputs and issue new promises (`BlindSignatures`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct SwapResponse {
     /// Promises
+    // NUT #03: "signatures": <Array[BlindSignature]>
     pub signatures: Vec<BlindSignature>,
 }
 

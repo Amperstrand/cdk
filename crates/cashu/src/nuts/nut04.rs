@@ -36,6 +36,7 @@ pub enum Error {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 #[serde(bound = "Q: Serialize + DeserializeOwned")]
+// NUT #04: The total output amount **MUST NOT** exceed the quote's currently mintable amount, `amount_paid - amount_issued`.
 pub struct MintRequest<Q> {
     /// Quote id
     #[cfg_attr(feature = "swagger", schema(max_length = 1_000))]
@@ -63,6 +64,7 @@ impl TryFrom<MintRequest<String>> for MintRequest<QuoteId> {
 
 impl<Q> MintRequest<Q> {
     /// Total [`Amount`] of outputs
+    // NUT #04: Mints **MUST NOT** issue ecash whose total output amount exceeds `amount_paid - amount_issued`.
     pub fn total_amount(&self) -> Result<Amount, Error> {
         Amount::try_sum(
             self.outputs
@@ -84,6 +86,7 @@ pub struct MintResponse {
 /// Mint Method Settings
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+// NUT #04: `method` **MUST** match `[a-z0-9_-]+`.
 pub struct MintMethodSettings {
     /// Payment Method e.g. bolt11
     pub method: PaymentMethod,
@@ -319,6 +322,8 @@ impl Settings {
 /// without being nested. When serialized, extra fields merge into the parent JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+// NUT #04: The `{method}` string **MUST** contain only ASCII alphanumeric characters, hyphens (`-`), and underscores (`_`), and **MUST** be non-empty.
+// NUT #04: Implementations **MUST** ignore unrecognized fields to preserve forward compatibility.
 pub struct MintQuoteCustomRequest {
     /// Amount to mint
     pub amount: Amount,
@@ -367,6 +372,14 @@ pub struct MintQuoteCustomRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 #[serde(bound = "Q: Serialize + for<'a> Deserialize<'a>")]
+// NUT #04: Mints **MUST** include `amount_paid`, `amount_issued`, and `updated_at` in all mint quote responses.
+// NUT #04: `amount_paid` and `amount_issued` **MUST** be non-negative integers, and `amount_issued` **MUST NOT** exceed `amount_paid`.
+// NUT #04: Mints **MUST** update `updated_at` whenever `amount_paid` or `amount_issued` changes.
+// NUT #04: Mints **MUST** ensure that `updated_at` monotonically increases for each quote, even if multiple updates occur within the same timestamp resolution.
+// NUT #04: Wallets that receive multiple responses for the same quote **MUST NOT** replace locally stored quote data with a response whose `updated_at` is lower than the latest processed value for that quote.
+// NUT #04: Wallets **MUST NOT** decrease locally stored `amount_paid` or `amount_issued` values based on stale responses.
+// NUT #04: **MUST** remain a secret between user and mint and **MUST NOT** be derivable from the payment request.
+// NUT #04: The mint responds with the common mint quote response format and **MUST** include the `amount_paid`, `amount_issued` and `updated_at` accounting fields.
 pub struct MintQuoteCustomResponse<Q> {
     /// Quote ID
     pub quote: Q,

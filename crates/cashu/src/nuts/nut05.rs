@@ -95,6 +95,7 @@ pub struct MeltRequest<Q> {
     /// Whether the client prefers asynchronous processing
     #[serde(default)]
     #[cfg_attr(feature = "swagger", schema(value_type = bool))]
+    // NUT #05: If the method-specific NUT requires asynchronous execution, the mint **MUST** process melt requests for that method asynchronously.
     prefer_async: bool,
 }
 
@@ -212,6 +213,7 @@ where
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct MeltMethodSettings {
     /// Payment Method e.g. bolt11
+    // NUT #05: `method` **MUST** match `[a-z0-9_-]+`.
     pub method: PaymentMethod,
     /// Currency Unit e.g. sat
     pub unit: CurrencyUnit,
