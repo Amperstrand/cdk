@@ -35,7 +35,7 @@ jobs:
           pip install -e /tmp/gs
 
       - name: Clone Cashu NUT spec
-        run: git clone --depth=1 https://github.com/cashubtc/nuts.git nuts
+        run: git clone https://github.com/cashubtc/nuts.git nuts && cd nuts && git checkout 734f60efdd2feeaaf96acb21e1b632c6d35419de
 
       - name: Run spectate check
         run: |

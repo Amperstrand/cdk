@@ -16,3 +16,8 @@
 format = "markdown"
 dir = "nuts"
 pattern = "{id:02d}.md"
+
+[sources.BIP]
+format = "mediawiki"
+dir = "bips"
+pattern = "bip-{id:04d}.mediawiki"
