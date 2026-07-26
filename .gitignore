@@ -31,3 +31,6 @@ cdk_ffi.py
 
 # llm artifacts
 AGENTS.md
+nuts/
+.coverage
+.nut-coverage

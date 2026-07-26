@@ -1,0 +1,18 @@
+# greatspectations spec-quote drift config for CDK
+# Tool: https://github.com/rustyrussell/greatspectations
+# Spec: https://github.com/cashubtc/nuts (Cashu NUT specifications)
+#
+# Comment marker syntax in Rust source:
+#   // NUT #04: <verbatim spec quote>
+#
+# Setup (one-time):
+#   git clone --depth=1 https://github.com/cashubtc/nuts.git nuts
+#   pip install git+https://github.com/rustyrussell/greatspectations.git
+#
+# Run:
+#   spectate check --config specquotes.toml --comment-start '// ' --comment-continue '//' crates/cashu/src/nuts/*.rs crates/cashu/src/nuts/*/mod.rs
+
+[sources.NUT]
+format = "markdown"
+dir = "nuts"
+pattern = "{id:02d}.md"
