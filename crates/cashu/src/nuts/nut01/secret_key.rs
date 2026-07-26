@@ -82,6 +82,7 @@ impl SecretKey {
     }
 
     /// Schnorr Signature on Message
+    // BIP #340: This document proposes a standard for 64-byte Schnorr signatures over the elliptic curve ''secp256k1''.
     pub fn sign(&self, msg: &[u8]) -> Result<Signature, Error> {
         let hash: Sha256Hash = Sha256Hash::hash(msg);
         let msg = Message::from_digest_slice(hash.as_ref())?;

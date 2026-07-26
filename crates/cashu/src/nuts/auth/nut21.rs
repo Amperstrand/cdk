@@ -18,6 +18,12 @@ pub enum Error {
 }
 
 /// Clear Auth Settings
+// NUT #21: The mint lists each protected endpoint that requires a clear authentication token (CAT) in the `MintClearAuthSetting` in its [NUT-06][06] info response:
+// NUT #21: - **No client secret:** The OIDC service MUST NOT use a client secret.
+// NUT #21: - **Authorization code flow:** The OIDC service MUST enable the _authorization code flow_ with PKCE for public clients, so that an authorization code can be exchanged for an access token and a refresh token.
+// NUT #21: - **Signature algorithm:** The OIDC service MUST support at least one of the two asymmetric JWS signature algorithms for access token and ID token signatures: `ES256` and `RS256`.
+// NUT #21: - **Wallet redirect URLs:** To support the OpenID Connect Authorization Code flow, the OIDC service MUST allow redirect URLs that correspond to the wallets it wants to support. You can find a list of common redirect URLs for well-known Cashu wallets [here][21-SUPPL].
+// NUT #21: - **Localhost redirect URL:** The OIDC service MUST also allow redirects to the URL `http://localhost:33388/callback`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct Settings {
@@ -229,6 +235,10 @@ impl RoutePath {
 }
 
 /// Returns [`RoutePath`]s that match the pattern (Exact or Prefix)
+// NUT #21: Wallets **MUST** treat mint provided `path` values as untrusted input and use exact or prefix matching only. Never use regex matching on untrusted input.
+// NUT #21: **Exact match**: no trailing `*` → request path MUST equal `path`
+// NUT #21: **Prefix match**: ends with `*` → request path MUST start with the prefix (`*` removed)
+// NUT #21: The `*` wildcard, if present, MUST be the final character only.
 pub fn matching_route_paths(pattern: &str) -> Result<Vec<RoutePath>, Error> {
     // Check for wildcard
     if let Some(prefix) = pattern.strip_suffix('*') {

@@ -36,6 +36,7 @@ pub struct WsUnsubscribeResponse<I> {
 /// subscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "T: Serialize + DeserializeOwned, I: Serialize + DeserializeOwned")]
+// NUT #17: If the subscription is accepted by the mint, the mint MUST first respond with the _current_ state of the subscribed object and continue sending any further updates to it.
 pub struct NotificationInner<T, I>
 where
     T: Clone,
@@ -101,6 +102,7 @@ pub struct WsRequest<I> {
     #[serde(flatten)]
     pub method: WsMethodRequest<I>,
     /// The request ID
+    // NUT #17: an integer counter that must be incremented for every request sent over the websocket.
     pub id: usize,
 }
 

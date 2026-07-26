@@ -103,6 +103,7 @@ pub enum Error {
 /// P2Pk Witness
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+// NUT #11: Signatures are stored in `P2PKWitness` objects and are provided in either each `Proof.witness` of all inputs separately (for `SIG_INPUTS`) or only in the first input of the transaction (for `SIG_ALL`).
 pub struct P2PKWitness {
     /// Signatures
     pub signatures: Vec<String>,
@@ -118,6 +119,7 @@ impl P2PKWitness {
 
 impl Proof {
     /// Sign [Proof]
+    // BIP #340: Encoding only the X coordinate, resulting in 32-byte public keys and 64-byte signatures.
     pub fn sign_p2pk(&mut self, secret_key: SecretKey) -> Result<(), Error> {
         let msg: Vec<u8> = self.secret.to_bytes();
         let signature: Signature = secret_key.sign(&msg)?;
@@ -145,6 +147,7 @@ impl Proof {
     /// 2. Refund path (refund keys): available AFTER locktime
     ///
     /// The verification tries both paths - if either succeeds, the proof is valid.
+    // NUT #11: The message to sign MUST be constructed using the **unescaped** secret string
     pub fn verify_p2pk(&self) -> Result<(), Error> {
         let secret: Nut10Secret = self.secret.clone().try_into()?;
         let spending_conditions: Conditions = secret
@@ -234,6 +237,7 @@ impl Proof {
 
 /// Returns count of valid signatures (each public key is only counted once)
 /// Returns error if the same pubkey has multiple valid signatures
+// NUT #11: If a pathway contains a duplicate key, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 pub fn valid_signatures(
     msg: &[u8],
     pubkeys: &[PublicKey],
@@ -342,6 +346,7 @@ pub enum SpendingConditions {
 
 impl SpendingConditions {
     /// New HTLC [SpendingConditions]
+    // NUT #14: the hash lock in `Secret.data` represents the **SHA-256 hash** of a 32-byte preimage.
     pub fn new_htlc(preimage: String, conditions: Option<Conditions>) -> Result<Self, Error> {
         const MAX_PREIMAGE_BYTES: usize = 32;
 
@@ -370,6 +375,7 @@ impl SpendingConditions {
     }
 
     /// New P2PK [SpendingConditions]
+    // NUT #11: Public keys **MUST** use the [compressed Secp256k1 public key format](https://learnmeabitcoin.com/technical/public-key#public-key-format).
     pub fn new_p2pk(pubkey: PublicKey, conditions: Option<Conditions>) -> Self {
         Self::P2PKConditions {
             data: pubkey,
@@ -394,6 +400,7 @@ impl SpendingConditions {
     }
 
     /// Public keys of locked [`Proof`]
+    // NUT #11: Each key **MUST** appear at most **ONCE** per [multi-signature](#Multisig) pathway. The same key **MAY** appear in both pathways.
     pub fn pubkeys(&self) -> Option<Vec<PublicKey>> {
         match self {
             Self::P2PKConditions { data, conditions } => {
@@ -491,6 +498,7 @@ pub struct Conditions {
     ///
     /// Default is 1
     #[serde(skip_serializing_if = "Option::is_none")]
+    // NUT #11: If `n_sigs` or `n_sigs_refund` is not a positive integer, or exceeds the total number of keys in its pathway, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
     pub num_sigs: Option<u64>,
     /// Signature flag
     ///
@@ -567,6 +575,7 @@ impl From<Conditions> for Vec<Vec<String>> {
 
 impl TryFrom<Vec<Vec<String>>> for Conditions {
     type Error = Error;
+    // NUT #11: Each of the above tags may appear exactly **ONCE** in a P2PK secret. If a tag appears more than once, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
     fn try_from(tags: Vec<Vec<String>>) -> Result<Conditions, Self::Error> {
         let tags: HashMap<TagKind, Tag> = tags
             .into_iter()
@@ -698,8 +707,10 @@ pub enum SigFlag {
     /// Requires valid signatures on all inputs.
     /// It is the default signature flag and will be applied even if the
     /// `sigflag` tag is absent.
+    // NUT #11: `SIG_INPUTS` requires valid signatures on all inputs independently. It is the default signature flag and will be applied if the `sigflag` tag is absent.
     SigInputs,
     /// Requires valid signatures on all inputs and on all outputs.
+    // NUT #11: `SIG_ALL` requires valid signatures on all inputs and on all outputs of a transaction.
     SigAll,
 }
 
@@ -714,6 +725,7 @@ impl fmt::Display for SigFlag {
 
 impl FromStr for SigFlag {
     type Err = Error;
+    // NUT #11: If a P2PK secret has any other signature flag value, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
     fn from_str(tag: &str) -> Result<Self, Self::Err> {
         match tag {
             "SIG_ALL" => Ok(Self::SigAll),
@@ -915,6 +927,7 @@ impl From<Tag> for Vec<String> {
 
 impl SwapRequest {
     /// Sign swap request with SIG_ALL
+    // NUT #11: only **the first input of a transaction requires a witness** that covers all other inputs and outputs of the transaction.
     pub fn sign_sig_all(&mut self, secret_key: SecretKey) -> Result<(), Error> {
         // Get message to sign
         let msg = self.sig_all_msg_to_sign();

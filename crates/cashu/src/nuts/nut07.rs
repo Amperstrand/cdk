@@ -23,6 +23,7 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+// NUT #07: Mints **MUST** remember which proofs are currently `PENDING` to avoid reuse of the same token in multiple concurrent transactions.
 pub enum State {
     /// Spent
     Spent,
@@ -106,6 +107,7 @@ impl From<(PublicKey, State)> for ProofState {
 /// Check Spendable Response [NUT-07]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+// NUT #07: The elements of the `states` array MUST be returned in the same order as the corresponding `Ys` checked in the request.
 pub struct CheckStateResponse {
     /// Proof states
     pub states: Vec<ProofState>,

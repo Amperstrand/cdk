@@ -52,6 +52,7 @@ pub enum Error {
 
 ///  NUT10 Secret Kind
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// NUT #10: `kind` is the kind of the spending condition
 pub enum Kind {
     /// NUT-11 P2PK
     P2PK,
@@ -63,11 +64,14 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SecretData {
     /// Unique random string
+    // NUT #10: `nonce` is a unique random string
     nonce: String,
     /// Expresses the spending condition specific to each kind
+    // NUT #10: `data` expresses the spending condition specific to each kind
     data: String,
     /// Additional data committed to and can be used for feature extensions
     #[serde(skip_serializing_if = "Option::is_none")]
+    // NUT #10: The optional `tags` field, is an array of arrays of non-empty strings.
     tags: Option<Vec<Vec<String>>>,
 }
 
@@ -105,6 +109,7 @@ impl SecretData {
 
 /// NUT10 Secret
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+// NUT #10: The well-known `Secret` stored in `Proof.secret` is a JSON of the format:
 pub struct Secret {
     ///  Kind of the spending condition
     kind: Kind,
@@ -266,6 +271,7 @@ use super::Proofs;
 ///
 /// The preimage should be a 64-character hex string representing 32 bytes.
 /// We decode it from hex, hash it with SHA256, and compare to the hash in secret.data
+// NUT #14: Mints and wallets **must verify** this equality before accepting the spend as valid:
 pub fn verify_htlc_preimage(
     witness: &super::nut14::HTLCWitness,
     secret: &Secret,
@@ -359,6 +365,7 @@ pub trait SpendingConditionVerification {
     /// 2. SIG_ALL flag set
     /// 3. Same Secret.data
     /// 4. Same Secret.tags
+    // NUT #11: If one input has the signature flag `SIG_ALL`, all other inputs MUST have the same `Secret.data` and `Secret.tags`, and by extension, also be `SIG_ALL`.
     fn verify_all_inputs_match_for_sig_all(&self) -> Result<(), super::nut11::Error> {
         let inputs = self.inputs();
 
@@ -504,6 +511,7 @@ pub trait SpendingConditionVerification {
     /// Per NUT-11, there are two spending pathways after locktime:
     /// 1. Primary path (data + pubkeys): ALWAYS available
     /// 2. Refund path (refund keys): available AFTER locktime
+    // NUT #11: All signatures by the signing public keys MUST be provided in the `Proof.witness` of the first input of the transaction.
     fn verify_sig_all_p2pk(&self) -> Result<(), super::nut11::Error> {
         // Get the first input, as it's the one with the signatures
         let first_input = self

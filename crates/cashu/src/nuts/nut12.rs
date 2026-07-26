@@ -116,6 +116,7 @@ fn verify_dleq(
     Ok(())
 }
 
+// NUT #12: Mints that use random nonces **MUST** source them from a cryptographically secure RNG.
 fn calculate_dleq(
     blinded_signature: PublicKey, // C'
     blinded_message: &PublicKey,  // B'
@@ -146,6 +147,7 @@ fn calculate_dleq(
 
 impl Proof {
     /// Verify proof Dleq
+    // NUT #12: If a DLEQ proof is included in a received token, wallets **MUST** verify the proof.
     pub fn verify_dleq(&self, mint_pubkey: PublicKey) -> Result<(), Error> {
         match &self.dleq {
             Some(dleq) => {
@@ -194,6 +196,7 @@ impl BlindSignature {
 
     /// Verify dleq on proof
     #[inline]
+    // NUT #12: If a DLEQ proof is included in the mint's `BlindSignature` response, wallets **MUST** verify the DLEQ proof.
     pub fn verify_dleq(
         &self,
         mint_pubkey: PublicKey,

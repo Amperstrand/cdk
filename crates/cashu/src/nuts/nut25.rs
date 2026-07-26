@@ -32,6 +32,7 @@ pub struct MintQuoteBolt12Request {
     /// Memo to create the invoice with
     pub description: Option<String>,
     /// Pubkey
+    // NUT #25: the mint **MUST NOT** issue a mint quote if one is not included.
     pub pubkey: PublicKey,
 }
 
@@ -53,6 +54,7 @@ pub struct MintQuoteBolt12Response<Q> {
     /// Pubkey
     pub pubkey: PublicKey,
     /// Amount that has been paid
+    // NUT #25: Mints MUST accept mint requests whose total output amount is less than or equal to (`amount_paid` - `amount_issued`).
     pub amount_paid: Amount,
     /// Amount that has been issued
     pub amount_issued: Amount,
@@ -100,6 +102,7 @@ pub struct MeltQuoteBolt12Request {
     /// Unit wallet would like to pay with
     pub unit: CurrencyUnit,
     /// Payment Options
+    // NUT #25: If `options.amountless.amount_msat` is defined and the offer has an amount, they **MUST** be equal.
     pub options: Option<MeltOptions>,
 }
 

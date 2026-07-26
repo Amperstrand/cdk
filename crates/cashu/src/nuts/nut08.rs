@@ -17,6 +17,7 @@ impl<Q> MeltRequest<Q> {
 
 impl<Q> MeltQuoteBolt11Response<Q> {
     /// Total change [`Amount`]
+    // NUT #08: `Bob` **MUST** return the all blank signatures with a value greater than 0 in the same order as the blank outputs were received and should omit all blind signatures with value 0.
     pub fn change_amount(&self) -> Option<Amount> {
         self.change
             .as_ref()

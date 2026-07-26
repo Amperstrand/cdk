@@ -29,6 +29,7 @@ pub struct MppMethodSettings {
 /// Mpp Settings
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema), schema(as = nut15::Settings))]
+// NUT #15: The mint MUST indicate each `method` and `unit` that supports mpp.
 pub struct Settings {
     /// Method settings
     pub methods: Vec<MppMethodSettings>,

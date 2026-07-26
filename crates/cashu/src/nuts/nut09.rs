@@ -9,6 +9,7 @@ use super::nut00::{BlindSignature, BlindedMessage};
 /// Restore Request [NUT-09]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+// NUT #09: Mints must store the `BlindedMessage` and the corresponding `BlindSignature` in their database every time they issue a `BlindSignature`.
 pub struct RestoreRequest {
     /// Outputs
     pub outputs: Vec<BlindedMessage>,
@@ -17,6 +18,9 @@ pub struct RestoreRequest {
 /// Restore Response [NUT-09]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+// NUT #09: Mints only respond with a `BlindSignature`, if they have previously signed the `BlindedMessage`.
+// NUT #09: Each returned `BlindSignature` also contains the `amount` and the keyset `id` (see [NUT-00][00]) which is all the necessary information for a wallet to recover a `Proof`.
+// NUT #09: The returned arrays `outputs` and `signatures` are of the same length and for every entry `outputs[i]`, there is a corresponding entry `signatures[i]`.
 pub struct RestoreResponse {
     /// Outputs
     pub outputs: Vec<BlindedMessage>,

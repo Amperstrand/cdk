@@ -37,6 +37,7 @@ impl Wallet {
         config: WalletConfig,
     ) -> Result<Self, FfiError> {
         // Parse mnemonic and generate seed without passphrase
+        // BIP #39: This seed can be later used to generate deterministic wallets using BIP-0032 or similar methods.
         let m = Mnemonic::parse(&mnemonic)
             .map_err(|e| FfiError::internal(format!("Invalid mnemonic: {}", e)))?;
         let seed = m.to_seed_normalized("");
@@ -654,6 +655,7 @@ pub struct WalletConfig {
 }
 
 /// Generates a new random mnemonic phrase
+// BIP #39: The mnemonic must encode entropy in a multiple of 32 bits. With more entropy security is improved but the sentence length increases.
 #[uniffi::export]
 pub fn generate_mnemonic() -> Result<String, FfiError> {
     let mnemonic = Mnemonic::generate(12)

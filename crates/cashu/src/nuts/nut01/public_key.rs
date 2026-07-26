@@ -95,6 +95,7 @@ impl PublicKey {
     }
 
     /// Verify schnorr signature
+    // BIP #340: Return success iff no failure occurred before reaching this point.
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
         let hash: Sha256Hash = Sha256Hash::hash(msg);
         let msg = Message::from_digest_slice(hash.as_ref())?;
