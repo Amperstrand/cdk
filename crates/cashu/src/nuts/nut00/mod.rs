@@ -432,6 +432,7 @@ impl PartialOrd for Proof {
 }
 
 /// Proof V4
+// NUT #00: Receivers MUST ignore unknown fields to preserve forward compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofV4 {
     /// Amount in satoshi
@@ -577,6 +578,7 @@ impl Hash for ProofV3 {
     }
 }
 
+// NUT #00: Implementations MUST convert between hex strings and raw byte arrays when translating between JSON and CBOR representations.
 fn serialize_v4_pubkey<S>(key: &PublicKey, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,

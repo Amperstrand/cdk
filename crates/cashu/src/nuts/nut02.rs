@@ -198,6 +198,7 @@ impl Id {
         let mut data = keys_string;
         data.push_str(&format!("|unit:{}", unit));
 
+        // NUT #02: If input_fee_ppk is omitted, null, or 0, it MUST be omitted from the preimage.
         if input_fee_ppk > 0 {
             data.push_str(&format!("|input_fee_ppk:{}", input_fee_ppk));
         }
@@ -260,6 +261,7 @@ impl Id {
 
     /// Selects the correct IDv2 from a list of keysets and the given short-id
     /// or returns the short-id in the case of v1.
+    // NUT #00: the wallet **MUST** fail token parsing and return an error.
     pub fn from_short_keyset_id(
         short_id: &ShortKeysetId,
         keysets_info: &[KeySetInfo],
@@ -496,6 +498,7 @@ pub struct KeySet {
     /// Keyset [`Keys`]
     pub keys: Keys,
     /// Input Fee PPK
+    // NUT #02: wallets **MUST** add fees to the inputs or, vice versa, subtract from the outputs.
     #[serde(default)]
     pub input_fee_ppk: u64,
     /// Expiry
@@ -528,6 +531,7 @@ impl KeySet {
 }
 
 /// KeySetInfo
+// NUT #02: Mints can have multiple keysets at the same time but **MUST** have at least one `active` keyset (see [NUT-01][01]).
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KeySetInfo {
     /// Keyset [`Id`]
@@ -536,6 +540,7 @@ pub struct KeySetInfo {
     pub unit: CurrencyUnit,
     /// Keyset state
     /// Mint will only sign from an active keyset
+    // NUT #02: new outputs (`BlindedMessages` and `BlindSignatures`) **MUST** be from `active` keysets only.
     pub active: bool,
     /// Input Fee PPK
     #[serde(
@@ -561,6 +566,7 @@ pub trait KeySetInfosMethods {
 }
 
 impl KeySetInfosMethods for KeySetInfos {
+    // NUT #02: When constructing outputs for a transaction, wallets **MUST** choose only `active` keysets (see [NUT-00][00]).
     fn active(&self) -> impl Iterator<Item = &KeySetInfo> + '_ {
         self.iter().filter(|k| k.active)
     }

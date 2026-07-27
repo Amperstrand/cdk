@@ -44,6 +44,7 @@ pub enum Error {
 /// This is a variation of [MintKeys] that only exposes the public keys.
 ///
 /// See [NUT-01]
+// NUT #01: Keyset amount values **MUST** represent an amount in the Minor Unit of that currency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keys(BTreeMap<Amount, PublicKey>);
 

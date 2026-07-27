@@ -8,6 +8,7 @@ use crate::Amount;
 
 impl<Q> MeltRequest<Q> {
     /// Total output [`Amount`]
+    // NUT #08: which ensures that there is at least one output if there is any fee
     pub fn output_amount(&self) -> Option<Amount> {
         self.outputs()
             .as_ref()
@@ -17,6 +18,8 @@ impl<Q> MeltRequest<Q> {
 
 impl<Q> MeltQuoteBolt11Response<Q> {
     /// Total change [`Amount`]
+    // NUT #08: return the all blank signatures with a value greater than 0 in the same order as the blank outputs were received and should omit all blind signatures with value 0
+    // NUT #08: that account for the overpaid fees
     pub fn change_amount(&self) -> Option<Amount> {
         self.change
             .as_ref()

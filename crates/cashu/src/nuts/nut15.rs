@@ -25,6 +25,7 @@ pub struct MppMethodSettings {
 }
 
 /// Mpp Settings
+// NUT #15: The mint MUST indicate each `method` and `unit` that supports mpp.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Settings {
     /// Method settings

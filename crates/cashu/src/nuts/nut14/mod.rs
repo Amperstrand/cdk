@@ -72,6 +72,7 @@ pub enum Error {
 }
 
 /// HTLC Witness
+// NUT #14: The preimage for unlocking the HTLC is in the witness `Proof.witness.preimage`.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HTLCWitness {
     /// Preimage
@@ -87,6 +88,8 @@ impl HTLCWitness {
     /// Returns the 32-byte preimage data if valid, or an error if:
     /// - The hex decoding fails
     /// - The decoded data is not exactly 32 bytes
+    // NUT #14: `preimage_bytes` is exactly 32 bytes of arbitrary data, commonly random and uniformly distributed
+    // NUT #14: To successfully spend a Proof via the **Receiver Pathway**, the spender must present the matching `preimage_bytes`, encoded as a 64-character lowercase hexadecimal string in the `Proof.witness.preimage`.
     pub fn preimage_data(&self) -> Result<[u8; 32], Error> {
         const REQUIRED_PREIMAGE_BYTES: usize = 32;
 
@@ -114,6 +117,8 @@ impl Proof {
     ///
     /// The verification tries to determine which path is being used based on
     /// the witness provided, then validates accordingly.
+    // NUT #14: This pathway is **ALWAYS** available to the receivers, as possession of the preimage confirms performance of the Sender's wishes.
+    // NUT #14: If the `pubkeys` tag is absent, the preimage alone spends the proof; no signature is required.
     pub fn verify_htlc(&self) -> Result<(), Error> {
         let secret: Secret = self.secret.clone().try_into()?;
         let spending_conditions: Conditions = secret
@@ -236,6 +241,7 @@ impl Proof {
 
 impl SpendingConditions {
     /// New HTLC [SpendingConditions]
+    // NUT #14: `hash_hex` is the 32-byte SHA-256 digest of preimage_bytes, encoded as a 64-character lowercase hexadecimal string
     pub fn new_htlc(preimage: String, conditions: Option<Conditions>) -> Result<Self, Error> {
         const MAX_PREIMAGE_BYTES: usize = 32;
 
@@ -268,6 +274,8 @@ impl SpendingConditions {
 ///
 /// The preimage should be a 64-character hex string representing 32 bytes.
 /// We decode it from hex, hash it with SHA256, and compare to the hash in secret.data
+// NUT #14: the hash lock in `Secret.data` represents the **SHA-256 hash** of a 32-byte preimage.
+// NUT #14: Mints and wallets **must verify** this equality before accepting the spend as valid:
 fn verify_htlc_preimage(witness: &HTLCWitness, secret: &Secret) -> Result<(), Error> {
     use bitcoin::hashes::sha256::Hash as Sha256Hash;
     use bitcoin::hashes::Hash;

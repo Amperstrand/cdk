@@ -5,6 +5,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Mint settings
+// NUT #19: `ttl` is the number of seconds the responses are cached for
+// NUT #19: `cached_endpoints` is a list of the methods and paths for which caching is enabled.
+// NUT #19: If `ttl` is `null`, the responses are expected to be cached _indefinitely_.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Settings {
     /// Number of seconds the responses are cached for
@@ -14,6 +17,7 @@ pub struct Settings {
 }
 
 /// List of the methods and paths for which caching is enabled
+// NUT #19: `path` and `method` describe the cached route and its method respectively.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CachedEndpoint {
     /// HTTP Method

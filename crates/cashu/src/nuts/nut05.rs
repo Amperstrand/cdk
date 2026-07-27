@@ -89,6 +89,8 @@ pub struct MeltRequest<Q> {
     /// Blinded Message that can be used to return change [NUT-08]
     /// Amount field of BlindedMessages `SHOULD` be set to zero
     outputs: Option<Vec<BlindedMessage>>,
+    // NUT #05: If the method-specific NUT requires asynchronous execution, the mint **MUST** process melt requests for that method asynchronously. The wallet does not need to set `prefer_async`.
+
     /// Whether the client prefers asynchronous processing
     #[serde(default)]
     prefer_async: bool,
@@ -222,6 +224,8 @@ where
 /// Melt Method Settings
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MeltMethodSettings {
+    // NUT #05: `method` **MUST** match `[a-z0-9_-]+`.
+
     /// Payment Method e.g. bolt11
     pub method: PaymentMethod,
     /// Currency Unit e.g. sat

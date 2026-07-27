@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use super::nut00::{BlindSignature, BlindedMessage};
 
 /// Restore Request [NUT-09]
+// NUT #09: must store the...and the corresponding...in their database every time they issue a
+// NUT #09: if they have previously signed the
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreRequest {
     /// Outputs
@@ -14,6 +16,7 @@ pub struct RestoreRequest {
 }
 
 /// Restore Response [NUT-09]
+// NUT #09: are of the same length and for every entry...there is a corresponding entry
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreResponse {
     /// Outputs

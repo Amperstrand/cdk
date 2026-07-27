@@ -20,16 +20,22 @@ pub enum Error {
 }
 
 /// State of Proof
+// NUT #07: A proof can be in one of the following states
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum State {
     /// Spent
+    // NUT #07: if it has been redeemed and its secret is in the list of spent secrets of the mint.
     Spent,
     /// Unspent
+    // NUT #07: if it has not been spent yet
     Unspent,
     /// Pending
     ///
     /// Currently being used in a transaction i.e. melt in progress
+    // NUT #07: if it is being processed in a transaction
+    // NUT #07: proof cannot be used in another transaction until it is
+    // NUT #07: remember which proofs are currently...to avoid reuse of the same token in multiple concurrent transactions
     Pending,
     /// Reserved
     ///
@@ -69,6 +75,7 @@ impl FromStr for State {
 }
 
 /// Check spendable request [NUT-07]
+// NUT #07: are the hexadecimal representation of the compressed point
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckStateRequest {
     /// Y's of the proofs to check
@@ -77,6 +84,7 @@ pub struct CheckStateRequest {
 }
 
 /// Proof state [NUT-07]
+// NUT #07: is the serialized witness data that was used to spend the
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofState {
     /// Y of proof
@@ -99,6 +107,7 @@ impl From<(PublicKey, State)> for ProofState {
 }
 
 /// Check Spendable Response [NUT-07]
+// NUT #07: MUST be returned in the same order as the corresponding
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckStateResponse {
     /// Proof states

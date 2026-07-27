@@ -1,6 +1,10 @@
 //! NUT-29: Batch Mint Tokens
 //!
 //! <https://github.com/cashubtc/nuts/blob/main/29.md>
+//!
+// NUT #29: The quotes in this array MUST be in the same order as in the request.
+// NUT #29: If any `quote_id` is not known by the mint, the mint MUST reject the entire request and return an appropriate error
+// NUT #29: If any `quote_id` cannot be parsed (invalid format), the mint MUST reject the entire request and return an appropriate error
 
 use bitcoin::secp256k1::schnorr::Signature;
 use serde::de::DeserializeOwned;
@@ -58,6 +62,10 @@ pub struct BatchCheckMintQuoteRequest<Q> {
 }
 
 /// Batch mint request per NUT-29
+// NUT #29: every quote in the batch **MUST** be for the same payment `method` as the `{method}` in the URL, and a batch that mixes payment methods **MUST** be rejected by the mint.
+// NUT #29: The `quotes` array MUST NOT be empty
+// NUT #29: All quote IDs in the `quotes` array MUST be unique (no duplicates)
+// NUT #29: If **any signature in the batch is invalid**, the mint MUST reject the **entire batch** and return an error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "Q: Serialize + DeserializeOwned")]
 pub struct BatchMintRequest<Q> {
@@ -83,6 +91,7 @@ where
     ///
     /// Format: `quote_id || B_0 || B_1 || ... || B_n`
     /// where each component is encoded as UTF-8 bytes.
+    // NUT #29: The batch `outputs` are a single consolidated set (not partitioned per quote), so each signature is computed over the full `outputs` array.
     pub fn msg_to_sign(&self, quote: &Q) -> Vec<u8> {
         let quote_id = quote.to_string();
         let capacity = quote_id.len() + (self.outputs.len() * 66);

@@ -1,4 +1,7 @@
 //! Bolt12
+//!
+// NUT #25: the mint **MUST NOT** issue a mint quote if one is not included.
+// NUT #25: Mints MUST accept mint requests whose total output amount is less than or equal to (`amount_paid` - `amount_issued`).
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -90,6 +93,7 @@ impl From<MintQuoteBolt12Response<QuoteId>> for MintQuoteBolt12Response<String> 
 }
 
 /// Melt quote request [NUT-18]
+// NUT #25: If `options.amountless.amount_msat` is defined and the offer has an amount, they **MUST** be equal.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeltQuoteBolt12Request {
     /// Bolt12 invoice to be paid

@@ -1,4 +1,7 @@
 //! Mint Quote Signatures
+//!
+// NUT #20: `pubkey` is the compressed secp256k1 public key (33 bytes, hex-encoded) that will be required for signature verification during the minting operation. The mint will only mint ecash after receiving a valid signature from the corresponding private key in the subsequent `PostMintRequest`.
+// NUT #20: If the wallet user `Alice` does not include a signature on the `PostMintBolt11Request` but did include a `pubkey` in the `PostMintBolt11QuoteRequest` then `Bob` **MUST** respond with an error.
 
 use std::str::FromStr;
 
@@ -33,6 +36,8 @@ where
     ///
     /// Format: `quote_id || B_0 || B_1 || ... || B_n`
     /// where each component is encoded as UTF-8 bytes
+    // NUT #20: To authenticate a mint request, the signer commits to the quote ID and all `BlindedMessages` (the outputs, see [NUT-00][00]) of the `PostMintBolt11Request`, in the order they appear in the request.
+    // NUT #20: We use a [BIP340](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki) Schnorr signature on the SHA-256 hash of the message to sign as defined above.
     pub fn msg_to_sign(&self) -> Vec<u8> {
         // Pre-calculate capacity to avoid reallocations
         let quote_id = self.quote.to_string();

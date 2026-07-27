@@ -97,6 +97,7 @@ pub enum Error {
 }
 
 /// P2Pk Witness
+// NUT #11: Signatures are stored in `P2PKWitness` objects and are provided in either each `Proof.witness` of all inputs separately (for `SIG_INPUTS`) or only in the first input of the transaction (for `SIG_ALL`).
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct P2PKWitness {
     /// Signatures
@@ -113,6 +114,9 @@ impl P2PKWitness {
 
 impl Proof {
     /// Sign [Proof]
+    // BIP #340: This document proposes a standard for 64-byte Schnorr signatures
+    //over the elliptic curve ''secp256k1''.
+    // NUT #11: We use `libsecp256k1`'s serialized 64 byte Schnorr signatures on the SHA256 hash of the message to sign.
     pub fn sign_p2pk(&mut self, secret_key: SecretKey) -> Result<(), Error> {
         let msg: Vec<u8> = self.secret.to_bytes();
         let signature: Signature = secret_key.sign(&msg)?;
@@ -140,6 +144,9 @@ impl Proof {
     /// 2. Refund path (refund keys): available AFTER locktime
     ///
     /// The verification tries both paths - if either succeeds, the proof is valid.
+    // NUT #11: the proof must be unlocked by providing a witness `Proof.witness` and one or more valid signatures in the array `Proof.witness.signatures`.
+    // NUT #11: The `secret` field is **signed as a string**.
+    // NUT #11: The message to sign MUST be constructed using the **unescaped** secret string
     pub fn verify_p2pk(&self) -> Result<(), Error> {
         let secret: Nut10Secret = self.secret.clone().try_into()?;
         let spending_conditions: Conditions = secret
@@ -269,6 +276,7 @@ pub(crate) fn extract_signatures_from_witness(
 /// Per NUT-11, there are two spending pathways after locktime:
 /// 1. Primary path (data + pubkeys): ALWAYS available
 /// 2. Refund path (refund keys): available AFTER locktime
+// NUT #11: All signatures by the signing public keys MUST be provided in the `Proof.witness` of the first input of the transaction.
 pub(crate) fn verify_sig_all_p2pk(first_input: &Proof, msg_to_sign: String) -> Result<(), Error> {
     // Get the first input, as it's the one with the signatures
     let first_secret =
@@ -335,6 +343,9 @@ pub(crate) fn verify_sig_all_p2pk(first_input: &Proof, msg_to_sign: String) -> R
 
 /// Returns count of valid signatures (each public key is only counted once)
 /// Returns error if the same pubkey has multiple valid signatures
+// NUT #11: Each key **MUST** appear at most **ONCE** per [multi-signature](#Multisig) pathway. The same key **MAY** appear in both pathways.
+// NUT #11: Keys are compared using their lowercase x-coordinate (`02` or `03` y-parity prefix ignored).
+// NUT #11: If a pathway contains a duplicate key, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 pub(crate) fn valid_signatures(
     msg: &[u8],
     pubkeys: &[PublicKey],
@@ -421,6 +432,10 @@ impl BlindedMessage {
 /// Signature flag
 ///
 /// Defined in [NUT11](https://github.com/cashubtc/nuts/blob/main/11.md)
+// NUT #11: `SIG_INPUTS` requires valid signatures on all inputs independently. It is the default signature flag and will be applied if the `sigflag` tag is absent.
+// NUT #11: `SIG_ALL` requires valid signatures on all inputs and on all outputs of a transaction.
+// NUT #11: `SIG_INPUTS` is only enforced if no input is `SIG_ALL`.
+// NUT #11: If a P2PK secret has any other signature flag value, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord, Hash,
 )]

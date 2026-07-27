@@ -51,6 +51,8 @@ impl Wallet {
         let db = crate::database::resolve_wallet_store(store)?;
         let localstore = crate::database::create_cdk_database_from_ffi(db);
 
+        // BIP #39: A user may decide to protect their mnemonic with a passphrase. If a passphrase is not
+        //present, an empty string "" is used instead.
         let m = Mnemonic::parse(&mnemonic)
             .map_err(|e| FfiError::internal(format!("Invalid mnemonic: {}", e)))?;
         let seed = m.to_seed_normalized("");
@@ -871,6 +873,8 @@ pub struct WalletConfig {
 }
 
 /// Generates a new random mnemonic phrase
+// BIP #39: The mnemonic must encode entropy in a multiple of 32 bits. With more entropy
+//security is improved but the sentence length increases.
 #[uniffi::export]
 pub fn generate_mnemonic() -> Result<String, FfiError> {
     let mnemonic = Mnemonic::generate(12)

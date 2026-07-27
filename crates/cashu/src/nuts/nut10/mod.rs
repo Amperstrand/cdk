@@ -48,6 +48,7 @@ pub(crate) struct SpendingRequirements {
 }
 
 ///  NUT10 Secret Kind
+// NUT #10: `kind` is the kind of the spending condition
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Kind {
     /// NUT-11 P2PK
@@ -57,6 +58,10 @@ pub enum Kind {
 }
 
 /// Secret Date
+// NUT #10: The well-known `Secret` stored in `Proof.secret` is a JSON of the format:
+// NUT #10: `nonce` is a unique random string
+// NUT #10: `data` expresses the spending condition specific to each kind
+// NUT #10: `tags` hold additional data committed to and can be used for feature extensions
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SecretData {
     /// Unique random string
@@ -101,6 +106,7 @@ impl SecretData {
 }
 
 fn check_duplicate_pubkeys(pubkeys: &[PublicKey]) -> Result<(), Error> {
+    // NUT #11: Keys are compared using their lowercase x-coordinate (`02` or `03` y-parity prefix ignored).
     let mut x_coords = std::collections::HashSet::with_capacity(pubkeys.len());
     for pk in pubkeys {
         if !x_coords.insert(pk.x_only_public_key().serialize()) {
@@ -130,6 +136,9 @@ fn check_duplicate_pubkeys(pubkeys: &[PublicKey]) -> Result<(), Error> {
 /// - `pubkeys`: The public keys for the primary/receiver path
 /// - `required_sigs`: The minimum number of signatures required for primary path
 /// - `refund_path`: Optional refund path (available after locktime)
+// NUT #10: Spending conditions are defined for each individual `Proof` and not on a transaction level that can consist of multiple `Proofs`.
+// NUT #10: Similarly, spending conditions must be satisfied by providing signatures or additional witness data for each `Proof` separately.
+// NUT #10: For a transaction to be valid, all `Proofs` in that transaction must be unlocked successfully.
 pub(crate) fn get_pubkeys_and_required_sigs(
     secret: &Secret,
     current_time: u64,
@@ -295,6 +304,7 @@ pub trait SpendingConditionVerification {
     /// 2. SIG_ALL flag set
     /// 3. Same Secret.data
     /// 4. Same Secret.tags
+    // NUT #11: If one input has the signature flag `SIG_ALL`, all other inputs MUST have the same `Secret.data` and `Secret.tags`, and by extension, also be `SIG_ALL`.
     fn verify_all_inputs_match_for_sig_all(&self) -> Result<(), Error> {
         let inputs = self.inputs();
 
@@ -341,6 +351,7 @@ pub trait SpendingConditionVerification {
     ///
     /// This is the main entry point for spending condition verification.
     /// It checks if any input has SIG_ALL and dispatches to the appropriate verification path.
+    // NUT #10: the mint can require additional conditions to be met.
     fn verify_spending_conditions(&self) -> Result<(), Error> {
         // Check if any input has SIG_ALL flag
         if self.has_at_least_one_sig_all()? {

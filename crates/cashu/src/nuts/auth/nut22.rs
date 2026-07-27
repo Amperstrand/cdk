@@ -1,4 +1,8 @@
 //! 22 Blind Auth
+//!
+// NUT #22: Blind authentication tokens (BATs) are essentially the same as normal ecash tokens and are minted in the same way. They are signed with a special keyset of the mint that has the unit `auth` and a single amount `1`.
+// NUT #22: To access this endpoint the wallet MUST provide a valid CAT (obtained via [NUT-21][21]) in its request header, IF this endpoint is marked as protected in the info response of the mint as per [NUT-21][21].
+// NUT #22: To prevent pinning, wallets MUST validate the DLEQ proofs `dleq` as defined in [NUT-12](./12.md).
 
 use std::fmt;
 
@@ -110,6 +114,9 @@ impl<'de> Deserialize<'de> for Settings {
 }
 
 /// Auth Token
+// NUT #22: To add a blind authentication token (BAT) to the request header, we need to serialize a single `AuthProof` JSON as base64url with the prefix `authA`:
+// NUT #22: Mints **MUST** accept and decode both padded and unpadded forms.
+// NUT #22: To protect the privacy of the wallet, the BAT MUST NOT contain the `dleq` proof when it is sent to the mint in the request header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthToken {
     /// Clear Auth token
@@ -210,6 +217,7 @@ impl BlindAuthToken {
     /// Remove DLEQ
     ///
     /// We do not send the DLEQ to the mint as it links redemption and creation
+    // NUT #22: `AuthProofs` are single-use. The wallet MUST delete the `AuthProof` after a successful request, and SHOULD delete it even if request results in an error.
     pub fn without_dleq(&self) -> Self {
         Self {
             auth_proof: AuthProof {
@@ -254,6 +262,7 @@ impl std::str::FromStr for BlindAuthToken {
 }
 
 /// Mint auth request [NUT-XX]
+// NUT #22: The mint MUST return DLEQ proofs for every blind signature in `PostAuthBlindMintResponse` as defined in [NUT-12](./12.md)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MintAuthRequest {
     /// Outputs

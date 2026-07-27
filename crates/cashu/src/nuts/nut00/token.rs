@@ -432,6 +432,7 @@ impl From<TokenV4> for TokenV3 {
 
 /// Token V4
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// NUT #00: The mint URL **MUST** be normalized by stripping any trailing slashes (`/`).
 pub struct TokenV4 {
     /// Mint Url
     #[serde(rename = "m")]
@@ -449,6 +450,7 @@ pub struct TokenV4 {
 
 impl TokenV4 {
     /// Proofs from token
+    // NUT #00: the wallet **MUST** resolve it to the corresponding full keyset ID before processing the contained `Proof` objects.
     pub fn proofs(&self, mint_keysets: &[KeySetInfo]) -> Result<Proofs, Error> {
         let mut proofs: Proofs = vec![];
         for t in self.token.iter() {
@@ -580,6 +582,7 @@ impl TryFrom<TokenV3> for TokenV4 {
 
 /// Token V4 Token
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// NUT #00: All proofs in the corresponding `p` array MUST belong to the same keyset ID.
 pub struct TokenV4Token {
     /// `Keyset id`
     #[serde(
@@ -604,6 +607,7 @@ fn deserialize_v4_keyset_id<'de, D>(deserializer: D) -> Result<ShortKeysetId, D:
 where
     D: serde::Deserializer<'de>,
 {
+    // NUT #00: Wallets receiving a Token **MUST** support both short and full keyset ID representations.
     let bytes = Vec::<u8>::deserialize(deserializer)?;
     ShortKeysetId::from_bytes(&bytes).map_err(serde::de::Error::custom)
 }

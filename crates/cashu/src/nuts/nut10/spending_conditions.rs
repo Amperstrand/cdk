@@ -16,6 +16,7 @@ use crate::{ensure_cdk, nut14, Kind, Nut10Secret, PublicKey, SigFlag};
 /// Spending Conditions
 ///
 /// Defined in [NUT10](https://github.com/cashubtc/nuts/blob/main/10.md)
+// NUT #10: Spending conditions are enforced by the mint which means that, upon encountering a `Proof` where `Proof.secret` can be parsed into the well-known format, the mint can require additional conditions to be met.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SpendingConditions {
     /// NUT11 Spending conditions
@@ -153,6 +154,8 @@ impl TryFrom<SpendingConditions> for Secret {
 }
 
 /// P2PK and HTLC spending conditions
+// NUT #11: Each of the above tags may appear exactly **ONCE** in a P2PK secret. If a tag appears more than once, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
+// NUT #11: If `n_sigs` or `n_sigs_refund` is not a positive integer, or exceeds the total number of keys in its pathway, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct Conditions {
     /// Unix locktime after which refund keys can be used

@@ -33,6 +33,7 @@ impl MintVersion {
 }
 
 impl std::fmt::Display for MintVersion {
+    // NUT #06: is the implementation name and the version of the software running on this mint separated with a slash "/"
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.name, self.version)
     }
@@ -66,6 +67,7 @@ impl<'de> Deserialize<'de> for MintVersion {
 }
 
 /// Mint Info [NUT-06]
+// NUT #06: This endpoint returns information about the mint that a wallet can show to the user and use to make decisions on how to interact with the mint.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MintInfo {
     /// name of the mint and should be recognizable
@@ -99,9 +101,11 @@ pub struct MintInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
     /// message of the day that the wallet must display to the user
+    // NUT #06: is the message of the day that the wallet must display to the user
     #[serde(skip_serializing_if = "Option::is_none")]
     pub motd: Option<String>,
     /// server unix timestamp
+    // NUT #06: is the current time set on the server. The value is passed as a Unix timestamp integer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<u64>,
     /// terms of url service of the mint
@@ -269,6 +273,7 @@ impl MintInfo {
 }
 
 /// Supported nuts and settings
+// NUT #06: indicates each NUT specification that the mint supports and its settings.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Nuts {
     /// NUT04 Settings
@@ -493,6 +498,7 @@ pub struct SupportedSettings {
 }
 
 /// Contact Info
+// NUT #06: A contact object consists of two fields.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContactInfo {
     /// Contact Method i.e. nostr

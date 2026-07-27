@@ -80,6 +80,7 @@ impl SecretKey {
     }
 
     /// Schnorr Signature on Message
+    // BIP #340: The algorithm ''Sign(sk, m)'' is defined as:
     pub fn sign(&self, msg: &[u8]) -> Result<Signature, Error> {
         let hash: Sha256Hash = Sha256Hash::hash(msg);
         let msg = Message::from_digest_slice(hash.as_ref())?;

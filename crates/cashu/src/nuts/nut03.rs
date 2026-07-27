@@ -1,6 +1,10 @@
 //! NUT-03: Swap
 //!
 //! <https://github.com/cashubtc/nuts/blob/main/03.md>
+//!
+//! Note: The NUT-03 specification defines no `MUST`-level requirements
+//! (only `SHOULD`, e.g. output ordering for privacy), so there are no
+//! greatspectations spec-quotes recorded in this module.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

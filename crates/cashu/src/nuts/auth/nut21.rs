@@ -1,4 +1,10 @@
 //! 21 Clear Auth
+//!
+// NUT #21: The OIDC service MUST NOT use a client secret.
+// NUT #21: The OIDC service MUST enable the _authorization code flow_ with PKCE for public clients, so that an authorization code can be exchanged for an access token and a refresh token.
+// NUT #21: The OIDC service MUST support at least one of the two asymmetric JWS signature algorithms for access token and ID token signatures: `ES256` and `RS256`.
+// NUT #21: the OIDC service MUST allow redirect URLs that correspond to the wallets it wants to support.
+// NUT #21: The OIDC service MUST also allow redirects to the URL `http://localhost:33388/callback`.
 
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -18,6 +24,9 @@ pub enum Error {
 }
 
 /// Clear Auth Settings
+// NUT #21: `protected_endpoints` is an array of objects that specify each endpoint that requires a CAT in the request headers. `method` is the HTTP method, and `path` is either:
+// NUT #21: The `*` wildcard, if present, MUST be the final character only.
+// NUT #21: Wallets **MUST** treat mint provided `path` values as untrusted input and use exact or prefix matching only. Never use regex matching on untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize)]
 pub struct Settings {
     /// Openid discovery
@@ -204,6 +213,8 @@ impl<'de> Deserialize<'de> for RoutePath {
 
 impl RoutePath {
     /// Create a wildcard route path.
+    // NUT #21: **Exact match**: no trailing `*` → request path MUST equal `path`
+    // NUT #21: **Prefix match**: ends with `*` → request path MUST start with the prefix (`*` removed)
     pub fn wildcard(prefix: String) -> Result<Self, Error> {
         if prefix.contains('*') {
             return Err(Error::InvalidPattern(

@@ -45,6 +45,8 @@ pub enum Error {
 
 impl Secret {
     /// Create new [`Secret`] from seed
+    // NUT #13: the wallet **MUST** keep track of a separate counter for each keyset `k` it uses. The wallet **MUST** keep track of multiple keysets for every mint it interacts with.
+    // NUT #13: When encountering keysets with different versions, wallets **MUST** use the appropriate derivation method based on the keyset ID version and retain the existing `counter_k` value for each keyset to ensure consistent restore support across wallet implementations.
     pub fn from_seed(seed: &[u8; 64], keyset_id: Id, counter: u32) -> Result<Self, Error> {
         match keyset_id.get_version() {
             super::nut02::KeySetVersion::Version00 => Self::legacy_derive(seed, keyset_id, counter),
@@ -52,6 +54,7 @@ impl Secret {
         }
     }
 
+    // NUT #13: Wallets **MUST** use this method when working with keysets that have IDs starting with `00`.
     fn legacy_derive(seed: &[u8; 64], keyset_id: Id, counter: u32) -> Result<Self, Error> {
         let xpriv = Xpriv::new_master(Network::Bitcoin, seed)?;
         let path = derive_path_from_keyset_id(keyset_id)?
@@ -222,6 +225,7 @@ impl PreMintSecrets {
     }
 }
 
+// NUT #13: Keyset IDs with version prefix `01` **MUST** be shortened to the first 8 bytes before conversion.
 fn derive_path_from_keyset_id(id: Id) -> Result<DerivationPath, Error> {
     let index = u32::from(id);
 

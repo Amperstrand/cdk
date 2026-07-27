@@ -12,6 +12,9 @@ use crate::nut10::Error;
 use crate::SigFlag;
 
 /// P2PK and HTLC Spending condition tags
+// NUT #10: The optional `tags` field, is an array of arrays of non-empty strings.
+// NUT #10: Each individual tag is an array of **ONE or more strings**.
+// NUT #10: The first element of the tag array is known as the tag _name_ or _key_ and the subsequent string(s) are the _tag value(s)_.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum TagKind {

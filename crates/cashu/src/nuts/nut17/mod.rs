@@ -16,6 +16,7 @@ use crate::MintQuoteBolt12Response;
 pub mod ws;
 
 /// Subscription Parameter according to the standard
+// NUT #17: The `subId` is the ID for each subscription, whereas `id` is part of the JSON-RPC spec and is an integer counter that must be incremented for every request sent over the websocket.
 #[derive(Debug, Clone, Serialize, Eq, PartialEq, Hash, Deserialize)]
 #[serde(bound = "I: DeserializeOwned + Serialize")]
 pub struct Params<I> {
@@ -188,6 +189,7 @@ where
 #[serde(bound(serialize = "T: Serialize + DeserializeOwned"))]
 #[serde(untagged)]
 /// Subscription response
+// NUT #17: If the subscription is accepted by the mint, the mint MUST first respond with the _current_ state of the subscribed object and continue sending any further updates to it.
 pub enum NotificationPayload<T>
 where
     T: Clone,

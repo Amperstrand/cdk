@@ -11,6 +11,7 @@ use crate::nut10::Error;
 use crate::{Kind, SecretData};
 
 /// NUT10 Secret
+// NUT #10: upon encountering a `Proof` where `Proof.secret` can be parsed into the well-known format, the mint can require additional conditions to be met.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Secret {
     ///  Kind of the spending condition

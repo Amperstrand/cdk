@@ -47,6 +47,7 @@ impl PublicKey {
     }
 
     /// Parse from `hex` string
+    // NUT #01: The mint **MUST** use the [compressed Secp256k1 public key format](https://learnmeabitcoin.com/technical/public-key#public-key-format) to represent its public keys.
     #[inline]
     pub fn from_hex<S>(hex: S) -> Result<Self, Error>
     where
@@ -92,6 +93,7 @@ impl PublicKey {
     }
 
     /// Verify schnorr signature
+    // BIP #340: The algorithm ''Verify(pk, m, sig)'' is defined as:
     pub fn verify(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
         let hash: Sha256Hash = Sha256Hash::hash(msg);
         let msg = Message::from_digest_slice(hash.as_ref())?;
