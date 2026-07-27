@@ -56,3 +56,5 @@ out/
 bindings/kotlin/cdk-jvm/src/main/kotlin/uniffi/
 bindings/kotlin/cdk-jvm/src/main/resources/*.so
 bindings/kotlin/cdk-jvm/src/main/resources/*.dylib
+nuts/
+.coverage
