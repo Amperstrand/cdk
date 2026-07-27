@@ -340,34 +340,41 @@ impl TryFrom<Vec<Vec<String>>> for Conditions {
             let tag = Tag::try_from(tag_vec)?;
             match tag {
                 Tag::LockTime(lt) => {
-                    if locktime.is_none() {
-                        locktime = Some(lt);
+                    // REF-NUTSHELL: also uses first-match (not spec-compliant rejection)
+                    if locktime.is_some() {
+                        return Err(Error::NUT11(crate::nuts::nut11::Error::DuplicatePubkey));
                     }
+                    locktime = Some(lt);
                 }
                 Tag::PubKeys(pks) => {
-                    if pubkeys.is_none() {
-                        pubkeys = Some(pks);
+                    if pubkeys.is_some() {
+                        return Err(Error::NUT11(crate::nuts::nut11::Error::DuplicatePubkey));
                     }
+                    pubkeys = Some(pks);
                 }
                 Tag::Refund(keys) => {
-                    if refund_keys.is_none() {
-                        refund_keys = Some(keys);
+                    if refund_keys.is_some() {
+                        return Err(Error::NUT11(crate::nuts::nut11::Error::DuplicatePubkey));
                     }
+                    refund_keys = Some(keys);
                 }
                 Tag::SigFlag(sf) => {
-                    if sig_flag.is_none() {
-                        sig_flag = Some(sf);
+                    if sig_flag.is_some() {
+                        return Err(Error::NUT11(crate::nuts::nut11::Error::DuplicatePubkey));
                     }
+                    sig_flag = Some(sf);
                 }
                 Tag::NSigs(sigs) => {
-                    if num_sigs.is_none() {
-                        num_sigs = Some(sigs);
+                    if num_sigs.is_some() {
+                        return Err(Error::NUT11(crate::nuts::nut11::Error::DuplicatePubkey));
                     }
+                    num_sigs = Some(sigs);
                 }
                 Tag::NSigsRefund(sigs) => {
-                    if num_sigs_refund.is_none() {
-                        num_sigs_refund = Some(sigs);
+                    if num_sigs_refund.is_some() {
+                        return Err(Error::NUT11(crate::nuts::nut11::Error::DuplicatePubkey));
                     }
+                    num_sigs_refund = Some(sigs);
                 }
                 Tag::Custom(_, _) => {}
             }
