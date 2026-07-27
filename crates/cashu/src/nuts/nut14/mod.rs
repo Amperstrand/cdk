@@ -126,6 +126,7 @@ impl Proof {
         let requirements =
             super::nut10::get_pubkeys_and_required_sigs(&secret, now).map_err(Error::NUT11)?;
 
+        // REF-NUTSHELL: accepts any witness type for HTLC refund, CDK requires HTLCWitness
         // Try to extract HTLC witness - must be correct type
         let htlc_witness = match &self.witness {
             Some(Witness::HTLCWitness(witness)) => witness,

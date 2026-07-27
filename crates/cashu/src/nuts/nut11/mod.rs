@@ -237,6 +237,7 @@ impl Proof {
 
 /// Returns count of valid signatures (each public key is only counted once)
 /// Returns error if the same pubkey has multiple valid signatures
+// REF-NUTSHELL: also rejects duplicate signatures (conditions.py:148-149)
 // NUT #11: If a pathway contains a duplicate key, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 pub fn valid_signatures(
     msg: &[u8],
@@ -498,6 +499,7 @@ pub struct Conditions {
     ///
     /// Default is 1
     #[serde(skip_serializing_if = "Option::is_none")]
+    // REF-NUTSHELL: validates n_sigs > pubkeys at verify time (deferred, not upfront)
     // NUT #11: If `n_sigs` or `n_sigs_refund` is not a positive integer, or exceeds the total number of keys in its pathway, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
     pub num_sigs: Option<u64>,
     /// Signature flag
@@ -575,6 +577,7 @@ impl From<Conditions> for Vec<Vec<String>> {
 
 impl TryFrom<Vec<Vec<String>>> for Conditions {
     type Error = Error;
+    // REF-NUTSHELL: duplicate tags also use first-match (not spec-compliant rejection)
     // NUT #11: Each of the above tags may appear exactly **ONCE** in a P2PK secret. If a tag appears more than once, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
     fn try_from(tags: Vec<Vec<String>>) -> Result<Conditions, Self::Error> {
         let tags: HashMap<TagKind, Tag> = tags

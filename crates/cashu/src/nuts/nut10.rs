@@ -350,6 +350,7 @@ pub trait SpendingConditionVerification {
                 if has_sig_all {
                     return Ok(true);
                 }
+            // REF-NUTSHELL: also rejects witness on plain secret (conditions.py:210-213)
             } else if proof.witness.is_some() {
                 return Err(super::nut11::Error::IncorrectWitnessKind);
             }
@@ -497,6 +498,7 @@ pub trait SpendingConditionVerification {
                     }
                 }
             }
+            // REF-NUTSHELL: unknown kind raises ValueError (fail-closed), CDK treats as anyone-can-spend
             // If not a nut10 secret, skip verification (plain secret)
         }
         Ok(())
