@@ -1,12 +1,13 @@
 //! Mint Builder
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bitcoin::bip32::DerivationPath;
 use cdk_common::database::{DynMintAuthDatabase, DynMintDatabase, MintKeysDatabase};
 use cdk_common::error::Error;
 use cdk_common::nut00::KnownMethod;
+use cdk_common::nuts::Id;
 use cdk_common::nut04::MintMethodOptions;
 use cdk_common::nut05::MeltMethodOptions;
 use cdk_common::payment::DynMintPayment;
@@ -81,6 +82,10 @@ pub struct MintBuilder {
     /// deployment that owns its database; set an interval only to run several
     /// mints/signatories against one shared database.
     keyset_refresh_interval: Option<std::time::Duration>,
+    /// Keysets whose proofs may additionally verify under the legacy
+    /// hex-decode secret encoding (issued claims of divergent wallets);
+    /// empty by default (strict canonical verification).
+    legacy_encoding_keysets: HashSet<Id>,
 }
 
 impl std::fmt::Debug for MintBuilder {
@@ -125,7 +130,16 @@ impl MintBuilder {
             max_outputs: 1000,
             max_batch_size: None,
             keyset_refresh_interval: None,
+            legacy_encoding_keysets: HashSet::new(),
         }
+    }
+
+    /// Set the keysets whose proofs may additionally verify under the legacy
+    /// hex-decode secret encoding (empty = strict canonical verification,
+    /// the default and previous behavior).
+    pub fn with_legacy_encoding_keysets(mut self, keysets: HashSet<Id>) -> Self {
+        self.legacy_encoding_keysets = keysets;
+        self
     }
 
     /// Set use keyset v2
@@ -758,7 +772,8 @@ impl MintBuilder {
                 self.supported_units.clone(),
                 self.custom_paths.clone(),
             )
-            .await?,
+            .await?
+            .with_legacy_encoding_keysets(self.legacy_encoding_keysets.clone()),
         );
 
         // Off by default: a single mint owns its database. When an interval is

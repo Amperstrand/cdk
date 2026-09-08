@@ -68,6 +68,17 @@ impl Settings {
             self.database.engine = engine;
         }
 
+        if let Ok(keysets) = env::var(LEGACY_ENCODING_KEYSETS_ENV_VAR) {
+            let parsed: Vec<String> = keysets
+                .split(',')
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect();
+            if !parsed.is_empty() {
+                self.legacy_encoding_keysets = parsed;
+            }
+        }
+
         // Parse PostgreSQL-specific configuration from environment variables
         if self.database.engine == DatabaseEngine::Postgres {
             self.database.postgres = Some(

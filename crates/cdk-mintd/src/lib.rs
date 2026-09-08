@@ -1097,8 +1097,24 @@ async fn configure_mint_builder_with_wallet_info(
     let mint_builder = configure_cache(settings, mint_builder, &payment_methods).await?;
 
     // Configure transaction limits
-    let mint_builder =
+    let mut mint_builder =
         mint_builder.with_limits(settings.limits.max_inputs, settings.limits.max_outputs);
+
+    // Legacy hex-decode encoding allowlist (honor issued claims of divergent
+    // wallets for specific keysets; empty = strict canonical verification)
+    if !settings.legacy_encoding_keysets.is_empty() {
+        let mut keysets = std::collections::HashSet::new();
+        for id in &settings.legacy_encoding_keysets {
+            let id = cdk_common::nuts::Id::from_str(id)
+                .map_err(|e| anyhow::anyhow!("invalid keyset id {id:?} in legacy_encoding_keysets: {e}"))?;
+            keysets.insert(id);
+        }
+        tracing::info!(
+            count = keysets.len(),
+            "legacy hex-decode encoding verification enabled for allowlisted keysets"
+        );
+        mint_builder = mint_builder.with_legacy_encoding_keysets(keysets);
+    }
 
     // Verify at least one payment processor is configured
     if mint_builder

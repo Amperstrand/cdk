@@ -1129,6 +1129,12 @@ pub struct Settings {
     /// Transaction limits for DoS protection
     #[serde(default)]
     pub limits: Limits,
+    /// Keyset ids whose proofs may additionally verify under the legacy
+    /// hex-decode secret encoding (issued claims of wallets that hashed the
+    /// raw entropy behind a hex secret instead of its UTF-8 bytes). Empty by
+    /// default: verification is strictly canonical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_encoding_keysets: Vec<String>,
     #[cfg(feature = "cln")]
     pub cln: Option<Cln>,
     #[cfg(feature = "lnd")]

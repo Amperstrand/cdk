@@ -9,7 +9,7 @@
 //! once and bubbles up any error, so a failed load fails construction rather
 //! than leaving a signatory without keys. On success the returned signatory is
 //! loaded and serving.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -75,6 +75,16 @@ pub struct DbSignatory {
     /// Latest keyset snapshot, published on every reload (initial load and each
     /// rotation).
     keyset_updates: watch::Sender<SignatoryKeysets>,
+    /// Keysets whose proofs may additionally verify under the legacy
+    /// hex-decode secret encoding (see `verify_proofs`). Empty by default:
+    /// verification is strictly NUT-00 canonical, matching previous behavior.
+    ///
+    /// Background: wallets that hashed the raw entropy behind a 64-char hex
+    /// secret (instead of the UTF-8 bytes of the string) produced signatures
+    /// this mint blindly issued against paid quotes. Those proofs only verify
+    /// under `hash_to_curve(hex_decode(secret))`. Keysets with such issued
+    /// claims can be allowlisted to honor them.
+    legacy_encoding_keysets: HashSet<Id>,
 }
 
 impl DbSignatory {
@@ -112,11 +122,20 @@ impl DbSignatory {
             secp_ctx,
             xpriv,
             keyset_updates,
+            legacy_encoding_keysets: HashSet::new(),
         };
 
         signatory.boot_load().await?;
 
         Ok(signatory)
+    }
+
+    /// Set the keysets whose proofs may additionally verify under the legacy
+    /// hex-decode secret encoding (empty = strict canonical verification,
+    /// the default and previous behavior).
+    pub fn with_legacy_encoding_keysets(mut self, keysets: HashSet<Id>) -> Self {
+        self.legacy_encoding_keysets = keysets;
+        self
     }
 
     /// Periodically reload keysets from the shared database, so a rotation
@@ -393,8 +412,42 @@ impl Signatory for DbSignatory {
                 .get(&proof.keyset_id)
                 .ok_or(Error::UnknownKeySet)?;
             let key_pair = key.keys.get(&proof.amount).ok_or(Error::UnknownKeySet)?;
-            verify_message(&key_pair.secret_key, proof.c, proof.secret.as_bytes())?;
-            Ok(())
+
+            if verify_message(&key_pair.secret_key, proof.c, proof.secret.as_bytes()).is_ok() {
+                return Ok(());
+            }
+
+            // Legacy hex-decode encoding handling (see field doc on
+            // `legacy_encoding_keysets`): a 64-char hex secret whose proof
+            // matches hash_to_curve(hex_decode(secret)) was issued by this
+            // mint to a divergent-but-spec-permitted wallet. Sensor: always
+            // log when the legacy derivation matches, so operators can find
+            // affected keysets even while verification is strict. Acceptance
+            // only for allowlisted keysets (honor issued claims, bounded).
+            let secret_str = proof.secret.to_string();
+            if secret_str.len() == 64 && secret_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let decoded = cdk_common::util::hex::decode(secret_str)
+                    .map_err(|_| Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))?;
+                if verify_message(&key_pair.secret_key, proof.c, &decoded).is_ok() {
+                    if self.legacy_encoding_keysets.contains(&proof.keyset_id) {
+                        tracing::info!(
+                            keyset = %proof.keyset_id,
+                            "proof verified via legacy hex-decode encoding (allowlisted keyset)"
+                        );
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        keyset = %proof.keyset_id,
+                        amount = %proof.amount,
+                        "LEGACY_ENCODING_PROOF_REJECTED: proof matches the legacy hex-decode \
+                         derivation but its keyset is not in the legacy allowlist; if this \
+                         keyset has issued such claims, add it to \
+                         CDK_MINTD_LEGACY_ENCODING_KEYSETS to honor them"
+                    );
+                }
+            }
+
+            Err(Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))
         })
     }
 
@@ -502,10 +555,12 @@ impl Signatory for DbSignatory {
 #[cfg(test)]
 mod test {
     use std::collections::HashSet;
+    use std::str::FromStr;
 
     use bitcoin::key::Secp256k1;
     use bitcoin::Network;
     use cdk_common::database::MintKeysDatabase;
+    use cdk_common::dhke::hash_to_curve;
     use cdk_common::nuts::SecretKey;
     use cdk_common::util::{hex, unix_time};
     use cdk_common::{Amount, MintKeySet, PublicKey};
@@ -1605,5 +1660,163 @@ mod test {
             pubkey,
             "025b6c1ca8bb741a6f2321c953266df7bf3f3f2c3be8c54c0a6e41bb00976046a4".to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn verify_proofs_legacy_encoding_sensor_and_allowlist() {
+        use crate::signatory::Signatory;
+
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let keyset_info_store = store.clone();
+        let signatory = DbSignatory::new(store, b"legacy-encoding-test-seed", Default::default(), Default::default())
+            .await
+            .expect("DbSignatory::new");
+
+        let rotated = signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![64],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+                final_expiry: None,
+            })
+            .await
+            .expect("rotate_keyset");
+
+        // Snapshots expose public keys only; regenerate the keyset's private
+        // keys deterministically from the same seed + the persisted keyset
+        // info (amounts and derivation path) exactly as the signatory does.
+        let mut tx = keyset_info_store
+            .begin_transaction()
+            .await
+            .expect("begin keyset tx");
+        let info = tx
+            .get_keyset_infos()
+            .await
+            .expect("keyset infos persisted")
+            .into_iter()
+            .find(|i| i.id == rotated.id)
+            .expect("rotated keyset info present");
+        tx.rollback().await.expect("rollback");
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let xpriv = bitcoin::bip32::Xpriv::new_master(
+            bitcoin::Network::Bitcoin,
+            b"legacy-encoding-test-seed",
+        )
+        .expect("xpriv");
+        let keyset = MintKeySet::generate_from_xpriv(
+            &secp,
+            xpriv,
+            &info.amounts,
+            info.unit.clone(),
+            info.derivation_path.clone(),
+            info.input_fee_ppk,
+            info.final_expiry,
+            info.id.get_version(),
+        );
+        let secret_key = keyset
+            .keys
+            .get(&64.into())
+            .expect("amount key present")
+            .secret_key
+            .clone();
+
+        // Canonical trap vector: utf8 derivation vs hex-decoded derivation
+        // produce different Y for the same secret string.
+        let secret = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let decoded = cdk_common::util::hex::decode(secret).expect("hex");
+        let y_canonical = hash_to_curve(secret.as_bytes()).expect("canonical Y");
+        let y_legacy = hash_to_curve(&decoded).expect("legacy Y");
+        assert_ne!(y_canonical, y_legacy);
+
+        let c_canonical = sign_message(&secret_key, &y_canonical).expect("sign canonical");
+        let c_legacy = sign_message(&secret_key, &y_legacy).expect("sign legacy");
+
+        let secret = cdk_common::secret::Secret::from_str(secret).expect("secret");
+        let canonical_proof = Proof {
+            amount: 64.into(),
+            keyset_id: rotated.id,
+            secret: secret.clone(),
+            c: c_canonical,
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let legacy_proof = Proof {
+            amount: 64.into(),
+            keyset_id: rotated.id,
+            secret: secret.clone(),
+            c: c_legacy,
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+
+        // Default (no allowlist): canonical verifies, legacy is rejected —
+        // identical to previous cdk behavior.
+        signatory
+            .verify_proofs(vec![canonical_proof.clone()])
+            .await
+            .expect("canonical proof verifies");
+        let err = signatory
+            .verify_proofs(vec![legacy_proof.clone()])
+            .await
+            .expect_err("legacy proof rejected without allowlist");
+        assert!(matches!(
+            err,
+            Error::DHKE(cdk_common::dhke::Error::TokenNotVerified)
+        ));
+
+        // Allowlisted keyset: the legacy-issued claim is honored.
+        let lenient = DbSignatory::new(
+            Arc::new(
+                cdk_sqlite::mint::memory::empty()
+                    .await
+                    .expect("in-memory db 2"),
+            ),
+            b"legacy-encoding-test-seed",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("DbSignatory::new 2");
+        // Same seed -> same keyset ids after the same rotation sequence.
+        let rotated2 = lenient
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![64],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+                final_expiry: None,
+            })
+            .await
+            .expect("rotate 2");
+        assert_eq!(rotated.id, rotated2.id, "same seed derives same keyset id");
+
+        let lenient = lenient.with_legacy_encoding_keysets(HashSet::from([rotated.id]));
+        lenient
+            .verify_proofs(vec![legacy_proof])
+            .await
+            .expect("legacy proof honored on allowlisted keyset");
+        lenient
+            .verify_proofs(vec![canonical_proof])
+            .await
+            .expect("canonical proof still verifies when lenient");
+
+        // Non-hex garbage secrets never enter the legacy path.
+        let garbage = Proof {
+            amount: 64.into(),
+            keyset_id: rotated.id,
+            secret: cdk_common::secret::Secret::from_str("not-hex!").expect("secret"),
+            c: c_canonical,
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        assert!(signatory.verify_proofs(vec![garbage]).await.is_err());
     }
 }
