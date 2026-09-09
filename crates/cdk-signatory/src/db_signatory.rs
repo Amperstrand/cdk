@@ -9,7 +9,7 @@
 //! once and bubbles up any error, so a failed load fails construction rather
 //! than leaving a signatory without keys. On success the returned signatory is
 //! loaded and serving.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ use arc_swap::ArcSwap;
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::secp256k1::{self, Secp256k1};
 use cdk_common::database::MintKeyDatabaseTransaction;
-use cdk_common::dhke::{sign_message, verify_message};
+use cdk_common::dhke::{sign_message, verify_message, verify_message_deprecated};
 use cdk_common::mint::MintKeySetInfo;
 use cdk_common::nuts::{BlindSignature, BlindedMessage, CurrencyUnit, Id, MintKeySet, Proof};
 use cdk_common::{database, Error, PublicKey};
@@ -75,6 +75,12 @@ pub struct DbSignatory {
     /// Latest keyset snapshot, published on every reload (initial load and each
     /// rotation).
     keyset_updates: watch::Sender<SignatoryKeysets>,
+    /// Keysets whose proofs may additionally verify under the legacy
+    /// pre-0.15.1 hash algorithm (nutshell compat; empty = strict).
+    legacy_algorithm_keysets: HashSet<Id>,
+    /// Keysets whose proofs may additionally verify under the legacy
+    /// hex-decode secret encoding (empty = strict).
+    legacy_encoding_keysets: HashSet<Id>,
 }
 
 impl DbSignatory {
@@ -112,11 +118,29 @@ impl DbSignatory {
             secp_ctx,
             xpriv,
             keyset_updates,
+            legacy_algorithm_keysets: HashSet::new(),
+            legacy_encoding_keysets: HashSet::new(),
         };
 
         signatory.boot_load().await?;
 
         Ok(signatory)
+    }
+
+    /// Set the keysets whose proofs may additionally verify under the legacy
+    /// hex-decode secret encoding (empty = strict canonical verification,
+    /// the default and previous behavior).
+    pub fn with_legacy_encoding_keysets(mut self, keysets: HashSet<Id>) -> Self {
+        self.legacy_encoding_keysets = keysets;
+        self
+    }
+
+    /// Set the keysets whose proofs may additionally verify under the legacy
+    /// pre-0.15.1 hash algorithm (nutshell <0.15.1 token compat; empty =
+    /// strict, the default and previous behavior).
+    pub fn with_legacy_algorithm_keysets(mut self, keysets: HashSet<Id>) -> Self {
+        self.legacy_algorithm_keysets = keysets;
+        self
     }
 
     /// Periodically reload keysets from the shared database, so a rotation
@@ -393,8 +417,57 @@ impl Signatory for DbSignatory {
                 .get(&proof.keyset_id)
                 .ok_or(Error::UnknownKeySet)?;
             let key_pair = key.keys.get(&proof.amount).ok_or(Error::UnknownKeySet)?;
-            verify_message(&key_pair.secret_key, proof.c, proof.secret.as_bytes())?;
-            Ok(())
+
+            if verify_message(&key_pair.secret_key, proof.c, proof.secret.as_bytes()).is_ok() {
+                return Ok(());
+            }
+
+            // Legacy algorithm (nutshell <0.15.1): deprecated sha256-chain
+            // hash on the utf-8 secret. Sensor always logs a match;
+            // acceptance per allowlisted keyset only.
+            if cdk_common::dhke::verify_message_deprecated(
+                &key_pair.secret_key,
+                proof.c,
+                proof.secret.as_bytes(),
+            )
+            .is_ok()
+            {
+                if self.legacy_algorithm_keysets.contains(&proof.keyset_id) {
+                    tracing::info!(
+                        keyset = %proof.keyset_id,
+                        "proof verified via legacy pre-0.15.1 hash algorithm (allowlisted keyset)"
+                    );
+                    return Ok(());
+                }
+                tracing::warn!(
+                    keyset = %proof.keyset_id,
+                    amount = %proof.amount,
+                    "LEGACY_ALGORITHM_PROOF_REJECTED: proof matches the pre-0.15.1 deprecated                      hash derivation but its keyset is not in the legacy algorithm allowlist;                      if this keyset holds such tokens (e.g. migrated from a nutshell mint), add                      it to CDK_MINTD_LEGACY_ALGORITHM_KEYSETS to honor them"
+                );
+            }
+
+            // Legacy encoding: 64-char hex secret hashed as decoded raw bytes.
+            let secret_str = proof.secret.to_string();
+            if secret_str.len() == 64 && secret_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let decoded = cdk_common::util::hex::decode(&secret_str)
+                    .map_err(|_| Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))?;
+                if verify_message(&key_pair.secret_key, proof.c, &decoded).is_ok() {
+                    if self.legacy_encoding_keysets.contains(&proof.keyset_id) {
+                        tracing::info!(
+                            keyset = %proof.keyset_id,
+                            "proof verified via legacy hex-decode encoding (allowlisted keyset)"
+                        );
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        keyset = %proof.keyset_id,
+                        amount = %proof.amount,
+                        "LEGACY_ENCODING_PROOF_REJECTED: proof matches the legacy hex-decode                          derivation but its keyset is not in the legacy allowlist; if this                          keyset has issued such claims, add it to                          CDK_MINTD_LEGACY_ENCODING_KEYSETS to honor them"
+                    );
+                }
+            }
+
+            Err(Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))
         })
     }
 

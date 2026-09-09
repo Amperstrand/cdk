@@ -1097,8 +1097,42 @@ async fn configure_mint_builder_with_wallet_info(
     let mint_builder = configure_cache(settings, mint_builder, &payment_methods).await?;
 
     // Configure transaction limits
-    let mint_builder =
+    let mut mint_builder =
         mint_builder.with_limits(settings.limits.max_inputs, settings.limits.max_outputs);
+
+    // ISSUE-119 legacy redemption allowlists (empty = strict, the previous
+    // behavior). Two independent axes:
+    //   legacy_algorithm_keysets  — pre-0.15.1 hash (nutshell token compat)
+    //   legacy_encoding_keysets   — hex-decode secret encoding
+    if !settings.legacy_algorithm_keysets.is_empty() {
+        let mut keysets = std::collections::HashSet::new();
+        for id in &settings.legacy_algorithm_keysets {
+            let id = cdk_common::nuts::Id::from_str(id).map_err(|e| {
+                anyhow::anyhow!("invalid keyset id {id:?} in legacy_algorithm_keysets: {e}")
+            })?;
+            keysets.insert(id);
+        }
+        tracing::info!(
+            count = keysets.len(),
+            "legacy pre-0.15.1 hash verification enabled for allowlisted keysets"
+        );
+        mint_builder = mint_builder.with_legacy_algorithm_keysets(keysets);
+    }
+
+    if !settings.legacy_encoding_keysets.is_empty() {
+        let mut keysets = std::collections::HashSet::new();
+        for id in &settings.legacy_encoding_keysets {
+            let id = cdk_common::nuts::Id::from_str(id).map_err(|e| {
+                anyhow::anyhow!("invalid keyset id {id:?} in legacy_encoding_keysets: {e}")
+            })?;
+            keysets.insert(id);
+        }
+        tracing::info!(
+            count = keysets.len(),
+            "legacy hex-decode encoding verification enabled for allowlisted keysets"
+        );
+        mint_builder = mint_builder.with_legacy_encoding_keysets(keysets);
+    }
 
     // Verify at least one payment processor is configured
     if mint_builder

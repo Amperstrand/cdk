@@ -1129,6 +1129,16 @@ pub struct Settings {
     /// Transaction limits for DoS protection
     #[serde(default)]
     pub limits: Limits,
+    /// Keysets whose proofs may additionally verify under the legacy
+    /// pre-0.15.1 hash algorithm (nutshell <0.15.1 token compat). Empty by
+    /// default: verification is strictly canonical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_algorithm_keysets: Vec<String>,
+    /// Keysets whose proofs may additionally verify under the legacy
+    /// hex-decode secret encoding. Empty by default: verification is
+    /// strictly canonical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_encoding_keysets: Vec<String>,
     #[cfg(feature = "cln")]
     pub cln: Option<Cln>,
     #[cfg(feature = "lnd")]

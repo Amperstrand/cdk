@@ -66,6 +66,24 @@ pub fn hash_to_curve(message: &[u8]) -> Result<PublicKey, Error> {
     Err(Error::NoValidPoint)
 }
 
+/// Pre-0.15.1 hash_to_curve (nutshell): sha256-chain try-and-increment, no
+/// domain separator. Tokens minted under this derivation exist in the wild;
+/// mints that issued or inherited them can honor them per-keyset (see
+/// DbSignatory::verify_proofs).
+pub fn hash_to_curve_deprecated(message: &[u8]) -> Result<PublicKey, Error> {
+    let mut msg_to_hash: Vec<u8> = message.to_vec();
+    for _ in 0..2_u32.pow(16) {
+        let hash: [u8; 32] = Sha256Hash::hash(&msg_to_hash).to_byte_array();
+        match XOnlyPublicKey::from_slice(&hash) {
+            Ok(pk) => {
+                return Ok(NormalizedPublicKey::from_x_only_public_key(pk, Parity::Even).into())
+            }
+            Err(_) => msg_to_hash = hash.to_vec(),
+        }
+    }
+    Err(Error::NoValidPoint)
+}
+
 /// Convert iterator of [`PublicKey`] to byte array
 pub fn hash_e<I>(public_keys: I) -> [u8; 32]
 where
@@ -190,6 +208,25 @@ pub fn verify_message(
 
     Err(Error::TokenNotVerified)
 }
+
+pub fn verify_message_deprecated(
+    a: &SecretKey,
+    unblinded_message: PublicKey,
+    msg: &[u8],
+) -> Result<(), Error> {
+    let y: PublicKey = hash_to_curve_deprecated(msg)?;
+
+    let expected_unblinded_message: PublicKey = y
+        .mul_tweak(&Secp256k1::new(), &Scalar::from(*a.deref()))?
+        .into();
+
+    if unblinded_message == expected_unblinded_message {
+        return Ok(());
+    }
+
+    Err(Error::TokenNotVerified)
+}
+
 
 #[cfg(test)]
 mod tests {
