@@ -1,0 +1,19 @@
+name: spec-quote-drift
+on:
+  push:
+    branches: [spectate/main]
+  schedule:
+    - cron: "0 7 * * 1"
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: spectate/main }
+      - uses: actions/checkout@v4
+        with: { repository: cashubtc/nuts, path: nuts }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install git+https://github.com/rustyrussell/greatspectations.git
+      - run: greatspectate check --config specquotes.toml
+             $(git ls-files 'crates/cashu/src/nuts/*.rs')

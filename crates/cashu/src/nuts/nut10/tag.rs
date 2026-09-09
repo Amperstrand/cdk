@@ -66,6 +66,7 @@ where
 
 /// Tag
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+// NUT #11: Each of the above tags may appear exactly **ONCE** in a P2PK secret. If a tag appears more than once, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 pub enum Tag {
     /// Sigflag [`Tag`]
     SigFlag(SigFlag),

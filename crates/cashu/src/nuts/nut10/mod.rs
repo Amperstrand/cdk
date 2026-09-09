@@ -122,6 +122,7 @@ pub const MAX_LOCKING_SLOTS: usize = 11;
 /// NUT-11 counts two keys sharing an x-coordinate as one, so a repetition can
 /// never add a signer. Construction and verification both run this, so a lock
 /// that is built is a lock that can be spent.
+// NUT #11: Keys are compared using their lowercase x-coordinate (`02` or `03` y-parity prefix ignored).
 fn check_duplicate_pubkeys(pubkeys: &[PublicKey]) -> Result<(), Error> {
     let mut x_coords = std::collections::HashSet::with_capacity(pubkeys.len());
     for pk in pubkeys {
@@ -132,6 +133,7 @@ fn check_duplicate_pubkeys(pubkeys: &[PublicKey]) -> Result<(), Error> {
     Ok(())
 }
 
+// NUT #11: If `n_sigs` or `n_sigs_refund` is not a positive integer, or exceeds the total number of keys in its pathway, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 /// Get the relevant public keys and required signature count for P2PK or HTLC verification
 /// This is for NUT-11(P2PK) and NUT-14(HTLC)
 ///

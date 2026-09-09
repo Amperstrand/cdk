@@ -1,0 +1,4 @@
+[sources.nuts]
+format = "markdown"
+dir = "../nuts"
+pattern = "{id}.md"

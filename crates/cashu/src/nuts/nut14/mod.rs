@@ -124,6 +124,7 @@ impl Proof {
     ///
     /// The verification tries to determine which path is being used based on
     /// the witness provided, then validates accordingly.
+    // NUT #14/Sender Pathway (timelocked refund): The sender(s) listed in the `refund` tag can spend the proof once the `locktime` lock has "expired" by providing signature(s) as per the [NUT-11][11] rules for **Refund MultiSig**.
     pub fn verify_htlc(&self) -> Result<(), Error> {
         let secret: Secret = self.secret.clone().try_into()?;
         let spending_conditions: Conditions = secret
@@ -278,6 +279,8 @@ impl SpendingConditions {
 ///
 /// The preimage should be a 64-character hex string representing 32 bytes.
 /// We decode it from hex, hash it with SHA256, and compare to the hash in secret.data
+// NUT #14: Mints and wallets **must verify** this equality before accepting the spend as valid:
+// SHA256(hex_to_bytes(Proof.witness.preimage)) == hex_to_bytes(Proof.secret.data)
 fn verify_htlc_preimage(witness: &HTLCWitness, secret: &Secret) -> Result<(), Error> {
     use bitcoin::hashes::sha256::Hash as Sha256Hash;
     use bitcoin::hashes::Hash;
