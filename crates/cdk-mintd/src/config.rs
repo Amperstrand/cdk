@@ -1129,6 +1129,18 @@ pub struct Settings {
     /// Transaction limits for DoS protection
     #[serde(default)]
     pub limits: Limits,
+    /// Legacy redemption policy. Three modes:
+    /// - "allow" — accept legacy-derivation proofs for listed keysets
+    /// - "observe" — reject but log (safe default)
+    /// - "rugpull" — reject without checking (strictest)
+    ///
+    /// Can be set globally (applies to all keysets) or per-keyset via
+    /// `legacy_mode_overrides`.
+    #[serde(default)]
+    pub legacy_mode: Option<String>,
+    /// Per-keyset mode overrides: { keyset_id: "allow" | "observe" | "rugpull" }
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub legacy_mode_overrides: std::collections::HashMap<String, String>,
     #[cfg(feature = "cln")]
     pub cln: Option<Cln>,
     #[cfg(feature = "lnd")]

@@ -9,7 +9,7 @@
 //! once and bubbles up any error, so a failed load fails construction rather
 //! than leaving a signatory without keys. On success the returned signatory is
 //! loaded and serving.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,13 +17,14 @@ use arc_swap::ArcSwap;
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::secp256k1::{self, Secp256k1};
 use cdk_common::database::MintKeyDatabaseTransaction;
-use cdk_common::dhke::{sign_message, verify_message};
+use cdk_common::dhke::{sign_message, verify_message, verify_message_deprecated};
 use cdk_common::mint::MintKeySetInfo;
 use cdk_common::nuts::{BlindSignature, BlindedMessage, CurrencyUnit, Id, MintKeySet, Proof};
 use cdk_common::{database, Error, PublicKey};
 use tokio::sync::{watch, Mutex};
 use tracing::instrument;
 
+use crate::LegacyRedemptionMode;
 use crate::common::{
     check_unit_string_collision, create_new_keyset, derivation_path_from_unit, init_keysets,
 };
@@ -75,6 +76,11 @@ pub struct DbSignatory {
     /// Latest keyset snapshot, published on every reload (initial load and each
     /// rotation).
     keyset_updates: watch::Sender<SignatoryKeysets>,
+    /// Per-keyset legacy redemption mode. Keysets not in this map use the
+    /// global default (see `legacy_default_mode`).
+    legacy_modes: HashMap<Id, LegacyRedemptionMode>,
+    /// Default mode for keysets without an explicit entry.
+    legacy_default_mode: LegacyRedemptionMode,
 }
 
 impl DbSignatory {
@@ -112,11 +118,27 @@ impl DbSignatory {
             secp_ctx,
             xpriv,
             keyset_updates,
+            legacy_modes: HashMap::new(),
+            legacy_default_mode: LegacyRedemptionMode::default(),
         };
 
         signatory.boot_load().await?;
 
         Ok(signatory)
+    }
+
+    /// Set per-keyset legacy redemption modes. Keysets not listed use the
+    /// default mode (see `with_legacy_default_mode`).
+    pub fn with_legacy_modes(mut self, modes: HashMap<Id, LegacyRedemptionMode>) -> Self {
+        self.legacy_modes = modes;
+        self
+    }
+
+    /// Set the default legacy redemption mode for keysets without an explicit
+    /// entry. Default: `Observe` (strict verification with sensor logging).
+    pub fn with_legacy_default_mode(mut self, mode: LegacyRedemptionMode) -> Self {
+        self.legacy_default_mode = mode;
+        self
     }
 
     /// Periodically reload keysets from the shared database, so a rotation
@@ -393,8 +415,78 @@ impl Signatory for DbSignatory {
                 .get(&proof.keyset_id)
                 .ok_or(Error::UnknownKeySet)?;
             let key_pair = key.keys.get(&proof.amount).ok_or(Error::UnknownKeySet)?;
-            verify_message(&key_pair.secret_key, proof.c, proof.secret.as_bytes())?;
-            Ok(())
+
+            if verify_message(&key_pair.secret_key, proof.c, proof.secret.as_bytes()).is_ok() {
+                return Ok(());
+            }
+
+            let mode = self
+                .legacy_modes
+                .get(&proof.keyset_id)
+                .copied()
+                .unwrap_or(self.legacy_default_mode);
+
+            if mode == LegacyRedemptionMode::RugPull {
+                // Don't even compute legacy derivations; strictest and fastest.
+                return Err(Error::DHKE(cdk_common::dhke::Error::TokenNotVerified));
+            }
+
+            // Legacy algorithm (nutshell <0.15.1): deprecated sha256-chain hash
+            if cdk_common::dhke::verify_message_deprecated(
+                &key_pair.secret_key,
+                proof.c,
+                proof.secret.as_bytes(),
+            )
+            .is_ok()
+            {
+                return match mode {
+                    LegacyRedemptionMode::Allow => {
+                        tracing::info!(
+                            keyset = %proof.keyset_id,
+                            "proof verified via legacy pre-0.15.1 hash algorithm (allow mode)"
+                        );
+                        Ok(())
+                    }
+                    LegacyRedemptionMode::Observe => {
+                        tracing::warn!(
+                            keyset = %proof.keyset_id,
+                            amount = %proof.amount,
+                            "LEGACY_ALGORITHM_PROOF_REJECTED (observe mode): proof matches the                              pre-0.15.1 deprecated hash derivation; switch this keyset to allow                              mode to honor it"
+                        );
+                        Err(Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))
+                    }
+                    LegacyRedemptionMode::RugPull => unreachable!(),
+                };
+            }
+
+            // Legacy encoding: 64-char hex secret hashed as decoded raw bytes
+            let secret_str = proof.secret.to_string();
+            if secret_str.len() == 64 && secret_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let decoded = cdk_common::util::hex::decode(&secret_str)
+                    .map_err(|_| Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))?;
+                if verify_message(&key_pair.secret_key, proof.c, &decoded).is_ok() {
+                    return match mode {
+                        LegacyRedemptionMode::Allow => {
+                            tracing::info!(
+                                keyset = %proof.keyset_id,
+                                "proof verified via legacy hex-decode encoding (allow mode)"
+                            );
+                            Ok(())
+                        }
+                        LegacyRedemptionMode::Observe => {
+                            tracing::warn!(
+                                keyset = %proof.keyset_id,
+                                amount = %proof.amount,
+                                "LEGACY_ENCODING_PROOF_REJECTED (observe mode): proof matches the                                  legacy hex-decode derivation; switch this keyset to allow mode                                  to honor it"
+                            );
+                            Err(Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))
+                        }
+                        LegacyRedemptionMode::RugPull => unreachable!(),
+                    };
+                }
+            }
+
+            Err(Error::DHKE(cdk_common::dhke::Error::TokenNotVerified))
         })
     }
 

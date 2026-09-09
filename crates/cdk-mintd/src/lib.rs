@@ -1097,8 +1097,42 @@ async fn configure_mint_builder_with_wallet_info(
     let mint_builder = configure_cache(settings, mint_builder, &payment_methods).await?;
 
     // Configure transaction limits
-    let mint_builder =
+    let mut mint_builder =
         mint_builder.with_limits(settings.limits.max_inputs, settings.limits.max_outputs);
+
+    // Legacy redemption mode (ISSUE-119): allow | observe | rugpull.
+    // Default observe: strict verification with sensor logging — measures
+    // exposure without breaking anything.
+    let default_mode = match settings.legacy_mode.as_deref() {
+        Some("allow") => cdk_signatory::LegacyRedemptionMode::Allow,
+        Some("rugpull") => cdk_signatory::LegacyRedemptionMode::RugPull,
+        Some("observe") | None => cdk_signatory::LegacyRedemptionMode::Observe,
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "invalid legacy_mode {other:?}: expected allow | observe | rugpull"
+            ))
+        }
+    };
+    let mut legacy_modes = std::collections::HashMap::new();
+    for (id_str, mode_str) in &settings.legacy_mode_overrides {
+        let id = cdk_common::nuts::Id::from_str(id_str)
+            .map_err(|e| anyhow::anyhow!("invalid keyset id {id_str:?} in legacy_mode_overrides: {e}"))?;
+        let mode = match mode_str.as_str() {
+            "allow" => cdk_signatory::LegacyRedemptionMode::Allow,
+            "observe" => cdk_signatory::LegacyRedemptionMode::Observe,
+            "rugpull" => cdk_signatory::LegacyRedemptionMode::RugPull,
+            other => return Err(anyhow::anyhow!("invalid legacy mode {other:?} for keyset {id_str}")),
+        };
+        legacy_modes.insert(id, mode);
+    }
+    tracing::info!(
+        default = ?default_mode,
+        overrides = legacy_modes.len(),
+        "legacy redemption mode configured"
+    );
+    mint_builder = mint_builder
+        .with_legacy_default_mode(default_mode)
+        .with_legacy_modes(legacy_modes);
 
     // Verify at least one payment processor is configured
     if mint_builder

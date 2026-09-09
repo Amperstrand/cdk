@@ -7,11 +7,13 @@ use bitcoin::bip32::DerivationPath;
 use cdk_common::database::{DynMintAuthDatabase, DynMintDatabase, MintKeysDatabase};
 use cdk_common::error::Error;
 use cdk_common::nut00::KnownMethod;
+use cdk_common::nuts::Id;
 use cdk_common::nut04::MintMethodOptions;
 use cdk_common::nut05::MeltMethodOptions;
 use cdk_common::payment::DynMintPayment;
 use cdk_common::{nut21, nut22};
 use cdk_signatory::signatory::{RotateKeyArguments, Signatory};
+use cdk_signatory::LegacyRedemptionMode;
 
 use super::nut17::SupportedMethods;
 use super::nut19::{self, CachedEndpoint};
@@ -81,6 +83,10 @@ pub struct MintBuilder {
     /// deployment that owns its database; set an interval only to run several
     /// mints/signatories against one shared database.
     keyset_refresh_interval: Option<std::time::Duration>,
+    /// Per-keyset legacy redemption modes; keysets not listed use the default.
+    legacy_modes: HashMap<Id, LegacyRedemptionMode>,
+    /// Default legacy redemption mode (Observe unless overridden).
+    legacy_default_mode: LegacyRedemptionMode,
 }
 
 impl std::fmt::Debug for MintBuilder {
@@ -125,7 +131,21 @@ impl MintBuilder {
             max_outputs: 1000,
             max_batch_size: None,
             keyset_refresh_interval: None,
+            legacy_modes: HashMap::new(),
+            legacy_default_mode: LegacyRedemptionMode::default(),
         }
+    }
+
+    /// Set per-keyset legacy redemption modes.
+    pub fn with_legacy_modes(mut self, modes: HashMap<Id, LegacyRedemptionMode>) -> Self {
+        self.legacy_modes = modes;
+        self
+    }
+
+    /// Set the default legacy redemption mode for unlisted keysets.
+    pub fn with_legacy_default_mode(mut self, mode: LegacyRedemptionMode) -> Self {
+        self.legacy_default_mode = mode;
+        self
     }
 
     /// Set use keyset v2
@@ -758,7 +778,9 @@ impl MintBuilder {
                 self.supported_units.clone(),
                 self.custom_paths.clone(),
             )
-            .await?,
+            .await?
+            .with_legacy_modes(self.legacy_modes.clone())
+            .with_legacy_default_mode(self.legacy_default_mode),
         );
 
         // Off by default: a single mint owns its database. When an interval is

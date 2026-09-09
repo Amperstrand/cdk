@@ -63,6 +63,10 @@ use crate::config::{DatabaseEngine, OnchainBackend, PaymentBackend, PaymentBacke
 
 impl Settings {
     pub fn from_env(&mut self) -> Result<Self> {
+        if let Ok(mode) = env::var(LEGACY_MODE_ENV_VAR) {
+            self.legacy_mode = Some(mode);
+        }
+
         if let Ok(database) = env::var(DATABASE_ENV_VAR) {
             let engine = DatabaseEngine::from_str(&database).map_err(|err| anyhow!(err))?;
             self.database.engine = engine;
