@@ -2,3 +2,4 @@
 format = "markdown"
 dir = "../nuts"
 pattern = "{id}.md"
+comment_marker = "NUT"
