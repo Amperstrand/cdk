@@ -294,6 +294,147 @@ async fn test_htlc_locktime_after_expiry() {
     println!("✓ HTLC spent by refund key after locktime (no preimage needed)");
 }
 
+/// Test: HTLC refund spend with the wallet-natural witness shape
+///
+/// Wallets signing a refund spend do not add an empty preimage first:
+/// cashu-ts omits the field, nutshell sends `"preimage":null`. Both
+/// encodings deserialize as a P2PK witness. The mint must accept the
+/// refund-path signatures from that shape after the locktime passed.
+#[tokio::test]
+async fn test_htlc_refund_signature_only_witness() {
+    let test_mint = TestMintHelper::new().await.unwrap();
+    let mint = test_mint.mint();
+
+    let (_alice_secret, alice_pubkey) = create_test_keypair();
+    let (bob_secret, bob_pubkey) = create_test_keypair();
+    let (hash, _preimage) = create_test_hash_and_preimage();
+
+    let past_locktime = cdk_common::util::unix_time() - 1000;
+
+    let input_amount = Amount::from(10);
+    let input_proofs = test_mint.mint_proofs(input_amount).await.unwrap();
+
+    let spending_conditions = SpendingConditions::new_htlc_hash(
+        &hash,
+        Some(Conditions {
+            locktime: Some(past_locktime),
+            pubkeys: Some(vec![alice_pubkey]),
+            refund_keys: Some(vec![bob_pubkey]),
+            num_sigs: None,
+            sig_flag: SigFlag::default(),
+            num_sigs_refund: None,
+        }),
+    )
+    .unwrap();
+
+    let split_amounts = test_mint.split_amount(input_amount).unwrap();
+    let (htlc_outputs, blinding_factors, secrets) = unzip3(
+        split_amounts
+            .iter()
+            .map(|&amt| test_mint.create_blinded_message(amt, &spending_conditions))
+            .collect(),
+    );
+
+    let swap_request =
+        cdk_common::nuts::SwapRequest::new(input_proofs.clone(), htlc_outputs.clone());
+    let swap_response = mint.process_swap_request(swap_request).await.unwrap();
+
+    use cdk_common::dhke::construct_proofs;
+    let htlc_proofs = construct_proofs(
+        swap_response.signatures.clone(),
+        blinding_factors.clone(),
+        secrets.clone(),
+        &test_mint.public_keys_of_the_active_sat_keyset,
+    )
+    .unwrap();
+
+    use crate::test_helpers::mint::create_test_blinded_messages;
+    let (new_outputs, _) = create_test_blinded_messages(mint, input_amount)
+        .await
+        .unwrap();
+    let mut swap_request =
+        cdk_common::nuts::SwapRequest::new(htlc_proofs.clone(), new_outputs.clone());
+
+    // Bob signs the refund spend WITHOUT adding a preimage first —
+    // this produces a signature-only witness, as wallets do on the wire.
+    for proof in swap_request.inputs_mut() {
+        proof.sign_p2pk(bob_secret.clone()).unwrap();
+    }
+
+    let result = mint.process_swap_request(swap_request).await;
+    assert!(
+        result.is_ok(),
+        "refund key must be able to spend after locktime with a signature-only witness: {result:?}"
+    );
+}
+
+/// Test: a signature-only witness must not bypass an unexpired locktime
+#[tokio::test]
+async fn test_htlc_signature_only_witness_locktime_not_passed() {
+    let test_mint = TestMintHelper::new().await.unwrap();
+    let mint = test_mint.mint();
+
+    let (_alice_secret, alice_pubkey) = create_test_keypair();
+    let (bob_secret, bob_pubkey) = create_test_keypair();
+    let (hash, _preimage) = create_test_hash_and_preimage();
+
+    let future_locktime = cdk_common::util::unix_time() + 10_000;
+
+    let input_amount = Amount::from(10);
+    let input_proofs = test_mint.mint_proofs(input_amount).await.unwrap();
+
+    let spending_conditions = SpendingConditions::new_htlc_hash(
+        &hash,
+        Some(Conditions {
+            locktime: Some(future_locktime),
+            pubkeys: Some(vec![alice_pubkey]),
+            refund_keys: Some(vec![bob_pubkey]),
+            num_sigs: None,
+            sig_flag: SigFlag::default(),
+            num_sigs_refund: None,
+        }),
+    )
+    .unwrap();
+
+    let split_amounts = test_mint.split_amount(input_amount).unwrap();
+    let (htlc_outputs, blinding_factors, secrets) = unzip3(
+        split_amounts
+            .iter()
+            .map(|&amt| test_mint.create_blinded_message(amt, &spending_conditions))
+            .collect(),
+    );
+
+    let swap_request =
+        cdk_common::nuts::SwapRequest::new(input_proofs.clone(), htlc_outputs.clone());
+    let swap_response = mint.process_swap_request(swap_request).await.unwrap();
+
+    use cdk_common::dhke::construct_proofs;
+    let htlc_proofs = construct_proofs(
+        swap_response.signatures.clone(),
+        blinding_factors.clone(),
+        secrets.clone(),
+        &test_mint.public_keys_of_the_active_sat_keyset,
+    )
+    .unwrap();
+
+    use crate::test_helpers::mint::create_test_blinded_messages;
+    let (new_outputs, _) = create_test_blinded_messages(mint, input_amount)
+        .await
+        .unwrap();
+    let mut swap_request =
+        cdk_common::nuts::SwapRequest::new(htlc_proofs.clone(), new_outputs.clone());
+
+    for proof in swap_request.inputs_mut() {
+        proof.sign_p2pk(bob_secret.clone()).unwrap();
+    }
+
+    let result = mint.process_swap_request(swap_request).await;
+    assert!(
+        result.is_err(),
+        "signature-only witness must not spend before the locktime passed"
+    );
+}
+
 /// Test: HTLC with multisig (preimage + 2-of-3 signatures)
 ///
 /// Verifies that HTLC can require preimage AND multiple signatures

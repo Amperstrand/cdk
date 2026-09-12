@@ -98,20 +98,7 @@ impl HTLCWitness {
     /// - The hex decoding fails
     /// - The decoded data is not exactly 32 bytes
     pub fn preimage_data(&self) -> Result<[u8; 32], Error> {
-        const REQUIRED_PREIMAGE_BYTES: usize = 32;
-
-        // Decode the 64-character hex string to bytes
-        let preimage_bytes = hex::decode(&self.preimage).map_err(|_| Error::InvalidHexPreimage)?;
-
-        // Verify the preimage is exactly 32 bytes
-        if preimage_bytes.len() != REQUIRED_PREIMAGE_BYTES {
-            return Err(Error::PreimageInvalidSize);
-        }
-
-        // Convert to fixed-size array
-        let mut array = [0u8; 32];
-        array.copy_from_slice(&preimage_bytes);
-        Ok(array)
+        decode_preimage_bytes(&self.preimage)
     }
 }
 
@@ -150,11 +137,21 @@ impl Proof {
                 _ => Error::SpendConditionsNotMet,
             })?;
 
-        // Try to extract HTLC witness - must be correct type
-        let htlc_witness = match &self.witness {
-            Some(Witness::HTLCWitness(witness)) => witness,
-            _ => {
-                // Wrong witness type or no witness
+        // Extract witness components in a variant-agnostic way.
+        //
+        // Both natural wallet encodings of an HTLC refund spend deserialize
+        // as `Witness::P2PKWitness`, because the untagged `Witness` enum only
+        // matches the HTLC variant when `preimage` is a present, non-null
+        // string:
+        //   - `{"signatures":[..]}`                 (preimage omitted; e.g. cashu-ts)
+        //   - `{"preimage":null,"signatures":[..]}` (e.g. nutshell)
+        // A P2PK-shaped witness carries no preimage, so it can only satisfy
+        // the refund path, which remains gated on locktime via
+        // `requirements.refund_path` (only `Some` after the locktime passed).
+        let witness_signatures = match &self.witness {
+            Some(witness) => witness.signatures(),
+            None => {
+                // No witness
                 // If refund path is available with 0 required sigs, anyone can spend
                 if let Some(refund_path) = &requirements.refund_path {
                     if refund_path.required_sigs == 0 {
@@ -165,8 +162,12 @@ impl Proof {
             }
         };
 
-        // Try to verify the preimage and capture the specific error if it fails
-        let preimage_result = verify_htlc_preimage(htlc_witness, &secret);
+        // Try to verify the preimage and capture the specific error if it fails.
+        // A witness without a preimage takes the refund path below.
+        let preimage_result = match self.witness.as_ref().and_then(|w| w.preimage()) {
+            Some(preimage) => verify_preimage_str(&preimage, &secret),
+            None => Err(Error::Preimage),
+        };
 
         // Determine which path to use:
         // - If preimage is valid → use receiver path (always available)
@@ -177,8 +178,7 @@ impl Proof {
                 return Ok(());
             }
 
-            let witness_signatures = htlc_witness
-                .signatures
+            let witness_signatures = witness_signatures
                 .as_ref()
                 .ok_or(Error::SignaturesNotProvided)?;
 
@@ -203,8 +203,7 @@ impl Proof {
                 return Ok(());
             }
 
-            let witness_signatures = htlc_witness
-                .signatures
+            let witness_signatures = witness_signatures
                 .as_ref()
                 .ok_or(Error::SignaturesNotProvided)?;
 
@@ -279,6 +278,10 @@ impl SpendingConditions {
 /// The preimage should be a 64-character hex string representing 32 bytes.
 /// We decode it from hex, hash it with SHA256, and compare to the hash in secret.data
 fn verify_htlc_preimage(witness: &HTLCWitness, secret: &Secret) -> Result<(), Error> {
+    verify_preimage_str(&witness.preimage, secret)
+}
+
+fn verify_preimage_str(preimage: &str, secret: &Secret) -> Result<(), Error> {
     use bitcoin::hashes::sha256::Hash as Sha256Hash;
     use bitcoin::hashes::Hash;
 
@@ -287,7 +290,7 @@ fn verify_htlc_preimage(witness: &HTLCWitness, secret: &Secret) -> Result<(), Er
         Sha256Hash::from_str(secret.secret_data().data()).map_err(|_| Error::InvalidHash)?;
 
     // Decode and validate the preimage (returns [u8; 32])
-    let preimage_bytes = witness.preimage_data()?;
+    let preimage_bytes = decode_preimage_bytes(preimage)?;
 
     // Hash the 32-byte preimage
     let preimage_hash = Sha256Hash::hash(&preimage_bytes);
@@ -298,6 +301,20 @@ fn verify_htlc_preimage(witness: &HTLCWitness, secret: &Secret) -> Result<(), Er
     }
 
     Ok(())
+}
+
+fn decode_preimage_bytes(preimage: &str) -> Result<[u8; 32], Error> {
+    const REQUIRED_PREIMAGE_BYTES: usize = 32;
+
+    let preimage_bytes = hex::decode(preimage).map_err(|_| Error::InvalidHexPreimage)?;
+
+    if preimage_bytes.len() != REQUIRED_PREIMAGE_BYTES {
+        return Err(Error::PreimageInvalidSize);
+    }
+
+    let mut array = [0u8; 32];
+    array.copy_from_slice(&preimage_bytes);
+    Ok(array)
 }
 
 /// Verify HTLC SIG_ALL signatures
@@ -403,6 +420,33 @@ mod tests {
     use crate::nuts::Nut10Secret;
     use crate::secret::Secret as SecretString;
     use crate::{SecretData, SecretKey};
+
+    #[test]
+    fn htlc_refund_witness_wallet_encodings_deserialize() {
+        // Wallets signing an HTLC refund spend do not provide a preimage:
+        // cashu-ts omits the field; nutshell sends an explicit null. Both
+        // deserialize as the P2PK witness variant (the untagged Witness enum
+        // only matches the HTLC variant for a present, non-null string), and
+        // both must keep their signatures accessible for refund verification.
+        let signature = "00".repeat(64);
+        let encodings = [
+            format!(r#"{{"signatures":["{signature}"]}}"#),
+            format!(r#"{{"preimage":null,"signatures":["{signature}"]}}"#),
+        ];
+        for encoding in encodings {
+            let witness: Witness = serde_json::from_str(&encoding).unwrap();
+            assert_eq!(witness.signatures().unwrap(), vec![signature.clone()]);
+            assert!(witness.preimage().is_none());
+        }
+    }
+
+    #[test]
+    fn htlc_receiver_witness_still_matches_htlc_variant() {
+        let preimage = "11".repeat(32);
+        let json = format!(r#"{{"preimage":"{preimage}","signatures":["{}"}}"#, "00".repeat(64));
+        let witness: Witness = serde_json::from_str(&json).unwrap();
+        assert_eq!(witness.preimage().unwrap(), preimage);
+    }
 
     #[allow(clippy::use_debug)]
     #[test]
