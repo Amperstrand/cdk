@@ -450,6 +450,56 @@ mod tests {
         assert_eq!(witness.preimage().unwrap(), preimage);
     }
 
+    /// Reproduction for the wallet-emission report: an HTLC secret with an
+    /// expired locktime and a refund key, signed exactly as wallets sign a
+    /// refund spend (signature-only witness — no preimage field).
+    #[test]
+    fn test_verify_htlc_refund_signature_only_witness_repro() {
+        use crate::nuts::nut11::P2PKWitness;
+
+        let refund_key = SecretKey::generate();
+        let refund_pubkey = refund_key.public_key().to_string();
+
+        let preimage = "repro-preimage";
+        let hash = Sha256Hash::hash(preimage.as_bytes()).to_string();
+
+        let past_locktime = crate::util::unix_time() - 1000;
+        let nut10_secret = Nut10Secret::new(
+            Kind::HTLC,
+            SecretData::new(
+                hash,
+                Some(vec![
+                    vec!["locktime".to_string(), past_locktime.to_string()],
+                    vec!["refund".to_string(), refund_pubkey],
+                ]),
+            ),
+        );
+        let secret: SecretString = nut10_secret.try_into().unwrap();
+
+        let mut proof = Proof {
+            amount: crate::Amount::from(1),
+            keyset_id: crate::nuts::nut02::Id::from_str("00deadbeef123456").unwrap(),
+            secret,
+            c: crate::nuts::nut01::PublicKey::from_hex(
+                "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            )
+            .unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+
+        // Sign as wallets do on a refund spend: signature only, no preimage.
+        proof.sign_p2pk(refund_key).unwrap();
+        assert!(matches!(
+            proof.witness.as_ref().unwrap(),
+            Witness::P2PKWitness(P2PKWitness { .. })
+        ));
+
+        let result = proof.verify_htlc();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
     #[allow(clippy::use_debug)]
     #[test]
     fn htlc_witness_debug_redacts_preimage() {
