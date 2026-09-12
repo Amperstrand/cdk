@@ -429,12 +429,13 @@ mod tests {
         // only matches the HTLC variant for a present, non-null string), and
         // both must keep their signatures accessible for refund verification.
         let signature = "00".repeat(64);
-        let encodings = [
+        let inners = [
             format!(r#"{{"signatures":["{signature}"]}}"#),
             format!(r#"{{"preimage":null,"signatures":["{signature}"]}}"#),
         ];
-        for encoding in encodings {
-            let witness: Witness = serde_json::from_str(&encoding).unwrap();
+        for inner in inners {
+            let wire = serde_json::to_string(&inner).unwrap();
+            let witness: Witness = serde_json::from_str(&wire).unwrap();
             assert_eq!(witness.signatures().unwrap(), vec![signature.clone()]);
             assert!(witness.preimage().is_none());
         }
@@ -443,8 +444,9 @@ mod tests {
     #[test]
     fn htlc_receiver_witness_still_matches_htlc_variant() {
         let preimage = "11".repeat(32);
-        let json = format!(r#"{{"preimage":"{preimage}","signatures":["{}"}}"#, "00".repeat(64));
-        let witness: Witness = serde_json::from_str(&json).unwrap();
+        let inner = format!(r#"{{"preimage":"{preimage}","signatures":[]}}"#);
+        let wire = serde_json::to_string(&inner).unwrap();
+        let witness: Witness = serde_json::from_str(&wire).unwrap();
         assert_eq!(witness.preimage().unwrap(), preimage);
     }
 
@@ -816,8 +818,10 @@ mod tests {
     /// This test ensures that the verification function checks that the witness is
     /// of the correct type (HTLCWitness) and not some other witness type.
     ///
-    /// Mutant testing: Catches mutations that replace verify_htlc with Ok(()) or
-    /// remove the witness type check.
+    /// Mutant testing: Catches mutations that replace verify_htlc with Ok(()).
+    /// A witness without a preimage and without a usable refund path (no
+    /// locktime tags here) must be rejected — the error names the missing
+    /// preimage since the witness carries none.
     #[test]
     fn test_verify_htlc_wrong_witness_type() {
         // Create an HTLC secret
@@ -847,10 +851,11 @@ mod tests {
             p2pk_e: None,
         };
 
-        // Verification should fail with wrong witness type
+        // Verification must fail: no preimage in the witness and no refund
+        // path available (no locktime tags)
         let result = proof.verify_htlc();
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::IncorrectSecretKind));
+        assert!(matches!(result.unwrap_err(), Error::Preimage));
     }
 
     /// Tests that add_preimage correctly adds a preimage to the proof.
