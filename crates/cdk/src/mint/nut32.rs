@@ -54,6 +54,15 @@ impl Nut32State {
         self.enabled.load(Ordering::SeqCst)
     }
 
+    /// Snapshot of the runtime-registered processors (series registered
+    /// after boot); payment-check paths merge these over the boot map.
+    pub fn processor_overrides(&self) -> HashMap<(CurrencyUnit, PaymentMethod), DynMintPayment> {
+        self.processors
+            .read()
+            .expect("nut32 processors lock")
+            .clone()
+    }
+
     pub(crate) fn processor_for(
         &self,
         unit: &CurrencyUnit,

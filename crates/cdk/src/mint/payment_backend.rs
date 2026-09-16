@@ -139,9 +139,26 @@ impl Mint {
     /// Check the status of a payment for a quote with the payment backend
     #[instrument(skip_all)]
     pub async fn check_mint_quote_paid(&self, quote: &mut MintQuote) -> Result<(), Error> {
+        // Runtime-registered NUT-32 series processors live in the override
+        // map; merge them in so future-unit quotes resolve here too.
+        let processors = {
+            let overrides = self.nut32.processor_overrides();
+            if overrides.is_empty() {
+                self.payment_processors.clone()
+            } else {
+                let mut merged: HashMap<PaymentProcessorKey, DynMintPayment> =
+                    self.payment_processors.as_ref().clone();
+                merged.extend(
+                    overrides
+                        .into_iter()
+                        .map(|((unit, method), p)| (PaymentProcessorKey::new(unit, method), p)),
+                );
+                Arc::new(merged)
+            }
+        };
         Self::check_mint_quote_payments(
             self.localstore.clone(),
-            self.payment_processors.clone(),
+            processors,
             Some(self.pubsub_manager.clone()),
             quote,
         )
