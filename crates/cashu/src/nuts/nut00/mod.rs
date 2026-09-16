@@ -652,6 +652,12 @@ impl CurrencyUnit {
 
 fn normalize_custom_unit(value: &str) -> String {
     let trimmed = value.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    // NUT-32 future units are case-sensitive by grammar (uppercase T/Z;
+    // lowercase is explicitly rejected) — keep them verbatim, lowercase
+    // everything else like a currency code.
+    if trimmed.starts_with("future:") {
+        return trimmed.nfc().collect::<String>();
+    }
     trimmed
         .chars()
         .flat_map(char::to_lowercase)
