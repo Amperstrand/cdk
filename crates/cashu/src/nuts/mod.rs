@@ -33,6 +33,8 @@ pub mod nut27;
 pub mod nut28;
 pub mod nut29;
 pub mod nut30;
+pub mod nut32;
+pub use nut32::*;
 
 mod auth;
 
@@ -61,7 +63,7 @@ pub use nut05::{
     MeltMethodSettings, MeltQuoteCustomRequest, MeltQuoteCustomResponse, MeltRequest,
     QuoteState as MeltQuoteState, Settings as NUT05Settings,
 };
-pub use nut06::{ContactInfo, MintInfo, MintVersion, Nuts};
+pub use nut06::{ContactInfo, MintInfo, MintVersion, Nut32Settings, Nuts};
 pub use nut07::{CheckStateRequest, CheckStateResponse, ProofState, State};
 pub use nut09::{RestoreRequest, RestoreResponse};
 pub use nut10::{

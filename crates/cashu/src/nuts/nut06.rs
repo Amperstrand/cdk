@@ -348,6 +348,28 @@ pub struct Nuts {
     #[serde(rename = "29")]
     #[serde(skip_serializing_if = "nut29::Settings::is_empty")]
     pub nut29: nut29::Settings,
+    /// NUT32 Settings (Cashu Futures, draft)
+    #[serde(rename = "32")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nut32: Option<Nut32Settings>,
+}
+
+/// NUT-06 capability advert for NUT-32 (Cashu Futures, draft):
+/// `"32": { "supported": true, "versions": [1] }`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Nut32Settings {
+    pub supported: bool,
+    pub versions: Vec<u8>,
+}
+
+impl Nut32Settings {
+    pub fn v1() -> Self {
+        Self {
+            supported: true,
+            versions: vec![1],
+        }
+    }
 }
 
 impl Nuts {

@@ -34,6 +34,7 @@ mod check_spendable;
 mod issue;
 mod keysets;
 mod melt;
+mod nut32;
 mod payment_backend;
 mod proofs;
 mod saga_recovery;
@@ -95,6 +96,8 @@ pub struct Mint {
     max_inputs: usize,
     /// Maximum number of outputs allowed per transaction
     max_outputs: usize,
+    /// NUT-32 futures registry (inert until `enable_nut32` runs)
+    nut32: Arc<nut32::Nut32State>,
 }
 
 impl std::fmt::Debug for Mint {
@@ -407,6 +410,7 @@ impl Mint {
             })),
             max_inputs,
             max_outputs,
+            nut32: Arc::new(nut32::Nut32State::default()),
         })
     }
 
@@ -705,6 +709,9 @@ impl Mint {
         unit: CurrencyUnit,
         payment_method: PaymentMethod,
     ) -> Result<DynMintPayment, Error> {
+        if let Some(runtime) = self.nut32.processor_for(&unit, &payment_method) {
+            return Ok(runtime);
+        }
         let key = PaymentProcessorKey::new(unit.clone(), payment_method.clone());
         self.payment_processors.get(&key).cloned().ok_or_else(|| {
             tracing::info!(

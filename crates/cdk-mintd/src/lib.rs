@@ -61,6 +61,7 @@ mod config_migration;
 mod config_service;
 mod config_store;
 pub mod env_vars;
+pub mod nut32;
 mod secret;
 pub mod setup;
 
@@ -2116,6 +2117,8 @@ impl PreparedMintd {
         )
         .await?;
 
+        crate::nut32::bootstrap(&mint, settings).await;
+
         let mint_info = mint.mint_info().await?;
         let nut04_methods = mint_info.nuts.nut04.supported_methods();
         let nut05_methods = mint_info.nuts.nut05.supported_methods();
@@ -2327,6 +2330,10 @@ impl PreparedMintd {
 
         for router in routers {
             mint_service = mint_service.merge(router);
+        }
+
+        if crate::nut32::enabled() {
+            mint_service = mint_service.merge(crate::nut32::router(mint.clone(), settings));
         }
 
         // Create a broadcast channel to share shutdown signal between services

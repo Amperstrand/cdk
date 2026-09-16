@@ -269,6 +269,8 @@ impl Mint {
             return Err(Error::UnsupportedUnit);
         }
 
+        self.verify_nut32_inputs(&unit, inputs).await?;
+
         let amount = inputs.total_amount()?.with_unit(unit);
 
         self.verify_proofs(inputs.clone()).await?;
