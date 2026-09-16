@@ -36,11 +36,13 @@ impl FutureUnit {
     }
 }
 
-/// `YYYYMMDDTHHMMSSZ` from unix seconds (UTC).
+/// `yyyymmddthhmmssz` from unix seconds (UTC, lowercase separators —
+/// Cashu unit identifiers are lowercase by established practice; cdk
+/// normalizes custom units to lowercase NFC).
 pub fn format_maturity(unix: u64) -> String {
     let date = time_from_unix(unix);
     format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        "{:04}{:02}{:02}t{:02}{:02}{:02}z",
         date.0, date.1, date.2, date.3, date.4, date.5
     )
 }
@@ -106,14 +108,15 @@ pub fn parse_future_unit(unit: &str) -> Result<FutureUnit, String> {
     if !valid_id(base) || !valid_id(quote) {
         return Err("base and quote must be lowercase [a-z0-9]+".into());
     }
-    // Timestamp: strict `YYYYMMDDTHHMMSSZ`, uppercase separators only.
+    // Timestamp: strict `yyyymmddthhmmssz`, lowercase separators only —
+    // the unit string lowercases whole (cdk custom-unit normalization).
     let bytes = stamp.as_bytes();
     if bytes.len() != 16
-        || bytes[8] != b'T'
-        || bytes[15] != b'Z'
+        || bytes[8] != b't'
+        || bytes[15] != b'z'
         || bytes[..8].iter().chain(&bytes[9..15]).any(|b| !b.is_ascii_digit())
     {
-        return Err(format!("maturity `{stamp}` must be YYYYMMDDTHHMMSSZ (UTC, no offsets, no fractions)"));
+        return Err(format!("maturity `{stamp}` must be yyyymmddthhmmssz (UTC, lowercase, no offsets, no fractions)"));
     }
     let num = |r: std::ops::Range<usize>| -> i64 { stamp[r].parse().expect("digits checked") };
     let (y, mo, d) = (num(0..4), num(4..6), num(6..8));
@@ -304,31 +307,32 @@ mod tests {
 
     #[test]
     fn parses_valid_unit() {
-        let u = parse_future_unit("future:farm-egg:20260918T160000Z").expect("valid");
+        let u = parse_future_unit("future:farm-egg:20260918t160000z").expect("valid");
         assert_eq!(u.base, "farm");
         assert_eq!(u.quote, "egg");
         // 2026-09-18T16:00:00Z
         assert_eq!(u.maturity, 1_789_747_200);
-        assert_eq!(u.unit_string(), "future:farm-egg:20260918T160000Z");
+        assert_eq!(u.unit_string(), "future:farm-egg:20260918t160000z");
     }
 
     #[test]
     fn rejects_grammar_violations() {
-        // lowercase t / z
-        assert!(parse_future_unit("future:farm-egg:20260918t160000z").is_err());
+        // uppercase t / z — the unit string lowercases whole (cdk
+        // custom-unit normalization; established Cashu practice)
+        assert!(parse_future_unit("future:farm-egg:20260918T160000Z").is_err());
         // offsets and fractions
-        assert!(parse_future_unit("future:farm-egg:20260918T160000+01:00").is_err());
-        assert!(parse_future_unit("future:farm-egg:20260918T160000.5Z").is_err());
+        assert!(parse_future_unit("future:farm-egg:20260918t160000+01:00").is_err());
+        assert!(parse_future_unit("future:farm-egg:20260918t160000.5z").is_err());
         // impossible dates
-        assert!(parse_future_unit("future:farm-egg:20260230T160000Z").is_err()); // no Feb 30
-        assert!(parse_future_unit("future:farm-egg:20260229T160000Z").is_err()); // 2026 not leap
-        assert!(parse_future_unit("future:farm-egg:20240229T160000Z").is_ok()); // 2024 leap
-        assert!(parse_future_unit("future:farm-egg:20260918T246000Z").is_err()); // hour 24
-        assert!(parse_future_unit("future:farm-egg:20260918T160060Z").is_err()); // second 60
+        assert!(parse_future_unit("future:farm-egg:20260230t160000z").is_err()); // no Feb 30
+        assert!(parse_future_unit("future:farm-egg:20260229t160000z").is_err()); // 2026 not leap
+        assert!(parse_future_unit("future:farm-egg:20240229t160000z").is_ok()); // 2024 leap
+        assert!(parse_future_unit("future:farm-egg:20260918t246000z").is_err()); // hour 24
+        assert!(parse_future_unit("future:farm-egg:20260918t160060z").is_err()); // second 60
         // identifier grammar
-        assert!(parse_future_unit("future:Farm-egg:20260918T160000Z").is_err()); // uppercase
-        assert!(parse_future_unit("future:farm_egg:20260918T160000Z").is_err()); // underscore
-        assert!(parse_future_unit("future:farm-:20260918T160000Z").is_err()); // empty quote
+        assert!(parse_future_unit("future:Farm-egg:20260918t160000z").is_err()); // uppercase base
+        assert!(parse_future_unit("future:farm_egg:20260918t160000z").is_err()); // underscore
+        assert!(parse_future_unit("future:farm-:20260918t160000z").is_err()); // empty quote
         // not a future unit at all
         assert!(parse_future_unit("sat").is_err());
         assert!(parse_future_unit("eur").is_err());
@@ -390,13 +394,13 @@ mod tests {
     #[test]
     fn signing_payload_is_stable() {
         let terms: serde_json::Value = serde_json::from_str(
-            r#"{"unit":"future:farm-egg:20260918T160000Z","contract_size":"1"}"#,
+            r#"{"unit":"future:farm-egg:20260918t160000z","contract_size":"1"}"#,
         )
         .unwrap();
         let a = terms_signing_payload("https://m.example", &terms).unwrap();
         // Same content, different input key order → same digest.
         let terms2: serde_json::Value = serde_json::from_str(
-            r#"{"contract_size":"1","unit":"future:farm-egg:20260918T160000Z"}"#,
+            r#"{"contract_size":"1","unit":"future:farm-egg:20260918t160000z"}"#,
         )
         .unwrap();
         let b = terms_signing_payload("https://m.example", &terms2).unwrap();
