@@ -648,13 +648,11 @@ impl Mint {
             validate_custom_payment_method(&payment_method)?;
             validate_custom_quote_fields(request, extra)?;
 
+            // NUT-32 future units register their processors at runtime;
+            // get_payment_processor consults that override map too.
             let payment_backend = self
-                .payment_processors
-                .get(&PaymentProcessorKey::new(
-                    unit.clone(),
-                    payment_method.clone(),
-                ))
-                .ok_or_else(|| {
+                .get_payment_processor(unit.clone(), payment_method.clone())
+                .map_err(|_| {
                     tracing::info!("Could not get payment backend for {}, {} ", unit, method);
                     Error::UnsupportedUnit
                 })?;
