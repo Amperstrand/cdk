@@ -777,7 +777,7 @@ impl MeltSaga<SetupComplete> {
         // hold a database connection across payment-backend network I/O: a few
         // slow payments would otherwise exhaust PostgreSQL dispatch capacity.
         let (response, acknowledged) = self
-            .execute_payment_and_verify(Arc::clone(payment_backend))
+            .execute_payment_and_verify(&payment_backend)
             .await?;
         if response.status == MeltQuoteState::Paid {
             self.persist_paid_payment(&response).await?;
