@@ -78,10 +78,11 @@ impl Mint {
             method: quote.payment_method.clone(),
         };
 
+        // NUT-32 future units register their processors at runtime; the
+        // override-aware resolver covers them.
         let payment_backend = self
-            .payment_processors
-            .get(&payment_processor_key)
-            .ok_or_else(|| {
+            .get_payment_processor(quote.unit.clone(), quote.payment_method.clone())
+            .map_err(|_| {
                 tracing::warn!(
                     "No backend for payment processor key: {:?}",
                     payment_processor_key

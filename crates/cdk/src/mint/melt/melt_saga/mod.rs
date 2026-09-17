@@ -739,15 +739,15 @@ impl MeltSaga<SetupComplete> {
     }
 
     async fn attempt_external_payment(&self) -> Result<MakePaymentResponse, Error> {
-        // Get the payment processor for the quote's unit and method
+        // Override-aware resolution: NUT-32 future units register their
+        // processors at runtime.
         let payment_backend = self
             .mint
-            .payment_processors
-            .get(&crate::types::PaymentProcessorKey::new(
+            .get_payment_processor(
                 self.state_data.quote.unit.clone(),
                 self.state_data.quote.payment_method.clone(),
-            ))
-            .ok_or_else(|| {
+            )
+            .map_err(|_| {
                 tracing::info!(
                     "Could not get payment backend for {}, {}",
                     self.state_data.quote.unit,
