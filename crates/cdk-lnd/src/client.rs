@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cdk_common::util::hex;
 use hyper_rustls::HttpsConnectorBuilder;
@@ -186,6 +187,18 @@ pub async fn connect<P: AsRef<Path>>(
     // Create hyper client
     let client = HyperClient::builder(TokioExecutor::new())
         .http2_only(true)
+        // A server-streaming RPC (subscribe_invoices) can sit idle for hours
+        // with no frames in flight. Without HTTP/2 keepalive PINGs a
+        // live-but-silent connection (black-holed packets, silent NAT drop)
+        // is indistinguishable from an idle one, so `stream.message()` pends
+        // forever: settlements are never delivered and the pooled connection
+        // also wedges new RPCs multiplexed onto it. Pinging every 30s and
+        // failing the connection when a PING is not acknowledged within 20s
+        // turns a silent stall into a stream error, which the mint's
+        // supervisor turns into a resubscribe from the persisted
+        // add/settle index.
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(20))
         .build(https);
 
     // Load macaroon
