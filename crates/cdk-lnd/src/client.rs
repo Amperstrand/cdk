@@ -9,7 +9,7 @@ use cdk_common::util::hex;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -194,11 +194,13 @@ pub async fn connect<P: AsRef<Path>>(
         // forever: settlements are never delivered and the pooled connection
         // also wedges new RPCs multiplexed onto it. Pinging every 30s and
         // failing the connection when a PING is not acknowledged within 20s
-        // turns a silent stall into a stream error, which the mint's
+        // Turns a silent stall into a stream error, which the mint's
         // supervisor turns into a resubscribe from the persisted
-        // add/settle index.
+        // add/settle index. The explicit timer is required: keepalive
+        // panics at runtime without one.
         .http2_keep_alive_interval(Duration::from_secs(30))
         .http2_keep_alive_timeout(Duration::from_secs(20))
+        .timer(TokioTimer::new())
         .build(https);
 
     // Load macaroon
