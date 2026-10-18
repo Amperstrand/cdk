@@ -7,16 +7,17 @@
 #![doc = include_str!("../README.md")]
 
 pub mod task;
+pub mod terminal;
 
 /// Authentication related types and utilities
+///
+/// Enabled by the `http` feature because OIDC auth helpers fetch discovery and
+/// JWK documents through `cdk-http-client`.
 #[cfg(feature = "http")]
 pub mod auth;
 
-/// Protocol version for gRPC Mint RPC communication
-pub const MINT_RPC_PROTOCOL_VERSION: &str = "1.0.0";
-
 /// Protocol version for gRPC Payment Processor communication
-pub const PAYMENT_PROCESSOR_PROTOCOL_VERSION: &str = "2.0.0";
+pub const PAYMENT_PROCESSOR_PROTOCOL_VERSION: &str = "4.0.0";
 
 #[cfg(feature = "grpc")]
 pub mod grpc;
@@ -31,8 +32,17 @@ pub mod mint_quote;
 #[cfg(feature = "mint")]
 pub mod payment;
 pub mod pub_sub;
+/// Client-side request rate limiting (GCRA token bucket + HTTP transport
+/// decorator).
+///
+/// Needs `wallet` for the KV-store persistence backend and `http` for the
+/// `Transport` trait it decorates.
+#[cfg(all(feature = "wallet", feature = "http"))]
+pub mod rate_limit;
+pub mod redact;
 #[cfg(feature = "mint")]
 pub mod state;
+pub mod stream;
 pub mod subscription;
 #[cfg(feature = "wallet")]
 pub mod wallet;
@@ -46,10 +56,19 @@ pub use cashu::nuts::{self, *};
 #[cfg(feature = "mint")]
 pub use cashu::quote_id::{self, *};
 pub use cashu::{dhke, ensure_cdk, mint_url, secret, util, SECP256K1};
-/// Re-export cdk-http-client WebSocket client
+/// Re-export `cdk-http-client` WebSocket client.
+///
+/// The `http` feature enables CDK common's HTTP-facing helpers and re-exports,
+/// and selects the default `bitreq` backend. Add `cdk-http-client/reqwest`
+/// elsewhere in the dependency graph to use `reqwest`; it takes precedence when
+/// both backend features are enabled.
 #[cfg(feature = "http")]
 pub use cdk_http_client::ws as ws_client;
-/// Re-export cdk-http-client types
+/// Re-export `cdk-http-client` types.
+///
+/// The `http` feature exposes these helpers and selects the default `bitreq`
+/// backend. Applications that need SOCKS proxy or invalid-certificate support
+/// can enable `cdk-http-client/reqwest`, which takes precedence over `bitreq`.
 #[cfg(feature = "http")]
 pub use cdk_http_client::{
     fetch, HttpClient, HttpClientBuilder, HttpError, RawResponse, RequestBuilder, Response,

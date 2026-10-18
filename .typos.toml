@@ -1,11 +1,14 @@
 [files]
 extend-exclude = [
     "target/",
-    "bindings/dart/flutter_example"
+    "bindings/dart/flutter_example",
+    "Cargo.lock.msrv"
 ]
 
 [default]
 extend-ignore-re = [
+    # Explicitly marked test fixtures may contain intentional misspellings.
+    '(?m)^.*// typos: ignore$',
     # Ignore cashu tokens
     "cashuA[A-Za-z0-9-_]+",
     "cashuB[A-Za-z0-9-_]+",
@@ -15,5 +18,6 @@ extend-ignore-re = [
     "autheticator",
     "Gam",
     "flate2",
-    "lnbc[A-Za-z0-9-_]+"
+    "lnbc[A-Za-z0-9-_]+",
+    "Writeable"
 ]

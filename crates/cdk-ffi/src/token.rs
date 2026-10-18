@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use crate::error::FfiError;
+use crate::types::TokenUrEncoder;
 use crate::{Amount, CurrencyUnit, KeySetInfo, MintUrl, Proofs};
 
 /// FFI-compatible Token
@@ -45,9 +46,7 @@ impl Token {
     /// Create a new Token from string
     #[uniffi::constructor]
     pub fn from_string(encoded_token: String) -> Result<Token, FfiError> {
-        let token = cdk::nuts::Token::from_str(&encoded_token)
-            .map_err(|e| FfiError::internal(format!("Invalid token: {}", e)))?;
-        Ok(Token { inner: token })
+        Self::from_str(&encoded_token)
     }
 
     /// Get the total value of the token
@@ -73,9 +72,7 @@ impl Token {
     /// Get proofs from the token (simplified - no keyset filtering for now)
     pub fn proofs_simple(&self) -> Result<Proofs, FfiError> {
         // For now, return empty keysets to get all proofs
-        let empty_keysets = vec![];
-        let proofs = self.inner.proofs(&empty_keysets)?;
-        Ok(proofs.into_iter().map(|p| p.into()).collect())
+        self.proofs(vec![])
     }
 
     /// Get proofs from the token
@@ -168,5 +165,22 @@ impl Token {
             .locktimes()
             .map(|s| s.into_iter().collect())
             .unwrap_or_default()
+    }
+
+    /// Create a NUT-16 UR encoder for displaying this token as an animated
+    /// QR code
+    ///
+    /// `max_fragment_length` is the maximum number of payload bytes per QR
+    /// frame; `None` selects a default suited to most QR scanners. Each
+    /// `TokenUrEncoder::next_part` fragment is displayed as one QR frame.
+    pub fn ur_encoder(
+        &self,
+        max_fragment_length: Option<u32>,
+    ) -> Result<std::sync::Arc<TokenUrEncoder>, FfiError> {
+        let max_fragment_length = max_fragment_length
+            .map(|l| l as usize)
+            .unwrap_or(cdk::nuts::nut16::DEFAULT_MAX_FRAGMENT_LENGTH);
+        let encoder = cdk::nuts::nut16::TokenUrEncoder::new(&self.inner, max_fragment_length)?;
+        Ok(std::sync::Arc::new(TokenUrEncoder::from_inner(encoder)))
     }
 }

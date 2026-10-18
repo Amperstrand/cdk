@@ -9,6 +9,7 @@ CDK lightning backend for ldk-node, providing Lightning Network functionality fo
 - Payment processing for Cashu mint operations
 - Web management interface
 - Support for multiple Bitcoin networks (Mainnet, Testnet, Signet/Mutinynet, Regtest)
+- Esplora, Electrum, and Bitcoin Core RPC chain sources
 - RGS (Rapid Gossip Sync) and P2P gossip support
 
 ## Quick Start
@@ -17,7 +18,7 @@ CDK lightning backend for ldk-node, providing Lightning Network functionality fo
 
 ```bash
 # Using environment variables (simplest)
-export CDK_MINTD_LN_BACKEND="ldk-node"
+export CDK_MINTD_PAYMENT_BACKEND="ldk-node"
 export CDK_MINTD_LDK_NODE_BITCOIN_NETWORK="signet"
 export CDK_MINTD_LDK_NODE_ESPLORA_URL="https://mutinynet.com/api"
 export CDK_MINTD_LDK_NODE_RGS_URL="https://rgs.mutinynet.com/snapshot/0"
@@ -37,7 +38,7 @@ After starting:
 
 The CDK LDK Node includes a built-in web management interface accessible at `http://127.0.0.1:8091` by default.
 
-⚠️ **SECURITY WARNING**: The web management interface has **NO AUTHENTICATION** and allows sending funds and managing channels. **NEVER expose it publicly** without proper authentication/authorization in front of it. Only bind to localhost (`127.0.0.1`) for security.
+⚠️ **SECURITY WARNING**: The web management interface has **NO AUTHENTICATION** and allows sending funds and managing channels. **NEVER expose it publicly** without proper authentication/authorization in front of it. Only bind to localhost (`127.0.0.1`) for security, or put it behind VPN, SSH tunneling, or authenticated reverse-proxy access. The dashboard includes CSRF protection and does not enable permissive browser CORS, but those browser hardening measures are not a substitute for access control.
 
 ### Key Features
 - **Dashboard**: Node status, balance, and recent activity
@@ -62,11 +63,12 @@ Or via environment variables:
 ### Config File Example
 
 ```toml
-[ln]
-ln_backend = "ldk-node"
+[payment_backend]
+backend = "ldk-node"
 
 [ldk_node]
 bitcoin_network = "signet"  # mainnet, testnet, signet, regtest
+chain_source_type = "esplora"  # esplora, electrum, or bitcoinrpc
 esplora_url = "https://mutinynet.com/api"
 rgs_url = "https://rgs.mutinynet.com/snapshot/0"
 gossip_source_type = "rgs"  # rgs or p2p
@@ -77,7 +79,9 @@ webserver_port = 8091
 
 All options can be set with `CDK_MINTD_LDK_NODE_` prefix:
 - `CDK_MINTD_LDK_NODE_BITCOIN_NETWORK`
+- `CDK_MINTD_LDK_NODE_CHAIN_SOURCE_TYPE`
 - `CDK_MINTD_LDK_NODE_ESPLORA_URL`
+- `CDK_MINTD_LDK_NODE_ELECTRUM_URL`
 - `CDK_MINTD_LDK_NODE_RGS_URL`
 - `CDK_MINTD_LDK_NODE_GOSSIP_SOURCE_TYPE`
 

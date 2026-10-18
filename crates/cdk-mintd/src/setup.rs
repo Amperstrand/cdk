@@ -3,9 +3,11 @@ use std::collections::HashMap;
 #[cfg(feature = "fakewallet")]
 use std::collections::HashSet;
 use std::path::Path;
-#[cfg(feature = "ldk-node")]
+#[cfg(any(feature = "grpc-processor", feature = "ldk-node"))]
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "bdk")]
+use std::time::Duration;
 
 use async_trait::async_trait;
 #[cfg(feature = "fakewallet")]
@@ -14,10 +16,10 @@ use cdk::cdk_database::KVStore;
 use cdk::cdk_payment::MintPayment;
 use cdk::nuts::CurrencyUnit;
 #[cfg(any(
-    feature = "lnbits",
     feature = "cln",
     feature = "lnd",
     feature = "ldk-node",
+    feature = "bdk",
     feature = "fakewallet"
 ))]
 use cdk::types::FeeReserve;
@@ -27,7 +29,7 @@ use crate::config::{self, Settings};
 use crate::expand_path;
 
 #[async_trait]
-pub trait LnBackendSetup {
+pub trait PaymentBackendSetup {
     async fn setup(
         &self,
         settings: &Settings,
@@ -35,12 +37,24 @@ pub trait LnBackendSetup {
         runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
         work_dir: &Path,
         kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
-    ) -> anyhow::Result<impl MintPayment>;
+    ) -> anyhow::Result<impl MintPayment<Err = cdk_common::payment::Error>>;
+}
+
+#[async_trait]
+pub trait OnchainBackendSetup {
+    async fn setup(
+        &self,
+        settings: &Settings,
+        unit: CurrencyUnit,
+        runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        work_dir: &Path,
+        kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
+    ) -> anyhow::Result<impl MintPayment<Err = cdk_common::payment::Error>>;
 }
 
 #[cfg(feature = "cln")]
 #[async_trait]
-impl LnBackendSetup for config::Cln {
+impl PaymentBackendSetup for config::Cln {
     async fn setup(
         &self,
         _settings: &Settings,
@@ -52,7 +66,7 @@ impl LnBackendSetup for config::Cln {
         // Validate required connection field
         if self.rpc_path.as_os_str().is_empty() {
             return Err(anyhow::anyhow!(
-                "CLN rpc_path must be set via config or CDK_MINTD_CLN_RPC_PATH env var"
+                "CLN rpc_path must be set in [cln].rpc_path"
             ));
         }
 
@@ -74,64 +88,16 @@ impl LnBackendSetup for config::Cln {
             self.expose_private_channels,
             kv_store.expect("Cln needs kv store"),
         )
-        .await?;
+        .await?
+        .with_bolt12(self.bolt12);
 
         Ok(cln)
     }
 }
 
-#[cfg(feature = "lnbits")]
-#[async_trait]
-impl LnBackendSetup for config::LNbits {
-    async fn setup(
-        &self,
-        _settings: &Settings,
-        _unit: CurrencyUnit,
-        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
-        _work_dir: &Path,
-        _kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
-    ) -> anyhow::Result<cdk_lnbits::LNbits> {
-        use anyhow::bail;
-
-        // Validate required connection fields
-        if self.admin_api_key.is_empty() {
-            bail!("LNbits admin_api_key must be set via config or CDK_MINTD_LNBITS_ADMIN_API_KEY env var");
-        }
-        if self.invoice_api_key.is_empty() {
-            bail!("LNbits invoice_api_key must be set via config or CDK_MINTD_LNBITS_INVOICE_API_KEY env var");
-        }
-        if self.lnbits_api.is_empty() {
-            bail!(
-                "LNbits lnbits_api must be set via config or CDK_MINTD_LNBITS_LNBITS_API env var"
-            );
-        }
-
-        let admin_api_key = &self.admin_api_key;
-        let invoice_api_key = &self.invoice_api_key;
-
-        let fee_reserve = FeeReserve {
-            min_fee_reserve: self.reserve_fee_min,
-            percent_fee_reserve: self.fee_percent,
-        };
-
-        let lnbits = cdk_lnbits::LNbits::new(
-            admin_api_key.clone(),
-            invoice_api_key.clone(),
-            self.lnbits_api.clone(),
-            fee_reserve,
-        )
-        .await?;
-
-        // Use v1 websocket API
-        lnbits.subscribe_ws().await?;
-
-        Ok(lnbits)
-    }
-}
-
 #[cfg(feature = "lnd")]
 #[async_trait]
-impl LnBackendSetup for config::Lnd {
+impl PaymentBackendSetup for config::Lnd {
     async fn setup(
         &self,
         _settings: &Settings,
@@ -143,15 +109,13 @@ impl LnBackendSetup for config::Lnd {
         use anyhow::bail;
         // Validate required connection fields
         if self.address.is_empty() {
-            bail!("LND address must be set via config or CDK_MINTD_LND_ADDRESS env var");
+            bail!("LND address must be set in [lnd].address");
         }
         if self.cert_file.as_os_str().is_empty() {
-            bail!("LND cert_file must be set via config or CDK_MINTD_LND_CERT_FILE env var");
+            bail!("LND cert_file must be set in [lnd].cert_file");
         }
         if self.macaroon_file.as_os_str().is_empty() {
-            bail!(
-                "LND macaroon_file must be set via config or CDK_MINTD_LND_MACAROON_FILE env var"
-            );
+            bail!("LND macaroon_file must be set in [lnd].macaroon_file");
         }
 
         let address = &self.address;
@@ -170,7 +134,8 @@ impl LnBackendSetup for config::Lnd {
             fee_reserve,
             kv_store.expect("Lnd needs kv store"),
         )
-        .await?;
+        .await?
+        .with_allow_self_payment(self.allow_self_payment);
 
         Ok(lnd)
     }
@@ -178,7 +143,7 @@ impl LnBackendSetup for config::Lnd {
 
 #[cfg(feature = "fakewallet")]
 #[async_trait]
-impl LnBackendSetup for config::FakeWallet {
+impl PaymentBackendSetup for config::FakeWallet {
     async fn setup(
         &self,
         _settings: &Settings,
@@ -196,21 +161,108 @@ impl LnBackendSetup for config::FakeWallet {
         let mut rng = thread_rng();
         let delay_time = rng.gen_range(self.min_delay_time..=self.max_delay_time);
 
+        let mut custom_payment_methods = HashMap::new();
+        for custom_payment_method in &self.custom_payment_methods {
+            if !custom_payment_method.applies_to_unit(&unit) {
+                continue;
+            }
+
+            let method = custom_payment_method.method().trim().to_lowercase();
+            if method.is_empty() {
+                anyhow::bail!("Fake wallet custom payment method cannot be empty");
+            }
+
+            if matches!(method.as_str(), "bolt11" | "bolt12" | "onchain") {
+                anyhow::bail!(
+                    "Fake wallet custom payment method `{method}` conflicts with a known payment method"
+                );
+            }
+
+            custom_payment_methods.insert(method, "{}".to_string());
+        }
+
         let fake_wallet = cdk_fake_wallet::FakeWallet::new(
             fee_reserve,
             HashMap::default(),
             HashSet::default(),
             delay_time,
             unit,
-        );
+        )
+        .with_custom_payment_methods(custom_payment_methods);
 
         Ok(fake_wallet)
     }
 }
 
+#[cfg(all(test, feature = "fakewallet"))]
+mod tests {
+    use cdk::cdk_payment::MintPayment;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn fake_wallet_setup_filters_custom_methods_by_unit() {
+        let fake_wallet = config::FakeWallet {
+            supported_units: vec![CurrencyUnit::Sat, CurrencyUnit::Usd],
+            custom_payment_methods: vec![
+                config::FakeWalletCustomPaymentMethod::MethodForUnit {
+                    method: "paypal".to_string(),
+                    unit: CurrencyUnit::Sat,
+                },
+                config::FakeWalletCustomPaymentMethod::MethodForUnit {
+                    method: "venmo".to_string(),
+                    unit: CurrencyUnit::Usd,
+                },
+                config::FakeWalletCustomPaymentMethod::Method("cashapp".to_string()),
+            ],
+            min_delay_time: 0,
+            max_delay_time: 0,
+            ..Default::default()
+        };
+
+        let sat_wallet = fake_wallet
+            .setup(
+                &Settings::default(),
+                CurrencyUnit::Sat,
+                None,
+                Path::new("."),
+                None,
+            )
+            .await
+            .expect("sat fake wallet should set up");
+        let sat_settings = sat_wallet
+            .get_settings()
+            .await
+            .expect("sat fake wallet settings should load");
+
+        assert!(sat_settings.custom.contains_key("paypal"));
+        assert!(sat_settings.custom.contains_key("cashapp"));
+        assert!(!sat_settings.custom.contains_key("venmo"));
+
+        let usd_wallet = fake_wallet
+            .setup(
+                &Settings::default(),
+                CurrencyUnit::Usd,
+                None,
+                Path::new("."),
+                None,
+            )
+            .await
+            .expect("usd fake wallet should set up");
+        let usd_settings = usd_wallet
+            .get_settings()
+            .await
+            .expect("usd fake wallet settings should load");
+
+        assert!(!usd_settings.custom.contains_key("paypal"));
+        assert!(usd_settings.custom.contains_key("cashapp"));
+        assert!(usd_settings.custom.contains_key("venmo"));
+    }
+}
+
 #[cfg(feature = "grpc-processor")]
 #[async_trait]
-impl LnBackendSetup for config::GrpcProcessor {
+impl PaymentBackendSetup for config::GrpcProcessor {
     async fn setup(
         &self,
         _settings: &Settings,
@@ -219,61 +271,92 @@ impl LnBackendSetup for config::GrpcProcessor {
         _work_dir: &Path,
         _kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
     ) -> anyhow::Result<cdk_payment_processor::PaymentProcessorClient> {
-        let payment_processor = cdk_payment_processor::PaymentProcessorClient::new(
-            &self.addr,
-            self.port,
-            self.tls_dir.clone(),
-        )
-        .await?;
+        let tls_dir = grpc_processor_tls_dir(self)?;
+
+        let payment_processor =
+            cdk_payment_processor::PaymentProcessorClient::new(&self.address, self.port, tls_dir)
+                .await?;
 
         Ok(payment_processor)
     }
 }
 
+#[cfg(feature = "grpc-processor")]
+fn grpc_processor_tls_dir(processor: &config::GrpcProcessor) -> anyhow::Result<Option<PathBuf>> {
+    match (&processor.tls_dir, processor.allow_insecure) {
+        (Some(tls_dir), _) => Ok(Some(tls_dir.clone())),
+        (None, false) => anyhow::bail!(
+            "gRPC payment processor TLS is not configured. Set [grpc_processor].tls_dir \
+             or [grpc_processor].allow_insecure = true to connect without TLS"
+        ),
+        (None, true) => {
+            tracing::warn!(
+                address = %processor.address,
+                port = processor.port,
+                "SECURITY WARNING: connecting to the gRPC payment processor without TLS because \
+                 allow_insecure is true; traffic is unencrypted and unauthenticated and can be \
+                 intercepted or modified"
+            );
+
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(all(test, feature = "grpc-processor"))]
+mod grpc_processor_tests {
+    use super::grpc_processor_tls_dir;
+    use crate::config::GrpcProcessor;
+
+    #[test]
+    fn remote_plaintext_processor_requires_explicit_opt_in() {
+        let mut processor = GrpcProcessor {
+            address: "192.0.2.1".to_string(),
+            ..Default::default()
+        };
+
+        let error = grpc_processor_tls_dir(&processor)
+            .expect_err("plaintext should require explicit opt-in");
+        assert!(error
+            .to_string()
+            .contains("allow_insecure = true to connect without TLS"));
+
+        processor.allow_insecure = true;
+        assert_eq!(
+            grpc_processor_tls_dir(&processor).expect("remote plaintext should be allowed"),
+            None
+        );
+    }
+}
+
 #[cfg(feature = "ldk-node")]
-#[async_trait]
-impl LnBackendSetup for config::LdkNode {
-    async fn setup(
-        &self,
-        settings: &Settings,
-        _unit: CurrencyUnit,
-        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
-        work_dir: &Path,
-        _kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
-    ) -> anyhow::Result<cdk_ldk_node::CdkLdkNode> {
-        use std::net::SocketAddr;
-
+impl config::LdkNode {
+    fn chain_source(&self) -> anyhow::Result<cdk_ldk_node::ChainSource> {
         use anyhow::bail;
-        use bip39::Mnemonic;
-        use bitcoin::Network;
 
-        let fee_reserve = FeeReserve {
-            min_fee_reserve: self.reserve_fee_min,
-            percent_fee_reserve: self.fee_percent,
-        };
-
-        // Parse network from config
-        let network = match self
-            .bitcoin_network
-            .as_ref()
-            .map(|n| n.to_lowercase())
-            .as_deref()
-            .unwrap_or("regtest")
-        {
-            "mainnet" | "bitcoin" => Network::Bitcoin,
-            "testnet" => Network::Testnet,
-            "signet" => Network::Signet,
-            _ => Network::Regtest,
-        };
-
-        // Parse chain source from config
-        let chain_source = match self
+        let chain_source_type = self
             .chain_source_type
             .as_ref()
-            .map(|s| s.to_lowercase())
-            .as_deref()
-            .unwrap_or("esplora")
-        {
+            .map(|source| source.to_lowercase())
+            .unwrap_or_else(|| "esplora".to_string());
+
+        match chain_source_type.as_str() {
+            "esplora" => {
+                let esplora_url = self.esplora_url.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "LDK Node esplora_url must be set when chain_source_type is esplora"
+                    )
+                })?;
+                Ok(cdk_ldk_node::ChainSource::Esplora(esplora_url))
+            }
+            "electrum" => {
+                let electrum_url = self.electrum_url.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "LDK Node electrum_url must be set when chain_source_type is electrum"
+                    )
+                })?;
+                Ok(cdk_ldk_node::ChainSource::Electrum(electrum_url))
+            }
             "bitcoinrpc" => {
                 let host = self
                     .bitcoind_rpc_host
@@ -289,21 +372,123 @@ impl LnBackendSetup for config::LdkNode {
                     .clone()
                     .unwrap_or_else(|| "testpass".to_string());
 
-                cdk_ldk_node::ChainSource::BitcoinRpc(cdk_ldk_node::BitcoinRpcConfig {
-                    host,
-                    port,
-                    user,
-                    password,
-                })
+                Ok(cdk_ldk_node::ChainSource::BitcoinRpc(
+                    cdk_ldk_node::BitcoinRpcConfig {
+                        host,
+                        port,
+                        user,
+                        password,
+                    },
+                ))
             }
-            _ => {
-                let esplora_url = self
-                    .esplora_url
-                    .clone()
-                    .unwrap_or_else(|| "https://mutinynet.com/api".to_string());
-                cdk_ldk_node::ChainSource::Esplora(esplora_url)
-            }
+            _ => bail!("Unknown LDK Node chain_source_type: {chain_source_type}"),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "ldk-node"))]
+mod ldk_node_tests {
+    use super::*;
+
+    #[test]
+    fn parses_electrum_chain_source() {
+        let config = config::LdkNode {
+            chain_source_type: Some("ElEcTrUm".to_string()),
+            electrum_url: Some("ssl://electrum.example.com:50002".to_string()),
+            ..Default::default()
         };
+
+        match config.chain_source().expect("electrum config should parse") {
+            cdk_ldk_node::ChainSource::Electrum(url) => {
+                assert_eq!(url, "ssl://electrum.example.com:50002");
+            }
+            _ => panic!("expected an Electrum chain source"),
+        }
+    }
+
+    #[test]
+    fn esplora_chain_source_requires_url() {
+        let config = config::LdkNode {
+            chain_source_type: Some("esplora".to_string()),
+            ..Default::default()
+        };
+
+        let error = config
+            .chain_source()
+            .expect_err("esplora config without a URL should fail");
+
+        assert!(error.to_string().contains("esplora_url must be set"));
+    }
+
+    #[test]
+    fn electrum_chain_source_requires_url() {
+        let config = config::LdkNode {
+            chain_source_type: Some("electrum".to_string()),
+            ..Default::default()
+        };
+
+        let error = config
+            .chain_source()
+            .expect_err("electrum config without a URL should fail");
+
+        assert!(error.to_string().contains("electrum_url must be set"));
+    }
+
+    #[test]
+    fn rejects_unknown_chain_source() {
+        let config = config::LdkNode {
+            chain_source_type: Some("unknown".to_string()),
+            ..Default::default()
+        };
+
+        let error = config
+            .chain_source()
+            .expect_err("unknown chain source should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Unknown LDK Node chain_source_type: unknown"
+        );
+    }
+}
+
+#[cfg(feature = "ldk-node")]
+#[async_trait]
+impl PaymentBackendSetup for config::LdkNode {
+    async fn setup(
+        &self,
+        settings: &Settings,
+        _unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        work_dir: &Path,
+        kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
+    ) -> anyhow::Result<cdk_ldk_node::CdkLdkNode> {
+        use std::net::SocketAddr;
+
+        use anyhow::bail;
+        use bip39::Mnemonic;
+        use bitcoin::Network;
+
+        let fee_reserve = FeeReserve {
+            min_fee_reserve: self.reserve_fee_min,
+            percent_fee_reserve: self.fee_percent,
+        };
+
+        // Parse network from config
+        let network_str = self.bitcoin_network.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("LDK Node bitcoin_network must be set in [ldk_node].bitcoin_network")
+        })?;
+
+        let network = match network_str.to_lowercase().as_str() {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "testnet" => Network::Testnet,
+            "signet" => Network::Signet,
+            "regtest" => Network::Regtest,
+            _ => bail!("Unknown LDK Node bitcoin_network: {}", network_str),
+        };
+
+        // Parse chain source from config
+        let chain_source = self.chain_source()?;
 
         // Parse gossip source from config
         let gossip_source = match self.rgs_url.clone() {
@@ -372,6 +557,8 @@ impl LnBackendSetup for config::LdkNode {
             .map(|addrs| addrs.iter().filter_map(|addr| addr.parse().ok()).collect())
             .unwrap_or_default();
 
+        let kv_store = kv_store.ok_or_else(|| anyhow::anyhow!("LdkNode needs a KV store"))?;
+
         let mut ldk_node_builder = cdk_ldk_node::CdkLdkNodeBuilder::new(
             network,
             chain_source,
@@ -379,6 +566,7 @@ impl LnBackendSetup for config::LdkNode {
             storage_dir_path,
             fee_reserve,
             listen_address,
+            kv_store,
         );
 
         // Only set seed if provided
@@ -411,5 +599,307 @@ impl LnBackendSetup for config::LdkNode {
         ldk_node.set_web_addr(webserver_addr);
 
         Ok(ldk_node)
+    }
+}
+
+#[cfg(feature = "bdk")]
+impl crate::config::Bdk {
+    fn wallet_identity(&self) -> Result<(bip39::Mnemonic, bitcoin::Network), cdk_bdk::Error> {
+        let network_str = self.network.as_ref().ok_or_else(|| {
+            cdk_bdk::Error::InvalidConfig("BDK network must be set in [bdk].network".to_string())
+        })?;
+        let network = match network_str.to_lowercase().as_str() {
+            "mainnet" | "bitcoin" => bitcoin::Network::Bitcoin,
+            "testnet" => bitcoin::Network::Testnet,
+            "signet" => bitcoin::Network::Signet,
+            "regtest" => bitcoin::Network::Regtest,
+            _ => {
+                return Err(cdk_bdk::Error::InvalidConfig(format!(
+                    "Unknown BDK network: {network_str}"
+                )));
+            }
+        };
+        let mnemonic = self
+            .mnemonic
+            .as_ref()
+            .ok_or_else(|| cdk_bdk::Error::InvalidConfig("BDK mnemonic must be set".to_string()))?;
+        let mnemonic = bip39::Mnemonic::parse(mnemonic)
+            .map_err(|error| cdk_bdk::Error::InvalidConfig(error.to_string()))?;
+
+        Ok((mnemonic, network))
+    }
+
+    pub(crate) fn validate_wallet_identity(&self) -> Result<(), cdk_bdk::Error> {
+        self.wallet_identity().map(|_| ())
+    }
+
+    pub(crate) fn validate_existing_wallet(&self, work_dir: &Path) -> Result<(), cdk_bdk::Error> {
+        let (mnemonic, network) = self.wallet_identity()?;
+        cdk_bdk::validate_existing_wallet(mnemonic, network, work_dir)?;
+        Ok(())
+    }
+
+    fn chain_source(&self) -> anyhow::Result<cdk_bdk::ChainSource> {
+        use anyhow::bail;
+
+        let chain_source_type = self
+            .chain_source_type
+            .as_deref()
+            .unwrap_or("bitcoinrpc")
+            .to_lowercase();
+
+        match chain_source_type.as_str() {
+            "esplora" => {
+                let esplora_url = self.esplora_url.clone().ok_or_else(|| {
+                    anyhow::anyhow!("BDK esplora_url must be set when chain_source_type is esplora")
+                })?;
+                Ok(cdk_bdk::ChainSource::Esplora(cdk_bdk::EsploraConfig {
+                    url: esplora_url,
+                    parallel_requests: self.esplora_parallel_requests.max(1),
+                }))
+            }
+            "electrum" => {
+                let electrum_url = self.electrum_url.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "BDK electrum_url must be set when chain_source_type is electrum"
+                    )
+                })?;
+                if self.electrum_batch_size == 0 {
+                    bail!("BDK electrum_batch_size must be greater than zero");
+                }
+                Ok(cdk_bdk::ChainSource::Electrum(cdk_bdk::ElectrumConfig {
+                    url: electrum_url,
+                    batch_size: self.electrum_batch_size,
+                }))
+            }
+            "bitcoinrpc" => {
+                let host = self
+                    .bitcoind_rpc_host
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = self.bitcoind_rpc_port.unwrap_or(18443);
+                let user = self
+                    .bitcoind_rpc_user
+                    .clone()
+                    .unwrap_or_else(|| "user".to_string());
+                let password = self
+                    .bitcoind_rpc_password
+                    .clone()
+                    .unwrap_or_else(|| "pass".to_string());
+
+                Ok(cdk_bdk::ChainSource::BitcoinRpc(
+                    cdk_bdk::BitcoinRpcConfig {
+                        host,
+                        port,
+                        user,
+                        password,
+                        wallet_rescan_from_height: self.wallet_rescan_from_height,
+                    },
+                ))
+            }
+            _ => bail!("Unknown BDK chain_source_type: {chain_source_type}"),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "bdk"))]
+mod bdk_tests {
+    use super::*;
+
+    #[test]
+    fn forwards_bitcoin_rpc_wallet_rescan_height() {
+        let config = config::Bdk {
+            chain_source_type: Some("bitcoinrpc".to_string()),
+            wallet_rescan_from_height: Some(850000),
+            ..Default::default()
+        };
+
+        match config
+            .chain_source()
+            .expect("Bitcoin RPC config should parse")
+        {
+            cdk_bdk::ChainSource::BitcoinRpc(config) => {
+                assert_eq!(config.wallet_rescan_from_height, Some(850000));
+            }
+            _ => panic!("expected a Bitcoin RPC chain source"),
+        }
+    }
+
+    #[test]
+    fn parses_electrum_chain_source() {
+        let config = config::Bdk {
+            chain_source_type: Some("ElEcTrUm".to_string()),
+            electrum_url: Some("ssl://electrum.example.com:50002".to_string()),
+            electrum_batch_size: 7,
+            ..Default::default()
+        };
+
+        match config.chain_source().expect("electrum config should parse") {
+            cdk_bdk::ChainSource::Electrum(config) => {
+                assert_eq!(config.url, "ssl://electrum.example.com:50002");
+                assert_eq!(config.batch_size, 7);
+            }
+            _ => panic!("expected an Electrum chain source"),
+        }
+    }
+
+    #[test]
+    fn electrum_chain_source_requires_url() {
+        let config = config::Bdk {
+            chain_source_type: Some("electrum".to_string()),
+            ..Default::default()
+        };
+
+        let error = config
+            .chain_source()
+            .expect_err("electrum config without a URL should fail");
+
+        assert!(error.to_string().contains("electrum_url must be set"));
+    }
+
+    #[test]
+    fn electrum_chain_source_rejects_zero_batch_size() {
+        let config = config::Bdk {
+            chain_source_type: Some("electrum".to_string()),
+            electrum_url: Some("tcp://127.0.0.1:50001".to_string()),
+            electrum_batch_size: 0,
+            ..Default::default()
+        };
+
+        let error = config
+            .chain_source()
+            .expect_err("zero Electrum batch size should fail");
+
+        assert!(error
+            .to_string()
+            .contains("electrum_batch_size must be greater than zero"));
+    }
+
+    #[test]
+    fn esplora_chain_source_requires_url() {
+        let config = config::Bdk {
+            chain_source_type: Some("esplora".to_string()),
+            ..Default::default()
+        };
+
+        let error = config
+            .chain_source()
+            .expect_err("esplora config without a URL should fail");
+
+        assert!(error.to_string().contains("esplora_url must be set"));
+    }
+
+    #[test]
+    fn rejects_unknown_chain_source() {
+        let config = config::Bdk {
+            chain_source_type: Some("unknown".to_string()),
+            ..Default::default()
+        };
+
+        let error = config
+            .chain_source()
+            .expect_err("unknown chain source should fail");
+
+        assert_eq!(error.to_string(), "Unknown BDK chain_source_type: unknown");
+    }
+}
+
+#[cfg(feature = "bdk")]
+#[async_trait]
+impl OnchainBackendSetup for crate::config::Bdk {
+    async fn setup(
+        &self,
+        settings: &Settings,
+        _unit: CurrencyUnit,
+        _runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
+        work_dir: &Path,
+        kv_store: Option<Arc<dyn KVStore<Err = cdk::cdk_database::Error> + Send + Sync>>,
+    ) -> anyhow::Result<cdk_bdk::CdkBdk> {
+        self.validate().map_err(anyhow::Error::msg)?;
+
+        let fee_reserve = FeeReserve {
+            min_fee_reserve: self.reserve_fee_min,
+            percent_fee_reserve: self.fee_percent,
+        };
+
+        let (mnemonic, network) = self.wallet_identity()?;
+
+        let chain_source = self.chain_source()?;
+
+        let min_receive_amount_sat = settings
+            .onchain
+            .as_ref()
+            .map(|onchain| onchain.min_mint.to_u64().max(self.min_receive_amount_sat))
+            .unwrap_or(self.min_receive_amount_sat);
+
+        let bdk = cdk_bdk::CdkBdk::new(
+            mnemonic,
+            network,
+            chain_source,
+            work_dir.to_string_lossy().to_string(),
+            fee_reserve,
+            kv_store.ok_or_else(|| anyhow::anyhow!("BDK backend requires a KV store"))?,
+            Some(self.batch_config.clone().into()),
+            self.num_confs,
+            min_receive_amount_sat,
+            self.min_send_amount_sat,
+            self.sync_interval_secs,
+            None,
+            None,
+        )?;
+
+        Ok(bdk)
+    }
+}
+
+#[cfg(feature = "bdk")]
+impl From<crate::config::BatchConfig> for cdk_bdk::BatchConfig {
+    fn from(config: crate::config::BatchConfig) -> Self {
+        let target_block_time = Duration::from_secs(config.target_block_time_secs);
+        let standard_deadline = config
+            .standard_deadline_secs
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| {
+                cdk_bdk::BatchConfig::deadline_for_target_blocks(
+                    cdk_bdk::PaymentTier::Standard,
+                    target_block_time,
+                )
+            });
+        let economy_deadline = config
+            .economy_deadline_secs
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| {
+                cdk_bdk::BatchConfig::deadline_for_target_blocks(
+                    cdk_bdk::PaymentTier::Economy,
+                    target_block_time,
+                )
+            });
+        let fee_estimation = cdk_bdk::FeeEstimationConfig {
+            fallback_sat_per_vb: config.fee_fallback_sat_per_vb,
+            cache_ttl_secs: config.fee_cache_ttl_secs,
+            quote_max_input_count: config.quote_max_input_count,
+            quote_fixed_safety_sat: config.quote_fixed_safety_sat,
+            quote_safety_multiplier: config.quote_safety_multiplier,
+        };
+
+        Self {
+            poll_interval: Duration::from_secs(config.poll_interval_secs),
+            max_batch_size: config.max_batch_size,
+            target_block_time,
+            standard_deadline,
+            economy_deadline,
+            max_intent_age: Some(
+                economy_deadline.saturating_add(Duration::from_secs(config.poll_interval_secs)),
+            ),
+            fee_options: config
+                .fee_options
+                .iter()
+                .map(|tier| {
+                    cdk_bdk::PaymentTier::from_config_name(tier)
+                        .expect("BDK fee_options should be validated before setup")
+                })
+                .collect(),
+            fee_estimation,
+        }
     }
 }

@@ -6,8 +6,9 @@ use std::ops::Deref;
 use cdk_common::nut17::NotificationId;
 use cdk_common::pub_sub::Event;
 use cdk_common::{
-    MeltQuoteBolt11Response, MintQuoteBolt11Response, MintQuoteBolt12Response, NotificationPayload,
-    ProofState,
+    MeltQuoteBolt11Response, MeltQuoteBolt12Response, MeltQuoteOnchainResponse,
+    MintQuoteBolt11Response, MintQuoteBolt12Response, MintQuoteOnchainResponse,
+    NotificationPayload, ProofState,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,33 @@ where
     }
 }
 
+impl<T> From<MeltQuoteBolt12Response<T>> for MintEvent<T>
+where
+    T: Clone + Eq + PartialEq,
+{
+    fn from(value: MeltQuoteBolt12Response<T>) -> Self {
+        Self(NotificationPayload::MeltQuoteBolt12Response(value))
+    }
+}
+
+impl<T> From<MintQuoteOnchainResponse<T>> for MintEvent<T>
+where
+    T: Clone + Eq + PartialEq,
+{
+    fn from(value: MintQuoteOnchainResponse<T>) -> Self {
+        Self(NotificationPayload::MintQuoteOnchainResponse(value))
+    }
+}
+
+impl<T> From<MeltQuoteOnchainResponse<T>> for MintEvent<T>
+where
+    T: Clone + Eq + PartialEq,
+{
+    fn from(value: MeltQuoteOnchainResponse<T>) -> Self {
+        Self(NotificationPayload::MeltQuoteOnchainResponse(value))
+    }
+}
+
 impl<T> Event for MintEvent<T>
 where
     T: Clone + Serialize + DeserializeOwned + Debug + Ord + Hash + Send + Sync + Eq + PartialEq,
@@ -113,15 +141,7 @@ where
     fn get_topics(&self) -> Vec<Self::Topic> {
         match &self.0 {
             NotificationPayload::MeltQuoteBolt11Response(r) => {
-                // TODO: MeltQuoteBolt12Response is a type alias for MeltQuoteBolt11Response.
-                // Since NotificationPayload uses untagged serde, all melt responses are
-                // deserialized as Bolt11. We broadcast to both topics to ensure Bolt12
-                // subscribers receive the event. This workaround should be addressed by
-                // properly distinguishing the response types in the protocol.
-                vec![
-                    NotificationId::MeltQuoteBolt11(r.quote.to_owned()),
-                    NotificationId::MeltQuoteBolt12(r.quote.to_owned()),
-                ]
+                vec![NotificationId::MeltQuoteBolt11(r.quote.to_owned())]
             }
             NotificationPayload::MintQuoteBolt11Response(r) => {
                 vec![NotificationId::MintQuoteBolt11(r.quote.to_owned())]
@@ -131,6 +151,12 @@ where
             }
             NotificationPayload::MeltQuoteBolt12Response(r) => {
                 vec![NotificationId::MeltQuoteBolt12(r.quote.to_owned())]
+            }
+            NotificationPayload::MeltQuoteOnchainResponse(r) => {
+                vec![NotificationId::MeltQuoteOnchain(r.quote.to_owned())]
+            }
+            NotificationPayload::MintQuoteOnchainResponse(r) => {
+                vec![NotificationId::MintQuoteOnchain(r.quote.to_owned())]
             }
             NotificationPayload::CustomMintQuoteResponse(method, r) => {
                 vec![NotificationId::MintQuoteCustom(

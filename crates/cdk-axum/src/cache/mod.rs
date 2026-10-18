@@ -20,7 +20,7 @@ mod backend;
 mod config;
 
 pub use self::backend::*;
-pub use self::config::Config;
+pub use self::config::{Backend, Config};
 
 #[async_trait::async_trait]
 /// Cache storage for the HTTP cache.
@@ -90,36 +90,107 @@ impl Deref for HttpCacheKey {
     }
 }
 
-impl From<config::Config> for HttpCache {
-    fn from(config: config::Config) -> Self {
+impl HttpCache {
+    /// Create an `HttpCache` from the given configuration.
+    ///
+    /// This is an async constructor because Redis connection setup requires
+    /// awaiting async operations. Using a sync `From` trait with
+    /// `Handle::current().block_on()` would panic when called from within
+    /// an active Tokio runtime.
+    pub async fn from_config(config: config::Config) -> anyhow::Result<Self> {
+        let ttl = Duration::from_secs(config.ttl.unwrap_or(DEFAULT_TTL_SECS));
+        let tti = Duration::from_secs(config.tti.unwrap_or(DEFAULT_TTI_SECS));
+
         match config.backend {
-            config::Backend::Memory => Self::new(
-                Duration::from_secs(config.ttl.unwrap_or(DEFAULT_TTL_SECS)),
-                Duration::from_secs(config.tti.unwrap_or(DEFAULT_TTI_SECS)),
-                None,
-            ),
+            config::Backend::Memory => Ok(Self::new(ttl, tti, None)),
             #[cfg(feature = "redis")]
             config::Backend::Redis(redis_config) => {
-                let client = redis::Client::open(redis_config.connection_string)
-                    .expect("Failed to create Redis client");
-                let storage = HttpCacheRedis::new(client).set_prefix(
+                let redis_client = if redis_config.use_cluster {
+                    match redis_config.cluster_nodes {
+                        Some(nodes) => {
+                            // Explicit timeouts
+                            let builder = redis::cluster::ClusterClientBuilder::new(nodes)
+                                .connection_timeout(Duration::from_secs(5))
+                                .response_timeout(Duration::from_secs(5))
+                                .retries(2);
+                            match builder.build() {
+                                Ok(cluster_client) => {
+                                    match cluster_client.get_async_connection().await {
+                                        Ok(conn) => RedisClient::Cluster(conn),
+                                        Err(err) => {
+                                            tracing::error!(
+                                                "Failed to connect to Redis cluster: {}",
+                                                err
+                                            );
+                                            return Err(anyhow::anyhow!(
+                                                "Failed to connect to Redis cluster: {}",
+                                                err
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        "Failed to create Redis cluster client: {}",
+                                        err
+                                    );
+                                    return Err(anyhow::anyhow!(
+                                        "Failed to create Redis cluster client: {}",
+                                        err
+                                    ));
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::error!("Redis cluster nodes not provided");
+                            return Err(anyhow::anyhow!("Redis cluster nodes not provided"));
+                        }
+                    }
+                } else {
+                    let connection_string = redis_config.connection_string.clone();
+                    if connection_string.is_empty() {
+                        tracing::error!("Redis connection string is empty");
+                        return Err(anyhow::anyhow!("Redis connection string is empty"));
+                    } else {
+                        match redis::Client::open(connection_string) {
+                            Ok(single_client) => {
+                                match redis::aio::ConnectionManager::new(single_client).await {
+                                    Ok(conn) => RedisClient::Single(conn),
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "Failed to create Redis connection manager: {}",
+                                            err
+                                        );
+                                        return Err(anyhow::anyhow!(
+                                            "Failed to create Redis connection manager: {}",
+                                            err
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!("Failed to create Redis client: {}", err);
+                                return Err(anyhow::anyhow!(
+                                    "Failed to create Redis client: {}",
+                                    err
+                                ));
+                            }
+                        }
+                    }
+                };
+
+                let storage = HttpCacheRedis::new(redis_client).set_prefix(
                     redis_config
                         .key_prefix
                         .unwrap_or_default()
                         .as_bytes()
                         .to_vec(),
                 );
-                Self::new(
-                    Duration::from_secs(config.ttl.unwrap_or(DEFAULT_TTL_SECS)),
-                    Duration::from_secs(config.tti.unwrap_or(DEFAULT_TTI_SECS)),
-                    Some(Box::new(storage)),
-                )
+                Ok(Self::new(ttl, tti, Some(Box::new(storage))))
             }
         }
     }
-}
 
-impl HttpCache {
     /// Create a new HTTP cache.
     pub fn new(
         ttl: Duration,
@@ -193,5 +264,76 @@ impl HttpCache {
         }) {
             self.storage.set(key, bytes).await;
         }
+    }
+}
+
+#[cfg(all(test, feature = "redis", feature = "integration-tests"))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::config::{Backend, Config};
+    use super::{HttpCache, RedisConfig};
+
+    #[tokio::test]
+    async fn redis_single_node_set_get_roundtrip() {
+        let url = std::env::var("CDK_MINTD_CACHE_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
+        let cache = Arc::new(
+            HttpCache::from_config(Config {
+                backend: Backend::Redis(RedisConfig {
+                    connection_string: url,
+                    use_cluster: false,
+                    cluster_nodes: None,
+                    key_prefix: None,
+                }),
+                ttl: Some(60),
+                tti: Some(60),
+            })
+            .await
+            .expect("failed to connect to single-node Redis"),
+        );
+
+        let key = cache
+            .calculate_key(&"redis_single_node_roundtrip")
+            .expect("key calculation failed");
+
+        cache.set(key.clone(), &"test_value_single").await;
+
+        let retrieved: Option<String> = cache.get(&key).await;
+        assert_eq!(retrieved, Some("test_value_single".to_string()));
+    }
+
+    #[tokio::test]
+    async fn redis_cluster_set_get_roundtrip() {
+        let nodes_str = std::env::var("CDK_MINTD_CACHE_REDIS_CLUSTER_NODES").unwrap_or_else(|_| {
+            "redis://127.0.0.1:7001,redis://127.0.0.1:7002,redis://127.0.0.1:7003".to_string()
+        });
+
+        let nodes: Vec<String> = nodes_str.split(',').map(|s| s.trim().to_string()).collect();
+
+        let cache = Arc::new(
+            HttpCache::from_config(Config {
+                backend: Backend::Redis(RedisConfig {
+                    connection_string: String::new(),
+                    use_cluster: true,
+                    cluster_nodes: Some(nodes),
+                    key_prefix: None,
+                }),
+                ttl: Some(60),
+                tti: Some(60),
+            })
+            .await
+            .expect("failed to connect to Redis cluster"),
+        );
+
+        let key = cache
+            .calculate_key(&"redis_cluster_roundtrip")
+            .expect("key calculation failed");
+
+        cache.set(key.clone(), &"test_value_cluster").await;
+
+        let retrieved: Option<String> = cache.get(&key).await;
+        assert_eq!(retrieved, Some("test_value_cluster".to_string()));
     }
 }

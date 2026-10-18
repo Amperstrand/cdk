@@ -42,7 +42,6 @@ pub enum Error {
 
 /// Blind auth settings
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct Settings {
     /// Max number of blind auth tokens that can be minted per request
     pub bat_max_mint: u64,
@@ -149,17 +148,14 @@ pub enum AuthRequired {
 
 /// Auth Proofs
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct AuthProof {
     /// `Keyset id`
     #[serde(rename = "id")]
     pub keyset_id: Id,
     /// Secret message
-    #[cfg_attr(feature = "swagger", schema(value_type = String))]
     pub secret: Secret,
     /// Unblinded signature
     #[serde(rename = "C")]
-    #[cfg_attr(feature = "swagger", schema(value_type = String))]
     pub c: PublicKey,
     /// Auth Proof Dleq
     pub dleq: Option<ProofDleq>,
@@ -259,10 +255,8 @@ impl std::str::FromStr for BlindAuthToken {
 
 /// Mint auth request [NUT-XX]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct MintAuthRequest {
     /// Outputs
-    #[cfg_attr(feature = "swagger", schema(max_items = 1_000))]
     pub outputs: Vec<BlindedMessage>,
 }
 
@@ -276,29 +270,27 @@ impl MintAuthRequest {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::str::FromStr;
 
     use super::super::nut21::{Method, RoutePath};
     use super::*;
     use crate::nut00::KnownMethod;
-    use crate::PaymentMethod;
+    use crate::{Amount, PaymentMethod, SecretKey};
+
+    fn test_auth_proof() -> AuthProof {
+        let secret_key = SecretKey::generate();
+
+        AuthProof {
+            keyset_id: Id::from_bytes(&[0, 1, 2, 3, 4, 5, 6, 7]).expect("valid id"),
+            secret: Secret::generate(),
+            c: secret_key.public_key(),
+            dleq: None,
+        }
+    }
 
     #[test]
     fn test_blind_auth_token_padding() {
-        use std::str::FromStr;
-
-        use crate::SecretKey;
-
-        // Build a valid BlindAuthToken programmatically
-        let secret_key = SecretKey::generate();
-        let public_key = secret_key.public_key();
-        let secret = Secret::generate();
-        let auth_proof = AuthProof {
-            keyset_id: Id::from_bytes(&[0, 1, 2, 3, 4, 5, 6, 7]).expect("valid id"),
-            secret,
-            c: public_key,
-            dleq: None,
-        };
-        let token = BlindAuthToken::new(auth_proof);
+        let token = BlindAuthToken::new(test_auth_proof());
 
         // Serialize (Display impl produces padded base64)
         let token_str = token.to_string();
@@ -314,6 +306,40 @@ mod tests {
         let parsed_no_pad =
             BlindAuthToken::from_str(token_no_pad).expect("Failed to parse token without padding");
         assert_eq!(token, parsed_no_pad);
+    }
+
+    #[test]
+    fn test_auth_token_display_and_header_key_preserve_type() {
+        let blind_auth = BlindAuthToken::new(test_auth_proof());
+        let blind_auth_string = blind_auth.to_string();
+
+        assert_eq!(
+            AuthToken::ClearAuth("clear-token".to_string()).to_string(),
+            "clear-token"
+        );
+        assert_eq!(
+            AuthToken::ClearAuth(String::new()).header_key(),
+            "Clear-auth"
+        );
+        assert_eq!(
+            AuthToken::BlindAuth(blind_auth.clone()).to_string(),
+            blind_auth_string
+        );
+        assert_eq!(AuthToken::BlindAuth(blind_auth).header_key(), "Blind-auth");
+    }
+
+    #[test]
+    fn test_mint_auth_request_amount_counts_outputs() {
+        let keyset_id = Id::from_bytes(&[0, 1, 2, 3, 4, 5, 6, 7]).expect("valid id");
+        let blinded_secret = SecretKey::generate().public_key();
+        let request = MintAuthRequest {
+            outputs: vec![
+                BlindedMessage::new(Amount::ONE, keyset_id, blinded_secret),
+                BlindedMessage::new(Amount::ONE, keyset_id, blinded_secret),
+            ],
+        };
+
+        assert_eq!(request.amount(), 2);
     }
 
     #[test]
@@ -369,7 +395,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(json).unwrap();
 
         assert_eq!(settings.bat_max_mint, 5);
-        assert_eq!(settings.protected_endpoints.len(), 5); // 4 mint paths + 1 swap path
+        assert_eq!(settings.protected_endpoints.len(), 6); // 4 mint paths + wildcard + 1 swap path
 
         let expected_protected: HashSet<ProtectedEndpoint> = HashSet::from_iter(vec![
             ProtectedEndpoint::new(Method::Post, RoutePath::Swap),
@@ -389,6 +415,7 @@ mod tests {
                 Method::Get,
                 RoutePath::Mint(PaymentMethod::Known(KnownMethod::Bolt12).to_string()),
             ),
+            ProtectedEndpoint::new(Method::Get, RoutePath::Wildcard("/v1/mint/".to_string())),
         ]);
 
         let deserialized_protected = settings.protected_endpoints.into_iter().collect();
@@ -413,6 +440,22 @@ mod tests {
     }
 
     #[test]
+    fn test_settings_deserialize_unknown_exact_path() {
+        let json = r#"{
+            "bat_max_mint": 5,
+            "protected_endpoints": [
+                {
+                    "method": "POST",
+                    "path": "/v1/swp"
+                }
+            ]
+        }"#;
+
+        let result = serde_json::from_str::<Settings>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_settings_deserialize_all_paths() {
         let json = r#"{
             "bat_max_mint": 5,
@@ -427,7 +470,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(
             settings.protected_endpoints.len(),
-            RoutePath::all_known_paths().len()
+            RoutePath::all_known_paths().len() + 1
         );
     }
 }

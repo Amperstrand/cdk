@@ -110,11 +110,14 @@ where
         .bind("id", keyset.id.to_string())
         .bind("unit", keyset.unit.to_string())
         .bind("active", keyset.active)
-        .bind("valid_from", keyset.valid_from as i64)
-        .bind("valid_to", keyset.final_expiry.map(|v| v as i64))
+        .bind("valid_from", i64::try_from(keyset.valid_from)?)
+        .bind(
+            "valid_to",
+            keyset.final_expiry.map(i64::try_from).transpose()?,
+        )
         .bind("derivation_path", keyset.derivation_path.to_string())
         .bind("amounts", serde_json::to_string(&keyset.amounts).ok())
-        .bind("input_fee_ppk", keyset.input_fee_ppk as i64)
+        .bind("input_fee_ppk", i64::try_from(keyset.input_fee_ppk)?)
         .bind("derivation_path_index", keyset.derivation_path_index)
         .execute(&self.inner)
         .await?;
@@ -124,24 +127,27 @@ where
 
     async fn add_proof(&mut self, proof: AuthProof) -> Result<(), database::Error> {
         let y = proof.y()?;
-        if let Err(err) = query(
+        let rows_affected = query(
             r#"
                 INSERT INTO proof
                 (y, keyset_id, secret, c, state)
                 VALUES
                 (:y, :keyset_id, :secret, :c, :state)
+                ON CONFLICT(y) DO NOTHING
                 "#,
         )?
         .bind("y", y.to_bytes().to_vec())
         .bind("keyset_id", proof.keyset_id.to_string())
         .bind("secret", proof.secret.to_string())
         .bind("c", proof.c.to_bytes().to_vec())
-        .bind("state", "UNSPENT".to_string())
+        .bind("state", State::Spent.to_string())
         .execute(&self.inner)
-        .await
-        {
-            tracing::debug!("Attempting to add known proof. Skipping.... {:?}", err);
+        .await?;
+
+        if rows_affected != 1 {
+            return Err(database::Error::Duplicate);
         }
+
         Ok(())
     }
 
@@ -182,7 +188,7 @@ where
                    "#,
             )?
             .bind("blinded_message", message.to_bytes().to_vec())
-            .bind("amount", u64::from(signature.amount) as i64)
+            .bind("amount", i64::try_from(u64::from(signature.amount))?)
             .bind("keyset_id", signature.keyset_id.to_string())
             .bind("c", signature.c.to_bytes().to_vec())
             .execute(&self.inner)

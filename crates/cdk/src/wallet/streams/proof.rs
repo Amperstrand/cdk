@@ -119,7 +119,14 @@ impl Stream for MultipleMintQuoteProofStream<'_> {
                                 .mint(&mint_quote.id, amount_split_target, spending_conditions)
                                 .await
                                 .map(|proofs| (mint_quote, proofs)),
-                            _ => Err(Error::UnsupportedPaymentMethod),
+                            PaymentMethod::Known(cdk_common::nut00::KnownMethod::Onchain) => wallet
+                                .mint(&mint_quote.id, amount_split_target, spending_conditions)
+                                .await
+                                .map(|proofs| (mint_quote, proofs)),
+                            PaymentMethod::Custom(_) => wallet
+                                .mint(&mint_quote.id, amount_split_target, spending_conditions)
+                                .await
+                                .map(|proofs| (mint_quote, proofs)),
                         }
                     });
 

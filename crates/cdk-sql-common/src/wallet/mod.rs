@@ -13,7 +13,7 @@ use cdk_common::nuts::{MeltQuoteState, MintQuoteState};
 use cdk_common::secret::Secret;
 use cdk_common::util::unix_time;
 use cdk_common::wallet::{
-    self, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
+    self, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId, TransactionStatus,
 };
 use cdk_common::{
     database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PaymentMethod, Proof,
@@ -168,6 +168,8 @@ where
                   expiry,
                   payment_proof,
                   payment_method,
+                  estimated_blocks,
+                  fee_index,
                   used_by_operation,
                   version,
                   mint_url
@@ -345,6 +347,8 @@ where
                 payment_method,
                 amount_issued,
                 amount_paid,
+                updated_at,
+                estimated_blocks,
                 used_by_operation,
                 version
             FROM
@@ -381,6 +385,8 @@ where
                 payment_method,
                 amount_issued,
                 amount_paid,
+                updated_at,
+                estimated_blocks,
                 used_by_operation,
                 version
             FROM
@@ -415,6 +421,8 @@ where
                 payment_method,
                 amount_issued,
                 amount_paid,
+                updated_at,
+                estimated_blocks,
                 used_by_operation,
                 version
             FROM
@@ -454,6 +462,8 @@ where
                 expiry,
                 payment_proof,
                 payment_method,
+                estimated_blocks,
+                fee_index,
                 used_by_operation,
                 version,
                 mint_url
@@ -526,6 +536,7 @@ where
                 spending_condition,
                 used_by_operation,
                 created_by_operation,
+                derivation_index,
                 p2pk_e
             FROM proof
             "#,
@@ -573,6 +584,7 @@ where
                 spending_condition,
                 used_by_operation,
                 created_by_operation,
+                derivation_index,
                 p2pk_e
             FROM proof
             WHERE y IN (:ys)
@@ -598,7 +610,8 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        let mut query_str = "SELECT COALESCE(SUM(amount), 0) as total FROM proof".to_string();
+        let mut query_str =
+            "SELECT CAST(COALESCE(SUM(amount), 0) AS BIGINT) as total FROM proof".to_string();
         let mut where_clauses = Vec::new();
         let states = states
             .unwrap_or_default()
@@ -640,8 +653,7 @@ where
             .map(|n| {
                 // SQLite SUM returns INTEGER which we need to convert to u64
                 match n {
-                    crate::stmt::Column::Integer(i) => Ok(i as u64),
-                    crate::stmt::Column::Real(f) => Ok(f as u64),
+                    crate::stmt::Column::Integer(i) => Ok(u64::try_from(i)?),
                     _ => Err(Error::Database(Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "Invalid balance type",
@@ -680,7 +692,8 @@ where
                 payment_request,
                 payment_proof,
                 payment_method,
-                saga_id
+                saga_id,
+                status
             FROM
                 transactions
             WHERE
@@ -723,7 +736,8 @@ where
                 payment_request,
                 payment_proof,
                 payment_method,
-                saga_id
+                saga_id,
+                status
             FROM
                 transactions
             "#,
@@ -759,9 +773,9 @@ where
             query(
                 r#"
     INSERT INTO proof
-    (y, mint_url, state, spending_condition, unit, amount, keyset_id, secret, c, witness, dleq_e, dleq_s, dleq_r, used_by_operation, created_by_operation, p2pk_e)
+    (y, mint_url, state, spending_condition, unit, amount, keyset_id, secret, c, witness, dleq_e, dleq_s, dleq_r, used_by_operation, created_by_operation, derivation_index, p2pk_e)
     VALUES
-    (:y, :mint_url, :state, :spending_condition, :unit, :amount, :keyset_id, :secret, :c, :witness, :dleq_e, :dleq_s, :dleq_r, :used_by_operation, :created_by_operation, :p2pk_e)
+    (:y, :mint_url, :state, :spending_condition, :unit, :amount, :keyset_id, :secret, :c, :witness, :dleq_e, :dleq_s, :dleq_r, :used_by_operation, :created_by_operation, :derivation_index, :p2pk_e)
     ON CONFLICT(y) DO UPDATE SET
         mint_url = excluded.mint_url,
         state = excluded.state,
@@ -777,6 +791,7 @@ where
         dleq_r = excluded.dleq_r,
         used_by_operation = excluded.used_by_operation,
         created_by_operation = excluded.created_by_operation,
+        derivation_index = COALESCE(excluded.derivation_index, proof.derivation_index),
         p2pk_e = excluded.p2pk_e
     ;
             "#,
@@ -791,7 +806,7 @@ where
                     .map(|s| serde_json::to_string(&s).ok()),
             )
             .bind("unit", proof.unit.to_string())
-            .bind("amount", u64::from(proof.proof.amount) as i64)
+            .bind("amount", i64::try_from(u64::from(proof.proof.amount))?)
             .bind("keyset_id", proof.proof.keyset_id.to_string())
             .bind("secret", proof.proof.secret.to_string())
             .bind("c", proof.proof.c.to_bytes().to_vec())
@@ -816,6 +831,7 @@ where
             )
             .bind("used_by_operation", proof.used_by_operation.map(|id| id.to_string()))
             .bind("created_by_operation", proof.created_by_operation.map(|id| id.to_string()))
+            .bind("derivation_index", proof.derivation_index.map(i64::from))
             .bind(
                 "p2pk_e",
                 proof
@@ -864,7 +880,16 @@ where
         Ok(())
     }
 
-    #[instrument(skip(self))]
+    #[instrument(
+        skip(self, transaction),
+        fields(
+            direction = %transaction.direction,
+            amount = %transaction.amount,
+            unit = %transaction.unit,
+            quote_id = ?transaction.quote_id,
+            saga_id = ?transaction.saga_id,
+        )
+    )]
     async fn add_transaction(&self, transaction: Transaction) -> Result<(), database::Error> {
         let conn = self
             .pool
@@ -875,8 +900,8 @@ where
         let mint_url = transaction.mint_url.to_string();
         let direction = transaction.direction.to_string();
         let unit = transaction.unit.to_string();
-        let amount = u64::from(transaction.amount) as i64;
-        let fee = u64::from(transaction.fee) as i64;
+        let amount = i64::try_from(u64::from(transaction.amount))?;
+        let fee = i64::try_from(u64::from(transaction.fee))?;
         let ys = transaction
             .ys
             .iter()
@@ -888,9 +913,9 @@ where
         query(
                r#"
    INSERT INTO transactions
-   (id, mint_url, direction, unit, amount, fee, ys, timestamp, memo, metadata, quote_id, payment_request, payment_proof, payment_method, saga_id)
+   (id, mint_url, direction, unit, amount, fee, ys, timestamp, memo, metadata, quote_id, payment_request, payment_proof, payment_method, saga_id, status)
    VALUES
-   (:id, :mint_url, :direction, :unit, :amount, :fee, :ys, :timestamp, :memo, :metadata, :quote_id, :payment_request, :payment_proof, :payment_method, :saga_id)
+   (:id, :mint_url, :direction, :unit, :amount, :fee, :ys, :timestamp, :memo, :metadata, :quote_id, :payment_request, :payment_proof, :payment_method, :saga_id, :status)
    ON CONFLICT(id) DO UPDATE SET
        mint_url = excluded.mint_url,
        direction = excluded.direction,
@@ -904,7 +929,8 @@ where
        payment_request = excluded.payment_request,
        payment_proof = excluded.payment_proof,
        payment_method = excluded.payment_method,
-       saga_id = excluded.saga_id
+       saga_id = excluded.saga_id,
+       status = excluded.status
    ;
            "#,
            )?
@@ -915,7 +941,7 @@ where
            .bind("amount", amount)
            .bind("fee", fee)
            .bind("ys", ys)
-           .bind("timestamp", transaction.timestamp as i64)
+           .bind("timestamp", i64::try_from(transaction.timestamp)?)
            .bind("memo", transaction.memo)
            .bind(
                "metadata",
@@ -926,6 +952,7 @@ where
            .bind("payment_proof", transaction.payment_proof)
            .bind("payment_method", transaction.payment_method.map(|pm| pm.to_string()))
            .bind("saga_id", transaction.saga_id.map(|id| id.to_string()))
+           .bind("status", transaction.status.to_string())
            .execute(&*conn)
            .await?;
 
@@ -997,6 +1024,38 @@ where
         Ok(new_counter)
     }
 
+    #[instrument(skip(self))]
+    async fn increment_derivation_counter(
+        &self,
+        namespace: &str,
+        count: u32,
+    ) -> Result<u32, database::Error> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+
+        let new_counter = query(
+            r#"
+            INSERT INTO derivation_counter (namespace, counter)
+            VALUES (:namespace, :count)
+            ON CONFLICT(namespace) DO UPDATE SET
+                counter = derivation_counter.counter + :count
+            RETURNING counter
+            "#,
+        )?
+        .bind("namespace", namespace.to_owned())
+        .bind("count", count)
+        .pluck(&*conn)
+        .await?
+        .map(|n| Ok::<_, Error>(column_as_number!(n)))
+        .transpose()?
+        .ok_or_else(|| Error::Internal("Derivation counter update returned no value".to_owned()))?;
+
+        Ok(new_counter)
+    }
+
     #[instrument(skip(self, mint_info))]
     async fn add_mint(
         &self,
@@ -1037,6 +1096,8 @@ where
                     motd,
                     time,
                     tos_url,
+                    // Not persisted: a runtime hint the mint recomputes, refreshed with /v1/info.
+                    max_array_length: _,
                 } = mint_info;
 
                 (
@@ -1098,7 +1159,7 @@ where
         .bind("icon_url", icon_url)
         .bind("urls", urls)
         .bind("motd", motd)
-        .bind("mint_time", time.map(|v| v as i64))
+        .bind("mint_time", time.map(i64::try_from).transpose()?)
         .bind("tos_url", tos_url)
         .execute(&*conn)
         .await?;
@@ -1151,8 +1212,11 @@ where
             .bind("id", keyset.id.to_string())
             .bind("unit", keyset.unit.to_string())
             .bind("active", keyset.active)
-            .bind("input_fee_ppk", keyset.input_fee_ppk as i64)
-            .bind("final_expiry", keyset.final_expiry.map(|v| v as i64))
+            .bind("input_fee_ppk", i64::try_from(keyset.input_fee_ppk)?)
+            .bind(
+                "final_expiry",
+                keyset.final_expiry.map(i64::try_from).transpose()?,
+            )
             .bind("keyset_u32", u32::from(keyset.id))
             .execute(&tx)
             .await?;
@@ -1177,9 +1241,9 @@ where
         let rows_affected = query(
                 r#"
     INSERT INTO mint_quote
-    (id, mint_url, amount, unit, request, state, expiry, secret_key, payment_method, amount_issued, amount_paid, version, used_by_operation)
+    (id, mint_url, amount, unit, request, state, expiry, secret_key, payment_method, amount_issued, amount_paid, updated_at, estimated_blocks, version, used_by_operation)
     VALUES
-    (:id, :mint_url, :amount, :unit, :request, :state, :expiry, :secret_key, :payment_method, :amount_issued, :amount_paid, :version, :used_by_operation)
+    (:id, :mint_url, :amount, :unit, :request, :state, :expiry, :secret_key, :payment_method, :amount_issued, :amount_paid, :updated_at, :estimated_blocks, :version, :used_by_operation)
     ON CONFLICT(id) DO UPDATE SET
         mint_url = excluded.mint_url,
         amount = excluded.amount,
@@ -1191,6 +1255,8 @@ where
         payment_method = excluded.payment_method,
         amount_issued = excluded.amount_issued,
         amount_paid = excluded.amount_paid,
+        updated_at = excluded.updated_at,
+        estimated_blocks = excluded.estimated_blocks,
         version = :new_version,
         used_by_operation = excluded.used_by_operation
     WHERE mint_quote.version = :expected_version
@@ -1199,18 +1265,23 @@ where
             )?
             .bind("id", quote.id.to_string())
             .bind("mint_url", quote.mint_url.to_string())
-            .bind("amount", quote.amount.map(|a| a.to_i64()))
+            .bind("amount", quote.amount.map(|a| i64::try_from(a.to_u64())).transpose()?)
             .bind("unit", quote.unit.to_string())
             .bind("request", quote.request)
             .bind("state", quote.state.to_string())
-            .bind("expiry", quote.expiry as i64)
-            .bind("secret_key", quote.secret_key.map(|p| p.to_string()))
+            .bind("expiry", i64::try_from(quote.expiry)?)
+            .bind(
+                "secret_key",
+                quote.secret_key.map(|key| key.to_secret_hex()),
+            )
             .bind("payment_method", quote.payment_method.to_string())
-            .bind("amount_issued", quote.amount_issued.to_i64())
-            .bind("amount_paid", quote.amount_paid.to_i64())
-            .bind("version", quote.version as i64)
-            .bind("new_version", new_version as i64)
-            .bind("expected_version", expected_version as i64)
+            .bind("amount_issued", i64::try_from(quote.amount_issued.to_u64())?)
+            .bind("amount_paid", i64::try_from(quote.amount_paid.to_u64())?)
+            .bind("updated_at", i64::try_from(quote.updated_at)?)
+            .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
+            .bind("version", i64::from(quote.version))
+            .bind("new_version", i64::from(new_version))
+            .bind("expected_version", i64::from(expected_version))
             .bind("used_by_operation", quote.used_by_operation)
             .execute(&*conn).await?;
 
@@ -1251,9 +1322,9 @@ where
         let rows_affected = query(
             r#"
  INSERT INTO melt_quote
- (id, unit, amount, request, fee_reserve, state, expiry, payment_method, version, mint_url, used_by_operation)
+ (id, unit, amount, request, fee_reserve, state, expiry, payment_proof, payment_method, estimated_blocks, fee_index, version, mint_url, used_by_operation)
  VALUES
- (:id, :unit, :amount, :request, :fee_reserve, :state, :expiry, :payment_method, :version, :mint_url, :used_by_operation)
+ (:id, :unit, :amount, :request, :fee_reserve, :state, :expiry, :payment_proof, :payment_method, :estimated_blocks, :fee_index, :version, :mint_url, :used_by_operation)
  ON CONFLICT(id) DO UPDATE SET
      unit = excluded.unit,
      amount = excluded.amount,
@@ -1261,7 +1332,10 @@ where
      fee_reserve = excluded.fee_reserve,
      state = excluded.state,
      expiry = excluded.expiry,
+     payment_proof = COALESCE(excluded.payment_proof, melt_quote.payment_proof),
      payment_method = excluded.payment_method,
+     estimated_blocks = excluded.estimated_blocks,
+     fee_index = excluded.fee_index,
      version = :new_version,
      mint_url = excluded.mint_url,
      used_by_operation = excluded.used_by_operation
@@ -1271,15 +1345,18 @@ where
         )?
         .bind("id", quote.id.to_string())
         .bind("unit", quote.unit.to_string())
-        .bind("amount", u64::from(quote.amount) as i64)
+        .bind("amount", i64::try_from(u64::from(quote.amount))?)
         .bind("request", quote.request)
-        .bind("fee_reserve", u64::from(quote.fee_reserve) as i64)
+        .bind("fee_reserve", i64::try_from(u64::from(quote.fee_reserve))?)
         .bind("state", quote.state.to_string())
-        .bind("expiry", quote.expiry as i64)
+        .bind("expiry", i64::try_from(quote.expiry)?)
+        .bind("payment_proof", quote.payment_proof)
         .bind("payment_method", quote.payment_method.to_string())
-        .bind("version", quote.version as i64)
-        .bind("new_version", new_version as i64)
-        .bind("expected_version", expected_version as i64)
+        .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
+        .bind("fee_index", quote.fee_index.map(i64::from))
+        .bind("version", i64::from(quote.version))
+        .bind("new_version", i64::from(new_version))
+        .bind("expected_version", i64::from(expected_version))
         .bind("mint_url", quote.mint_url.map(|m| m.to_string()))
         .bind("used_by_operation", quote.used_by_operation)
         .execute(&*conn)
@@ -1406,14 +1483,14 @@ where
         .bind("id", saga.id.to_string())
         .bind("kind", saga.kind.to_string())
         .bind("state", state_json)
-        .bind("amount", u64::from(saga.amount) as i64)
+        .bind("amount", i64::try_from(u64::from(saga.amount))?)
         .bind("mint_url", saga.mint_url.to_string())
         .bind("unit", saga.unit.to_string())
         .bind("quote_id", saga.quote_id)
-        .bind("created_at", saga.created_at as i64)
-        .bind("updated_at", saga.updated_at as i64)
+        .bind("created_at", i64::try_from(saga.created_at)?)
+        .bind("updated_at", i64::try_from(saga.updated_at)?)
         .bind("data", data_json)
-        .bind("version", saga.version as i64)
+        .bind("version", i64::from(saga.version))
         .execute(&*conn)
         .await?;
 
@@ -1487,14 +1564,14 @@ where
         .bind("id", saga.id.to_string())
         .bind("kind", saga.kind.to_string())
         .bind("state", state_json)
-        .bind("amount", u64::from(saga.amount) as i64)
+        .bind("amount", i64::try_from(u64::from(saga.amount))?)
         .bind("mint_url", saga.mint_url.to_string())
         .bind("unit", saga.unit.to_string())
         .bind("quote_id", saga.quote_id)
-        .bind("updated_at", saga.updated_at as i64)
+        .bind("updated_at", i64::try_from(saga.updated_at)?)
         .bind("data", data_json)
-        .bind("new_version", saga.version as i64)
-        .bind("expected_version", expected_version as i64)
+        .bind("new_version", i64::from(saga.version))
+        .bind("expected_version", i64::from(expected_version))
         .execute(&*conn)
         .await?;
 
@@ -1551,23 +1628,33 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        for y in ys {
-            let rows_affected = query(
-                r#"
-                UPDATE proof
-                SET state = 'RESERVED', used_by_operation = :operation_id
-                WHERE y = :y AND state = 'UNSPENT'
-                "#,
-            )?
-            .bind("y", y.to_bytes().to_vec())
-            .bind("operation_id", operation_id.to_string())
-            .execute(&*conn)
-            .await?;
-
-            if rows_affected == 0 {
-                return Err(database::Error::ProofNotUnspent);
-            }
+        if ys.is_empty() {
+            return Ok(());
         }
+
+        let expected = ys.len();
+        let tx = ConnectionWithTransaction::new(conn).await?;
+
+        let rows_affected = query(
+            r#"
+            UPDATE proof
+            SET state = 'RESERVED', used_by_operation = :operation_id
+            WHERE y IN (:ys) AND state = 'UNSPENT'
+            "#,
+        )?
+        .bind_vec("ys", ys.iter().map(|y| y.to_bytes().to_vec()).collect())?
+        .bind("operation_id", operation_id.to_string())
+        .execute(&tx)
+        .await?;
+
+        // Reserving is all-or-nothing: a partial match must not leave some of
+        // the proofs reserved.
+        if rows_affected != expected {
+            tx.rollback().await?;
+            return Err(database::Error::ProofNotUnspent);
+        }
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -1585,6 +1672,7 @@ where
             UPDATE proof
             SET state = 'UNSPENT', used_by_operation = NULL
             WHERE used_by_operation = :operation_id
+              AND state IN ('RESERVED', 'PENDING')
             "#,
         )?
         .bind("operation_id", operation_id.to_string())
@@ -1623,6 +1711,7 @@ where
                 spending_condition,
                 used_by_operation,
                 created_by_operation,
+                derivation_index,
                 p2pk_e
             FROM proof
             WHERE used_by_operation = :operation_id
@@ -1847,7 +1936,7 @@ where
             .bind("pubkey", pubkey.to_bytes().to_vec())
             .bind("derivation_index", derivation_index)
             .bind("derivation_path", derivation_path.to_string())
-            .bind("created_time", unix_time() as i64)
+            .bind("created_time", i64::try_from(unix_time())?)
             .execute(&*conn)
             .await?;
 
@@ -1936,9 +2025,9 @@ fn sql_row_to_mint_info(row: Vec<Column>) -> Result<MintInfo, Error> {
 
     Ok(MintInfo {
         name: column_as_nullable_string!(&name),
-        pubkey: column_as_nullable_string!(&pubkey, |v| serde_json::from_str(v).ok(), |v| {
-            serde_json::from_slice(v).ok()
-        }),
+        pubkey: column_as_nullable_binary!(&pubkey)
+            .map(|bytes| cdk_common::nuts::PublicKey::from_slice(&bytes))
+            .transpose()?,
         version: column_as_nullable_string!(&version).and_then(|v| serde_json::from_str(&v).ok()),
         description: column_as_nullable_string!(description),
         description_long: column_as_nullable_string!(description_long),
@@ -1950,6 +2039,7 @@ fn sql_row_to_mint_info(row: Vec<Column>) -> Result<MintInfo, Error> {
         motd: column_as_nullable_string!(motd),
         time: column_as_nullable_number!(mint_time).map(|t| t),
         tos_url: column_as_nullable_string!(tos_url),
+        max_array_length: None,
     })
 }
 
@@ -1988,16 +2078,19 @@ fn sql_row_to_mint_quote(row: Vec<Column>) -> Result<MintQuote, Error> {
             row_method,
             row_amount_minted,
             row_amount_paid,
+            updated_at,
+            estimated_blocks,
             used_by_operation,
             version
         ) = row
     );
 
-    let amount: Option<i64> = column_as_nullable_number!(amount);
+    let amount: Option<u64> = column_as_nullable_number!(amount);
 
     let amount_paid: u64 = column_as_number!(row_amount_paid);
     let amount_minted: u64 = column_as_number!(row_amount_minted);
     let expiry_val: u64 = column_as_number!(expiry);
+    let updated_at: u64 = column_as_number!(updated_at);
     let version_val: u32 = column_as_number!(version);
     let payment_method =
         PaymentMethod::from_str(&column_as_string!(row_method)).map_err(Error::from)?;
@@ -2005,7 +2098,7 @@ fn sql_row_to_mint_quote(row: Vec<Column>) -> Result<MintQuote, Error> {
     Ok(MintQuote {
         id: column_as_string!(id),
         mint_url: column_as_string!(mint_url, MintUrl::from_str),
-        amount: amount.and_then(Amount::from_i64),
+        amount: amount.map(Amount::from),
         unit: column_as_string!(unit, CurrencyUnit::from_str),
         request: column_as_string!(request),
         state: column_as_string!(state, MintQuoteState::from_str),
@@ -2014,6 +2107,8 @@ fn sql_row_to_mint_quote(row: Vec<Column>) -> Result<MintQuote, Error> {
         payment_method,
         amount_issued: Amount::from(amount_minted),
         amount_paid: Amount::from(amount_paid),
+        updated_at,
+        estimated_blocks: column_as_nullable_number!(estimated_blocks),
         used_by_operation: column_as_nullable_string!(used_by_operation),
         version: version_val,
     })
@@ -2031,6 +2126,8 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<wallet::MeltQuote, Error> {
             expiry,
             payment_proof,
             row_method,
+            estimated_blocks,
+            fee_index,
             used_by_operation,
             version,
             mint_url
@@ -2055,6 +2152,8 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<wallet::MeltQuote, Error> {
         state: column_as_string!(state, MeltQuoteState::from_str),
         expiry: expiry_val,
         payment_proof: column_as_nullable_string!(payment_proof),
+        estimated_blocks: column_as_nullable_number!(estimated_blocks),
+        fee_index: column_as_nullable_number!(fee_index),
         payment_method,
         used_by_operation: column_as_nullable_string!(used_by_operation),
         version: version_val,
@@ -2079,6 +2178,7 @@ fn sql_row_to_proof_info(row: Vec<Column>) -> Result<ProofInfo, Error> {
             spending_condition,
             used_by_operation,
             created_by_operation,
+            derivation_index,
             p2pk_e
         ) = row
     );
@@ -2117,6 +2217,7 @@ fn sql_row_to_proof_info(row: Vec<Column>) -> Result<ProofInfo, Error> {
         column_as_nullable_string!(used_by_operation).and_then(|id| Uuid::from_str(&id).ok());
     let created_by_operation =
         column_as_nullable_string!(created_by_operation).and_then(|id| Uuid::from_str(&id).ok());
+    let derivation_index = column_as_nullable_number!(derivation_index);
 
     Ok(ProofInfo {
         proof,
@@ -2131,6 +2232,7 @@ fn sql_row_to_proof_info(row: Vec<Column>) -> Result<ProofInfo, Error> {
         unit: column_as_string!(unit, CurrencyUnit::from_str),
         used_by_operation,
         created_by_operation,
+        derivation_index,
     })
 }
 
@@ -2219,7 +2321,8 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
             payment_request,
             payment_proof,
             payment_method,
-            saga_id
+            saga_id,
+            status
         ) = row
     );
 
@@ -2254,6 +2357,7 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
             .transpose()
             .map_err(Error::from)?,
         saga_id,
+        status: column_as_string!(status, TransactionStatus::from_str),
     })
 }
 

@@ -11,15 +11,22 @@ use cdk::wallet::{BaseHttpClient, HttpTransport, SendOptions, WalletBuilder};
 use cdk::{Amount, StreamExt};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::{AuthToken, PaymentMethod};
+use cdk_http_client::{HttpError, RawResponse};
 use cdk_sqlite::wallet::memory;
 use rand::random;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 use ureq::config::Config;
 use ureq::Agent;
 use url::Url;
 
+/// A minimal `HttpTransport` built on `ureq`, wired into a wallet below.
+///
+/// `max_redirects(0)` is the one setting a transport cannot leave at its
+/// default: ureq otherwise follows up to ten redirects and replays a POST as a
+/// bodyless GET on 301/302/303, so a receiver's redirect would report a NUT-18
+/// delivery that never carried the proofs. At zero, the 3xx comes back as a
+/// status the caller can classify.
 #[derive(Debug, Clone)]
 struct CustomHttp {
     agent: Agent,
@@ -32,6 +39,7 @@ impl Default for CustomHttp {
                 Config::builder()
                     .timeout_global(Some(Duration::from_secs(5)))
                     .no_delay(true)
+                    .max_redirects(0)
                     .user_agent("Custom HTTP Transport")
                     .build(),
             ),
@@ -42,50 +50,96 @@ impl Default for CustomHttp {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl HttpTransport for CustomHttp {
-    #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-    async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, Error> {
-        panic!("Not supported");
-    }
-
     fn with_proxy(
         &mut self,
         _proxy: Url,
         _host_matcher: Option<&str>,
         _accept_invalid_certs: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<(), HttpError> {
         panic!("Not supported");
     }
 
-    async fn http_get<R>(&self, url: Url, _auth: Option<AuthToken>) -> Result<R, Error>
-    where
-        R: DeserializeOwned,
-    {
-        self.agent
-            .get(url.as_str())
-            .call()
-            .map_err(|e| Error::HttpError(None, e.to_string()))?
-            .body_mut()
-            .read_json()
-            .map_err(|e| Error::HttpError(None, e.to_string()))
+    #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
+    async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, HttpError> {
+        panic!("Not supported");
     }
 
-    async fn http_post<P, R>(
+    async fn http_get(&self, url: Url, auth: Option<AuthToken>) -> Result<RawResponse, HttpError> {
+        let mut request = self.agent.get(url.as_str());
+
+        if let Some(auth) = auth {
+            request = request.header(auth.header_key(), auth.to_string());
+        }
+
+        let mut response = request
+            .call()
+            .map_err(|e| HttpError::Connection(e.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| HttpError::Connection(e.to_string()))?;
+
+        Ok(RawResponse::new(status, body))
+    }
+
+    async fn http_post<P>(
         &self,
         url: Url,
-        _auth_token: Option<AuthToken>,
+        auth_token: Option<AuthToken>,
         payload: &P,
-    ) -> Result<R, Error>
+    ) -> Result<RawResponse, HttpError>
     where
-        P: Serialize + ?Sized + Send + Sync,
-        R: DeserializeOwned,
+        P: Serialize + Send + Sync,
     {
-        self.agent
-            .post(url.as_str())
+        let mut request = self.agent.post(url.as_str());
+
+        if let Some(auth) = auth_token {
+            request = request.header(auth.header_key(), auth.to_string());
+        }
+
+        let mut response = request
             .send_json(payload)
-            .map_err(|e| Error::HttpError(None, e.to_string()))?
+            .map_err(|e| HttpError::Connection(e.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
             .body_mut()
-            .read_json()
-            .map_err(|e| Error::HttpError(None, e.to_string()))
+            .read_to_vec()
+            .map_err(|e| HttpError::Connection(e.to_string()))?;
+
+        Ok(RawResponse::new(status, body))
+    }
+
+    async fn http_post_form<P>(
+        &self,
+        url: Url,
+        auth_token: Option<AuthToken>,
+        payload: &P,
+    ) -> Result<RawResponse, HttpError>
+    where
+        P: Serialize + Send + Sync,
+    {
+        let encoded = serde_urlencoded::to_string(payload)
+            .map_err(|e| HttpError::Serialization(e.to_string()))?;
+        let mut request = self
+            .agent
+            .post(url.as_str())
+            .header("Content-Type", "application/x-www-form-urlencoded");
+
+        if let Some(auth) = auth_token {
+            request = request.header(auth.header_key(), auth.to_string());
+        }
+
+        let mut response = request
+            .send(&encoded)
+            .map_err(|e| HttpError::Connection(e.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| HttpError::Connection(e.to_string()))?;
+
+        Ok(RawResponse::new(status, body))
     }
 }
 
@@ -109,7 +163,7 @@ async fn main() -> Result<(), Error> {
     let seed = random::<[u8; 64]>();
 
     // Define the mint URL and currency unit
-    let mint_url = "https://fake.thesimplekid.dev";
+    let mint_url = "https://testnut.cashudevkit.org";
     let unit = CurrencyUnit::Sat;
     let amount = Amount::from(10);
 

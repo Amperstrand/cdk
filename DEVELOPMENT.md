@@ -115,10 +115,23 @@ To build the CDK mint server:
 cargo build --bin cdk-mintd --release
 ```
 
-To run cdk-mintd directly without building:
+For a first local run, initialize the database-backed configuration explicitly,
+then start the daemon. The example file references the mnemonic through an
+environment variable; it is a secret input, not a startup-time configuration
+override.
+
 ```bash
+export CDK_MINTD_MNEMONIC="your stable BIP39 mnemonic"
+cargo run --bin cdk-mintd -- config validate --file crates/cdk-mintd/example.config.toml
+cargo run --bin cdk-mintd -- config init --new-mint --file crates/cdk-mintd/example.config.toml
 cargo run --bin cdk-mintd
 ```
+
+On later edits, use `config apply --file ...`, then restart. A running daemon
+keeps its current configuration snapshot until that restart.
+See the
+[`cdk-mintd` configuration guide](crates/cdk-mintd/README.md#configuration) for
+the full workflow.
 
 Note: For cdk-mintd, you need to have the protobuf compiler installed as it's required for some dependencies.
 
@@ -163,17 +176,74 @@ nix build .#cdk-mintd
 nix build .#checks.x86_64-linux.cashu
 ```
 
-### Static Binaries
+### Binary Cache
 
-CDK provides fully statically-linked Linux binaries built with [musl](https://musl.libc.org/). These binaries have zero runtime dependencies and run on any x86_64 Linux system.
+The flake advertises the CDK Attic cache as the primary project cache and the
+CDK Cachix cache as a fallback. On single-user Nix installations, or when the
+current user is trusted by the Nix daemon, accept the flake configuration when
+prompted or pass `--accept-flake-config` explicitly:
 
-**Available static build targets:**
+```bash
+nix build --accept-flake-config .#default
+```
+
+Multi-user Nix installations must configure the caches and signing keys at the
+daemon level. Add the following to `/etc/nix/nix.conf` and restart the Nix
+daemon:
+
+```ini
+extra-substituters = https://cache.cashudevkit.org https://cashudevkit.cachix.org
+extra-trusted-public-keys = cashudevkit:Ukc9ltM4674fDHWWay+q4vdHDYKF48QIm6A+0z5/FqQ= cashudevkit.cachix.org-1:zFKdvMiTllKWxIFNTjXgisZsOFufmaZXjWJNcmc8r+4=
+```
+
+On NixOS, use the corresponding system configuration:
+
+```nix
+{
+  nix.settings = {
+    extra-substituters = [
+      "https://cache.cashudevkit.org"
+      "https://cashudevkit.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "cashudevkit:Ukc9ltM4674fDHWWay+q4vdHDYKF48QIm6A+0z5/FqQ="
+      "cashudevkit.cachix.org-1:zFKdvMiTllKWxIFNTjXgisZsOFufmaZXjWJNcmc8r+4="
+    ];
+  };
+}
+```
+
+Publishing requires an Attic token with write access to the `cashudevkit`
+cache. Obtain the API endpoint and token from a project maintainer, configure
+the expected server alias locally, and run the cache warm-up recipe:
+
+```bash
+attic login cashudevkit-cache <attic-api-endpoint> <write-token>
+just attic-push
+```
+
+The recipe pushes the default package, reusable native and MSRV Crane
+dependency artifacts, and the integration-test archive and harness binaries.
+On Linux it also pushes the static-musl dependencies; that target is skipped
+automatically on macOS. Attic credentials are local publisher secrets and must
+not be committed to the repository.
+
+### Release Binaries
+
+CDK provides fully statically-linked Linux binaries built with [musl](https://musl.libc.org/). These binaries have zero runtime dependencies and run on Linux x86_64 and aarch64 systems.
+
+The release flow also builds macOS aarch64 binaries through the Darwin flake targets. These are optimized with the same `release-static` Cargo profile, but are not fully static because macOS system libraries are dynamically linked.
+
+**Available release build targets:**
 
 | Target | Binary | Features |
 | :--- | :--- | :--- |
-| `cdk-mintd-static` | `cdk-mintd-{version}-x86_64` | `postgres`, `prometheus`, `redis` |
-| `cdk-mintd-ldk-static` | `cdk-mintd-ldk-{version}-x86_64` | `ldk-node`, `postgres`, `prometheus`, `redis` |
-| `cdk-cli-static` | `cdk-cli-{version}-x86_64` | default |
+| `cdk-mintd-static` | `cdk-mintd-{version}-{arch}` | `postgres`, `prometheus`, `redis` |
+| `cdk-mintd-ldk-static` | `cdk-mintd-ldk-{version}-{arch}` | `ldk-node`, `postgres`, `prometheus`, `redis` |
+| `cdk-cli-static` | `cdk-cli-{version}-{arch}` | default |
+| `cdk-mintd-darwin` | `cdk-mintd-{version}-aarch64-apple-darwin` | `postgres`, `prometheus`, `redis` |
+| `cdk-mintd-ldk-darwin` | `cdk-mintd-ldk-{version}-aarch64-apple-darwin` | `ldk-node`, `postgres`, `prometheus`, `redis` |
+| `cdk-cli-darwin` | `cdk-cli-{version}-aarch64-apple-darwin` | default |
 
 **Building locally (requires Nix):**
 
@@ -195,7 +265,7 @@ Built binaries are placed in `./static-bin/`.
 
 When a GitHub release is published, the [`static-build-publish.yml`](.github/workflows/static-build-publish.yml) workflow automatically:
 
-1. Builds all three static binaries via Nix
+1. Builds the Linux static binaries and macOS aarch64 binaries via Nix
 2. Generates a `SHA256SUMS` file with checksums for each binary
 3. Uploads the binaries and checksums to the GitHub release
 
@@ -218,11 +288,26 @@ sha256sum ./result/bin/*
 # Compare against SHA256SUMS from the release
 ```
 
+### Cargo Profiles
+
+The workspace defines four profiles beyond `dev` and `release`:
+
+| Profile | Used by | Notes |
+|---|---|---|
+| `ci` | CI test builds | Inherits `dev`, LTO off, no incremental compilation. |
+| `release-smaller` | Size-sensitive binaries | `opt-level = "z"`, LTO, `panic = "abort"`. |
+| `release-static` | `static-build-publish.yml` | Thin LTO and `codegen-units = 1` for reproducibility, `panic = "abort"`. |
+| `release-ffi` | The four FFI binding releases | LTO and `codegen-units = 1`. Deliberately **not** `panic = "abort"`: UniFFI turns a Rust panic into a foreign exception through `catch_unwind`, and aborting would take the host app down instead. `strip = "debuginfo"` keeps the symbol table that `uniffi-bindgen` reads the component interface from; the release workflows strip fully after generating bindings. |
+
+`release-ffi` is the only profile the FFI binding releases use. The binding
+repositories contain no Rust crate, so it is also the only profile those
+libraries are ever built under.
+
 ### Nix Troubleshooting
 
 - **Updating Dependencies**: If you notice dependencies are out of date or a new tool has been added to the flake, run `nix flake update` to refresh the `flake.lock` file.
 - **Command Not Found**: Ensure you have entered the shell (e.g., `nix develop`). Some tools like `mprocs` or `bitcoind` are only available in the `regtest` shell.
-- **Binary Cache**: The flake advertises the `cashudevkit` Cachix cache to speed up local builds and shell setup. If your Nix installation does not accept flake-provided cache settings automatically, the project will still work, but dependencies may build locally and take longer.
+- **Binary Cache**: See [Binary Cache](#binary-cache) for consumer and publisher configuration. If Nix cannot use either project cache, the build still works but dependencies compile locally and take substantially longer.
 - **Cache Issues**: If you suspect the environment is not reflecting recent flake changes, you can force a re-evaluation with `nix flake check`.
 - **Persistent Data**: The local PostgreSQL instance stores data in the `.pg_data/` directory. If you want to reset your database completely, stop the database and delete this directory.
 
@@ -281,6 +366,32 @@ just build
 ```bash
 just test
 ```
+
+### Checking Mint RPC Compatibility
+
+[Buf](https://buf.build/docs/) is included in the Nix development shells. The root
+`buf.yaml` scopes checks to `crates/cdk-mint-rpc/src/proto`.
+
+```bash
+nix develop
+git fetch upstream
+just proto-build     # Compile schemas without generating Rust code
+just proto-breaking  # Check compatibility against upstream/main
+```
+
+`proto-breaking` compares the working tree, including uncommitted changes, with
+the local `upstream/main`. [Configure `upstream`](#first-time-setup) or select an
+existing branch, tag, or commit, for example `just proto-breaking origin/main`.
+
+In JJ workspaces, refresh the baseline with `jj git fetch --remote upstream`.
+The recipe reads Git refs from JJ's backing repository.
+
+The [`FILE` rules](https://buf.build/docs/breaking/rules/) check wire and
+generated-code compatibility. Compatible additions pass; breaking changes are
+reported and exit nonzero.
+
+Buf style lints are disabled. These checks are opt-in and are not part of
+`quick-check` or CI.
 
 ### Running Integration Tests
 ```bash

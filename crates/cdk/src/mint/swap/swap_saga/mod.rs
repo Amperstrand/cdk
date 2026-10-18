@@ -103,7 +103,7 @@ pub struct SwapSaga<'a, S> {
 
 impl<'a> SwapSaga<'a, Initial> {
     pub fn new(mint: &'a super::Mint, db: DynMintDatabase, pubsub: Arc<PubSubManager>) -> Self {
-        let operation_id = uuid::Uuid::new_v4();
+        let operation_id = uuid::Uuid::now_v7();
 
         Self {
             mint,
@@ -461,14 +461,6 @@ impl<S> SwapSaga<'_, S> {
 
         if compensations.is_empty() {
             return Ok(());
-        }
-
-        #[cfg(feature = "prometheus")]
-        {
-            use cdk_prometheus::METRICS;
-
-            self.mint.record_swap_failure("process_swap_request");
-            METRICS.dec_in_flight_requests("process_swap_request");
         }
 
         tracing::warn!("Running {} compensating actions", compensations.len());

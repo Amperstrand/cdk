@@ -1,346 +1,233 @@
-//! HTTP Transport trait with a default implementation
-use std::fmt::Debug;
-#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-use std::str::FromStr;
-#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-use std::sync::Arc;
+//! Transport re-exports for wallet mint connector.
 
-#[cfg(not(target_arch = "wasm32"))]
-use cdk_common::HttpClientBuilder;
-use cdk_common::{AuthToken, HttpClient};
-#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-use hickory_resolver::name_server::TokioConnectionProvider;
-#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-use hickory_resolver::Resolver;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use url::Url;
-
-use super::Error;
-use crate::error::ErrorResponse;
-
-/// Expected HTTP Transport
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-pub trait Transport: Default + Send + Sync + Debug + Clone {
-    #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-    /// DNS resolver to get a TXT record from a domain name
-    async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, Error>;
-
-    /// Make the transport to use a given proxy
-    fn with_proxy(
-        &mut self,
-        proxy: url::Url,
-        host_matcher: Option<&str>,
-        accept_invalid_certs: bool,
-    ) -> Result<(), super::Error>;
-
-    /// HTTP Get request
-    async fn http_get<R>(
-        &self,
-        url: url::Url,
-        auth: Option<cdk_common::AuthToken>,
-    ) -> Result<R, super::Error>
-    where
-        R: serde::de::DeserializeOwned;
-
-    /// HTTP Post request
-    async fn http_post<P, R>(
-        &self,
-        url: url::Url,
-        auth_token: Option<cdk_common::AuthToken>,
-        payload: &P,
-    ) -> Result<R, super::Error>
-    where
-        P: serde::Serialize + ?Sized + Send + Sync,
-        R: serde::de::DeserializeOwned;
-}
-
-/// Async transport for Http
-#[derive(Debug, Clone)]
-pub struct Async {
-    inner: HttpClient,
-    #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-    resolver: Arc<Resolver<TokioConnectionProvider>>,
-}
-
-impl Default for Async {
-    fn default() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-
-        Self {
-            inner: HttpClient::new(),
-            #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-            resolver: Arc::new(default_resolver()),
-        }
-    }
-}
-
-#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-fn default_resolver() -> Resolver<TokioConnectionProvider> {
-    let mut resolver_opts = ResolverOpts::default();
-    resolver_opts.validate = true;
-
-    Resolver::builder_with_config(
-        ResolverConfig::default(),
-        TokioConnectionProvider::default(),
-    )
-    .with_options(resolver_opts)
-    .build()
-}
-
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-impl Transport for Async {
-    #[cfg(target_arch = "wasm32")]
-    fn with_proxy(
-        &mut self,
-        _proxy: Url,
-        _host_matcher: Option<&str>,
-        _accept_invalid_certs: bool,
-    ) -> Result<(), Error> {
-        panic!("Not supported in wasm");
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn with_proxy(
-        &mut self,
-        proxy: Url,
-        host_matcher: Option<&str>,
-        accept_invalid_certs: bool,
-    ) -> Result<(), Error> {
-        let builder =
-            HttpClientBuilder::default().danger_accept_invalid_certs(accept_invalid_certs);
-
-        let builder = match host_matcher {
-            Some(pattern) => {
-                // When a matcher is provided, only apply the proxy to matched hosts
-                builder
-                    .proxy_with_matcher(proxy, pattern)
-                    .map_err(|e| Error::Custom(e.to_string()))?
-            }
-            // Apply proxy to all requests when no matcher is provided
-            None => builder.proxy(proxy),
-        };
-
-        self.inner = builder
-            .build()
-            .map_err(|e| Error::HttpError(None, e.to_string()))?;
-        Ok(())
-    }
-
-    /// DNS resolver to get a TXT record from a domain name
-    #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-    async fn resolve_dns_txt(&self, domain: &str) -> Result<Vec<String>, Error> {
-        let name = hickory_resolver::Name::from_str(domain)
-            .map_err(|e| Error::Custom(format!("Invalid domain name: {}", e)))?;
-
-        Ok(self
-            .resolver
-            .txt_lookup(name)
-            .await
-            .map_err(|e| Error::Custom(e.to_string()))?
-            .into_iter()
-            .map(|txt| {
-                txt.txt_data()
-                    .iter()
-                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect::<Vec<_>>())
-    }
-
-    async fn http_get<R>(&self, url: Url, auth: Option<AuthToken>) -> Result<R, Error>
-    where
-        R: DeserializeOwned,
-    {
-        let url_str = url.to_string();
-        let mut request = self.inner.get(&url_str);
-
-        if let Some(auth) = auth {
-            request = request.header(auth.header_key(), auth.to_string());
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::HttpError(None, e.to_string()))?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::HttpError(None, e.to_string()))?;
-
-        if !(200..300).contains(&status) {
-            // Attempt to strictly parse as a Cashu ErrorResponse (requires the 'code' field).
-            // This avoids laundering generic errors into ErrorCode::Unknown(999).
-            if let Ok(err_resp) = serde_json::from_str::<ErrorResponse>(&body) {
-                return Err(err_resp.into());
-            }
-            return Err(Error::HttpError(Some(status), body));
-        }
-
-        serde_json::from_str::<R>(&body).map_err(|err| {
-            tracing::warn!("Http Response error: {}", err);
-            match ErrorResponse::from_json(&body) {
-                Ok(ok) => <ErrorResponse as Into<Error>>::into(ok),
-                Err(err) => err.into(),
-            }
-        })
-    }
-
-    async fn http_post<P, R>(
-        &self,
-        url: Url,
-        auth_token: Option<AuthToken>,
-        payload: &P,
-    ) -> Result<R, Error>
-    where
-        P: Serialize + ?Sized + Send + Sync,
-        R: DeserializeOwned,
-    {
-        let url_str = url.to_string();
-        let mut request = self.inner.post(&url_str).json(&payload);
-
-        if let Some(auth) = auth_token {
-            request = request.header(auth.header_key(), auth.to_string());
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::HttpError(None, e.to_string()))?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| Error::HttpError(None, e.to_string()))?;
-
-        if !(200..300).contains(&status) {
-            // Attempt to strictly parse as a Cashu ErrorResponse (requires the 'code' field).
-            // This avoids laundering generic errors into ErrorCode::Unknown(999).
-            if let Ok(err_resp) = serde_json::from_str::<ErrorResponse>(&body) {
-                return Err(err_resp.into());
-            }
-            return Err(Error::HttpError(Some(status), body));
-        }
-
-        serde_json::from_str::<R>(&body).map_err(|err| {
-            tracing::warn!("Http Response error: {}", err);
-            match ErrorResponse::from_json(&body) {
-                Ok(ok) => <ErrorResponse as Into<Error>>::into(ok),
-                Err(err) => err.into(),
-            }
-        })
-    }
-}
-
+// The rate limiter lives in cdk-common so the logic is shared; re-export it here
+// to keep the wallet's transport path stable.
+pub use cdk_common::rate_limit::{
+    RateLimitConfig, RateLimitedTransport, RateLimiterManager, TokenBucket,
+};
 #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
-pub mod tor_transport;
+pub use cdk_http_client::TorAsync;
+pub use cdk_http_client::{Async, Transport};
 
+// The persistence round-trip test lives here rather than in cdk-common: it needs
+// a concrete `WalletDatabase`, and the in-memory one is in `cdk-sqlite`, which
+// depends on `cdk-common` (so testing it there would be a dependency cycle).
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+mod persistence_tests {
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use super::*;
+    use cdk_common::database;
+    use url::Url;
 
-    /// Spawn a one-shot HTTP server that replies with the given status line and
-    /// body to the first request it receives. Returns the URL to connect to.
-    async fn spawn_canned_response(status_line: &'static str, body: &'static str) -> Url {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
+    use super::{RateLimitConfig, RateLimiterManager, TokenBucket};
+    use crate::cdk_database::WalletDatabase;
 
-        let response = format!(
-            "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
+    fn config(capacity: u32, refill_per_minute: u32) -> RateLimitConfig {
+        RateLimitConfig::new(
+            NonZeroU32::new(capacity).unwrap_or(NonZeroU32::MIN),
+            NonZeroU32::new(refill_per_minute).unwrap_or(NonZeroU32::MIN),
+        )
+    }
+
+    fn parse(url: &str) -> Url {
+        Url::parse(url).expect("valid url")
+    }
+
+    async fn store() -> Arc<dyn WalletDatabase<database::Error> + Send + Sync> {
+        Arc::new(
+            cdk_sqlite::wallet::memory::empty()
+                .await
+                .expect("in-memory wallet database"),
+        )
+    }
+
+    #[tokio::test]
+    async fn manager_shares_one_bucket_per_origin() {
+        // capacity 2 so two try_acquires exhaust one origin's shared burst.
+        let manager = RateLimiterManager::new(config(2, 300), Some(store().await));
+
+        // Same host, different port spelling and different path: one bucket.
+        let a = manager.bucket_for(&parse("https://mint.example.com/v1/keys"));
+        let b = manager.bucket_for(&parse("https://mint.example.com:443/v1/swap"));
+
+        assert!(a.try_acquire().await);
+        assert!(b.try_acquire().await);
+        // The shared burst of 2 is now spent across both handles.
+        assert!(!a.try_acquire().await, "shared origin budget is drained");
+        assert!(!b.try_acquire().await, "shared origin budget is drained");
+
+        // A different origin keeps its own budget.
+        let other = manager.bucket_for(&parse("https://other.example.com"));
+        assert!(other.try_acquire().await, "distinct origin is independent");
+    }
+
+    #[tokio::test]
+    async fn manager_evicts_recovered_unreferenced_bucket() {
+        let manager = RateLimiterManager::new(config(5, 300), Some(store().await));
+
+        // A fresh bucket is fully recovered. Dropping the handle leaves the map
+        // as its only holder.
+        drop(manager.bucket_for(&parse("https://a.example.com")));
+        assert_eq!(manager.origin_count(), 1);
+
+        // Creating a bucket for a different origin sweeps the recovered,
+        // unreferenced A out, so only B remains.
+        let _b = manager.bucket_for(&parse("https://b.example.com"));
+        assert_eq!(manager.origin_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn manager_retains_referenced_bucket() {
+        let manager = RateLimiterManager::new(config(5, 300), Some(store().await));
+
+        // Hold a live clone of A: even though A is fully recovered, a live
+        // holder must keep it so co-active callers never split budgets.
+        let _held = manager.bucket_for(&parse("https://a.example.com"));
+
+        let _b = manager.bucket_for(&parse("https://b.example.com"));
+        assert_eq!(manager.origin_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn manager_retains_unrecovered_bucket() {
+        let manager = RateLimiterManager::new(config(5, 300), Some(store().await));
+
+        // Drain A past its burst so it carries debt, then drop the handle: it is
+        // unreferenced but not yet recovered, so it must be kept.
+        let bucket_a = manager.bucket_for(&parse("https://a.example.com"));
+        for _ in 0..5 {
+            bucket_a.try_acquire().await;
+        }
+        drop(bucket_a);
+
+        let _b = manager.bucket_for(&parse("https://b.example.com"));
+        assert_eq!(manager.origin_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn shared_bucket_survives_concurrent_writers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = store().await;
+        let url = parse("https://concurrent.example.com/v1/info");
+        // capacity 5, emission ~200ms so the inherited budget paces measurably.
+        let cfg = config(5, 300);
+        let manager = RateLimiterManager::new(cfg, Some(store.clone()));
+
+        // Two handles to the same origin, as two currency-unit wallets hold.
+        let a = manager.bucket_for(&url);
+        let b = manager.bucket_for(&url);
+
+        // Hammer both handles concurrently. They share one budget and one
+        // writer, so the combined burst is exactly `capacity`, never twice it,
+        // no matter how the four tasks interleave.
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for bucket in [a.clone(), b.clone(), a.clone(), b.clone()] {
+            let admitted = admitted.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..10 {
+                    if bucket.try_acquire().await {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            5,
+            "concurrent handles share one burst, not one each"
         );
 
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let _ = socket.read(&mut buf).await;
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
+        // The single writer persists the drained budget; a fresh manager over
+        // the same store inherits it (does not reset to full), proving no
+        // concurrent writer overwrote it back to a staler value.
+        a.flush().await;
+        drop((a, b, manager));
 
-        Url::parse(&format!("http://{}/", addr)).expect("valid url")
+        let fresh = RateLimiterManager::new(cfg, Some(store)).bucket_for(&url);
+        let start = Instant::now();
+        fresh.acquire(async {}).await;
+        fresh.acquire(async {}).await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "inherited budget should pace, took {:?}",
+            start.elapsed()
+        );
     }
 
-    /// Regression test for https://github.com/cashubtc/cdk/issues/1914
-    ///
-    /// A 429 response with a body that does not match the Cashu ErrorResponse
-    /// schema (e.g. nutshell's `{"detail":"Rate limit exceeded."}`) must surface
-    /// as `Error::HttpError(Some(429), body)` instead of being laundered into
-    /// `ErrorCode::Unknown(999)` by `ErrorResponse::from_value`.
+    /// One barrier covers every origin the manager paces, not just the one the
+    /// caller happens to hold. Capacity 2 and emission ~200ms keep the pace
+    /// signal clear of scheduler noise.
     #[tokio::test]
-    async fn http_post_surfaces_429_status() {
-        let url = spawn_canned_response(
-            "HTTP/1.1 429 Too Many Requests",
-            r#"{"detail":"Rate limit exceeded."}"#,
-        )
-        .await;
+    async fn manager_flush_covers_every_origin() {
+        let store = store().await;
+        let cfg = config(2, 300);
+        let urls = [
+            parse("https://a.example.com/v1/info"),
+            parse("https://b.example.com/v1/info"),
+        ];
 
-        let transport = Async::default();
-        let result: Result<serde_json::Value, Error> =
-            transport.http_post(url, None, &serde_json::json!({})).await;
+        let first = RateLimiterManager::new(cfg, Some(store.clone()));
+        for url in &urls {
+            let bucket = first.bucket_for(url);
+            bucket.acquire(async {}).await;
+            bucket.acquire(async {}).await;
+        }
+        first.flush().await;
+        drop(first);
 
-        match result {
-            Err(Error::HttpError(Some(429), body)) => {
-                assert!(
-                    body.contains("Rate limit exceeded"),
-                    "body should be preserved, got: {body}"
-                );
-            }
-            other => panic!("expected HttpError(Some(429), _), got {other:?}"),
+        let second = RateLimiterManager::new(cfg, Some(store));
+        for url in &urls {
+            let bucket = second.bucket_for(url);
+            let start = Instant::now();
+            bucket.acquire(async {}).await;
+            bucket.acquire(async {}).await;
+            assert!(
+                start.elapsed() >= Duration::from_millis(150),
+                "{url} should inherit its drained budget, took {:?}",
+                start.elapsed()
+            );
         }
     }
 
     #[tokio::test]
-    async fn http_get_surfaces_429_status() {
-        let url = spawn_canned_response(
-            "HTTP/1.1 429 Too Many Requests",
-            r#"{"detail":"Rate limit exceeded."}"#,
-        )
-        .await;
+    async fn budget_persists_across_instances() {
+        let store = store().await;
+        // A path the mint would never use, to show the budget follows the host.
+        let url = parse("https://persist.example.com/.well-known/lnurlp/alice");
+        // capacity 2, emission ~200ms so the pace signal clears scheduler noise.
+        let cfg = config(2, 300);
 
-        let transport = Async::default();
-        let result: Result<serde_json::Value, Error> = transport.http_get(url, None).await;
+        // Drain the first bucket's burst, flush it to the store, then drop it.
+        let first = RateLimiterManager::new(cfg, Some(store.clone())).bucket_for(&url);
+        first.acquire(async {}).await;
+        first.acquire(async {}).await;
+        first.flush().await;
+        drop(first);
 
-        match result {
-            Err(Error::HttpError(Some(429), body)) => {
-                assert!(body.contains("Rate limit exceeded"));
-            }
-            other => panic!("expected HttpError(Some(429), _), got {other:?}"),
-        }
-    }
+        // A second bucket for the same host inherits the drained budget: it is
+        // at the burst edge, so two acquires take about one emission interval.
+        let second = RateLimiterManager::new(cfg, Some(store)).bucket_for(&url);
+        let start = Instant::now();
+        second.acquire(async {}).await;
+        second.acquire(async {}).await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "inherited bucket should pace, took {:?}",
+            start.elapsed()
+        );
 
-    #[tokio::test]
-    async fn http_post_surfaces_400_mint_error() {
-        let url = spawn_canned_response(
-            "HTTP/1.1 400 Bad Request",
-            r#"{"code": 1000, "detail": "Token already spent"}"#,
-        )
-        .await;
-
-        let transport = Async::default();
-        let result: Result<serde_json::Value, Error> =
-            transport.http_post(url, None, &serde_json::json!({})).await;
-
-        match result {
-            Err(Error::UnknownErrorResponse(msg)) if msg.contains("1000") => {}
-            other => panic!("expected Error::UnknownErrorResponse containing 1000, got {other:?}"),
-        }
+        // A fresh, non-persisted bucket bursts both immediately for contrast.
+        let fresh = TokenBucket::new(cfg);
+        let start = Instant::now();
+        fresh.acquire(async {}).await;
+        fresh.acquire(async {}).await;
+        assert!(start.elapsed() < Duration::from_millis(100));
     }
 }

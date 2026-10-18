@@ -9,17 +9,19 @@ use bitcoin::bip32::DerivationPath;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use cashu::amount::{FeeAndAmounts, KeysetFeeAndAmounts, SplitTarget};
 use cashu::nuts::nut07::ProofState;
-use cashu::nuts::nut18::PaymentRequest;
-use cashu::nuts::{AuthProof, Keys};
+use cashu::nuts::AuthProof;
 use cashu::util::hex;
 use cashu::{nut00, PaymentMethod, Proof, Proofs, PublicKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::mint_quote::quote_state_from_amounts;
 use crate::mint_url::MintUrl;
 use crate::nuts::{
     CurrencyUnit, Id, MeltQuoteState, MintQuoteState, SecretKey, SpendingConditions, State,
 };
+#[cfg(feature = "http")]
+use crate::rate_limit::RateLimitConfig;
 use crate::{Amount, Error};
 
 pub mod saga;
@@ -53,7 +55,7 @@ impl WalletKey {
 }
 
 /// Proof info
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofInfo {
     /// Proof
     pub proof: Proof,
@@ -67,12 +69,32 @@ pub struct ProofInfo {
     pub spending_condition: Option<SpendingConditions>,
     /// Unit
     pub unit: CurrencyUnit,
+    /// NUT-13 derivation index for deterministic proofs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation_index: Option<u32>,
     /// Operation ID that is using/spending this proof
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_by_operation: Option<Uuid>,
     /// Operation ID that created this proof
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_operation: Option<Uuid>,
+}
+
+impl fmt::Debug for ProofInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProofInfo")
+            .field("amount", &self.proof.amount)
+            .field("keyset_id", &self.proof.keyset_id)
+            .field("proof", &"[REDACTED]")
+            .field("y", &self.y)
+            .field("mint_url", &self.mint_url)
+            .field("state", &self.state)
+            .field("spending_condition", &self.spending_condition)
+            .field("unit", &self.unit)
+            .field("used_by_operation", &self.used_by_operation)
+            .field("created_by_operation", &self.created_by_operation)
+            .finish()
+    }
 }
 
 impl ProofInfo {
@@ -94,6 +116,7 @@ impl ProofInfo {
             state,
             spending_condition,
             unit,
+            derivation_index: None,
             used_by_operation: None,
             created_by_operation: None,
         })
@@ -119,9 +142,16 @@ impl ProofInfo {
             state,
             spending_condition,
             unit,
+            derivation_index: None,
             used_by_operation,
             created_by_operation,
         })
+    }
+
+    /// Set the NUT-13 derivation index for this proof.
+    pub fn with_derivation_index(mut self, derivation_index: u32) -> Self {
+        self.derivation_index = Some(derivation_index);
+        self
     }
 
     /// Check if [`Proof`] matches conditions
@@ -178,7 +208,10 @@ pub struct MintQuote {
     pub mint_url: MintUrl,
     /// Payment method
     pub payment_method: PaymentMethod,
-    /// Amount of quote
+    /// Requested or fixed quote amount, when defined by the payment method.
+    ///
+    /// Variable-amount methods such as onchain leave this unset and track
+    /// funds through `amount_paid` and `amount_issued`.
     pub amount: Option<Amount>,
     /// Unit of quote
     pub unit: CurrencyUnit,
@@ -196,6 +229,11 @@ pub struct MintQuote {
     /// Amount paid to the mint for the quote
     #[serde(default)]
     pub amount_paid: Amount,
+    /// Unix timestamp indicating when the mint quote was last updated
+    #[serde(default)]
+    pub updated_at: u64,
+    /// Estimated confirmation target in blocks for onchain quotes
+    pub estimated_blocks: Option<u32>,
     /// Operation ID that has reserved this quote (for saga pattern)
     #[serde(default)]
     pub used_by_operation: Option<String>,
@@ -205,7 +243,7 @@ pub struct MintQuote {
 }
 
 /// Melt Quote Info
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeltQuote {
     /// Quote id
     pub id: String,
@@ -226,6 +264,12 @@ pub struct MeltQuote {
     /// Payment proof (e.g. Lightning preimage or onchain outpoint)
     #[serde(alias = "payment_preimage")]
     pub payment_proof: Option<String>,
+    /// Estimated confirmation target in blocks for onchain quotes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_blocks: Option<u32>,
+    /// Selected fee option index for onchain quotes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_index: Option<u32>,
     /// Payment method
     pub payment_method: PaymentMethod,
     /// Operation ID that has reserved this quote (for saga pattern)
@@ -234,6 +278,41 @@ pub struct MeltQuote {
     /// Version for optimistic locking
     #[serde(default)]
     pub version: u32,
+}
+
+impl fmt::Debug for MeltQuote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeltQuote")
+            .field("id", &self.id)
+            .field("mint_url", &self.mint_url)
+            .field("unit", &self.unit)
+            .field("amount", &self.amount)
+            .field("request", &self.request)
+            .field("fee_reserve", &self.fee_reserve)
+            .field("state", &self.state)
+            .field("expiry", &self.expiry)
+            .field(
+                "payment_proof",
+                &self.payment_proof.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("estimated_blocks", &self.estimated_blocks)
+            .field("fee_index", &self.fee_index)
+            .field("payment_method", &self.payment_method)
+            .field("used_by_operation", &self.used_by_operation)
+            .field("version", &self.version)
+            .finish()
+    }
+}
+
+/// Quotes and fee information for a maximum cross-mint Lightning transfer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossMintTransferQuote {
+    /// Quote used to receive the Lightning payment at the destination mint.
+    pub mint_quote: MintQuote,
+    /// Quote used to pay the destination invoice from the source mint.
+    pub melt_quote: MeltQuote,
+    /// Input fee for spending all currently unspent source proofs.
+    pub input_fee: Amount,
 }
 
 impl MintQuote {
@@ -261,6 +340,8 @@ impl MintQuote {
             secret_key,
             amount_issued: Amount::ZERO,
             amount_paid: Amount::ZERO,
+            updated_at: 0,
+            estimated_blocks: None,
             used_by_operation: None,
             version: 0,
         }
@@ -269,6 +350,16 @@ impl MintQuote {
     /// Calculate the total amount including any fees
     pub fn total_amount(&self) -> Amount {
         self.amount_paid
+    }
+
+    /// Derive quote state from the tracked payment and issuance counters.
+    pub fn state_from_amounts(&self) -> MintQuoteState {
+        quote_state_from_amounts(self.amount_paid, self.amount_issued).unwrap_or(self.state)
+    }
+
+    /// Update quote state from the tracked payment and issuance counters.
+    pub fn update_state_from_amounts(&mut self) {
+        self.state = self.state_from_amounts();
     }
 
     /// Check if the quote has expired
@@ -305,8 +396,68 @@ pub struct Restored {
     pub pending: Amount,
 }
 
+/// Options for [`crate::wallet::Wallet::restore_with_opts`].
+///
+/// Defaults match the NUT-13 spec recommendation
+/// (<https://github.com/cashubtc/nuts/blob/main/13.md#generate-blindedmessages>):
+/// a batch of 100 blinded messages and three consecutive empty batches to
+/// signal end-of-history. Callers that need more conservative pacing or
+/// different gap tolerance can override either field.
+#[derive(Debug, Clone)]
+pub struct NUT13Options {
+    /// Number of blinded messages to request per batch.
+    pub batch_size: u32,
+    /// Number of consecutive empty batches that terminate the scan.
+    pub max_gap: u32,
+}
+
+impl Default for NUT13Options {
+    fn default() -> Self {
+        Self {
+            batch_size: Self::DEFAULT_BATCH_SIZE,
+            max_gap: Self::DEFAULT_MAX_GAP,
+        }
+    }
+}
+
+impl NUT13Options {
+    /// NUT-13 default restore batch size.
+    pub const DEFAULT_BATCH_SIZE: u32 = 100;
+
+    /// NUT-13 default restore gap limit.
+    pub const DEFAULT_MAX_GAP: u32 = 3;
+
+    /// Create new NUT-13 restore options.
+    pub fn new(batch_size: u32, max_gap: u32) -> Result<Self, Error> {
+        let opts = Self {
+            batch_size,
+            max_gap,
+        };
+        opts.validate()?;
+        Ok(opts)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        if self.batch_size == 0 {
+            return Err(Error::InvalidNut13Options {
+                field: "batch_size",
+                reason: "must be greater than zero",
+            });
+        }
+
+        if self.max_gap == 0 {
+            return Err(Error::InvalidNut13Options {
+                field: "max_gap",
+                reason: "must be greater than zero",
+            });
+        }
+
+        Ok(())
+    }
+}
+
 /// Send options
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SendOptions {
     /// Memo
     pub memo: Option<SendMemo>,
@@ -324,6 +475,40 @@ pub struct SendOptions {
     pub metadata: HashMap<String, String>,
     /// Use P2BK (NUT-28)
     pub use_p2bk: bool,
+    /// Signing keys for P2PK-locked input proofs; auto-detected from the wallet keyring if omitted
+    pub p2pk_signing_keys: Vec<SecretKey>,
+    /// How P2PK-locked input proofs should be handled during send
+    pub p2pk_locked_proof_send_mode: P2PKLockedProofSendMode,
+}
+
+impl fmt::Debug for SendOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendOptions")
+            .field("memo", &self.memo)
+            .field("conditions", &self.conditions)
+            .field("amount_split_target", &self.amount_split_target)
+            .field("send_kind", &self.send_kind)
+            .field("include_fee", &self.include_fee)
+            .field("max_proofs", &self.max_proofs)
+            .field("metadata", &self.metadata)
+            .field("use_p2bk", &self.use_p2bk)
+            .field("p2pk_signing_keys", &"[redacted]")
+            .field(
+                "p2pk_locked_proof_send_mode",
+                &self.p2pk_locked_proof_send_mode,
+            )
+            .finish()
+    }
+}
+
+/// Send behavior for selected P2PK-locked input proofs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum P2PKLockedProofSendMode {
+    /// Swap locked proofs into fresh proofs before creating the token
+    #[default]
+    Swap,
+    /// Sign locked proofs and include them directly in the token
+    SignAndSend,
 }
 
 /// Send memo
@@ -346,7 +531,7 @@ impl SendMemo {
 }
 
 /// Receive options
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ReceiveOptions {
     /// Amount split target
     pub amount_split_target: SplitTarget,
@@ -356,6 +541,39 @@ pub struct ReceiveOptions {
     pub preimages: Vec<String>,
     /// Metadata
     pub metadata: HashMap<String, String>,
+}
+
+impl fmt::Debug for ReceiveOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReceiveOptions")
+            .field("amount_split_target", &self.amount_split_target)
+            .field("p2pk_signing_keys", &"[redacted]")
+            .field("preimages", &"[redacted]")
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+/// Melt prepare options
+#[derive(Clone, Default)]
+pub struct MeltPrepareOptions {
+    /// Signing keys for P2PK/HTLC-locked input proofs; keys known to the wallet
+    /// are merged in automatically
+    pub p2pk_signing_keys: Vec<SecretKey>,
+    /// Preimages for HTLC-locked input proofs
+    pub preimages: Vec<String>,
+    /// Metadata
+    pub metadata: HashMap<String, String>,
+}
+
+impl fmt::Debug for MeltPrepareOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeltPrepareOptions")
+            .field("p2pk_signing_keys", &"[redacted]")
+            .field("preimages", &"[redacted]")
+            .field("metadata", &self.metadata)
+            .finish()
+    }
 }
 
 /// Send Kind
@@ -395,7 +613,7 @@ impl SendKind {
 }
 
 /// Wallet Transaction
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transaction {
     /// Mint Url
     pub mint_url: MintUrl,
@@ -428,12 +646,50 @@ pub struct Transaction {
     /// Saga ID if this transaction was part of a saga
     #[serde(default)]
     pub saga_id: Option<Uuid>,
+    /// Transaction status
+    #[serde(default)]
+    pub status: TransactionStatus,
+}
+
+impl fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Transaction")
+            .field("mint_url", &self.mint_url)
+            .field("direction", &self.direction)
+            .field("amount", &self.amount)
+            .field("fee", &self.fee)
+            .field("unit", &self.unit)
+            .field("ys", &self.ys)
+            .field("timestamp", &self.timestamp)
+            .field("memo", &self.memo)
+            .field("metadata", &self.metadata)
+            .field("quote_id", &self.quote_id)
+            .field("payment_request", &self.payment_request)
+            .field(
+                "payment_proof",
+                &self.payment_proof.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("payment_method", &self.payment_method)
+            .field("saga_id", &self.saga_id)
+            .field("status", &self.status)
+            .finish()
+    }
 }
 
 impl Transaction {
-    /// Transaction ID
+    /// Transaction ID.
+    ///
+    /// Saga-managed transactions are identified by their saga ID so that
+    /// separate wallet operations involving the same proofs do not collide.
+    /// Legacy transactions without a saga ID retain their proof-derived ID.
     pub fn id(&self) -> TransactionId {
-        TransactionId::new(self.ys.clone())
+        match self.saga_id {
+            Some(saga_id) => match self.metadata.get("batch_quote_id") {
+                Some(quote_id) => TransactionId::from_batch_quote(saga_id, quote_id),
+                None => TransactionId::from_saga_id(saga_id),
+            },
+            None => TransactionId::new(self.ys.clone()),
+        }
     }
 
     /// Check if transaction matches conditions
@@ -486,6 +742,42 @@ pub enum TransactionDirection {
     Outgoing,
 }
 
+/// Wallet transaction status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionStatus {
+    /// The transaction is still in progress.
+    Pending,
+    /// The transaction completed successfully.
+    #[default]
+    Completed,
+    /// The transaction failed or was revoked.
+    Failed,
+}
+
+impl fmt::Display for TransactionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Completed => write!(f, "completed"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl FromStr for TransactionStatus {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            _ => Err(Error::InvalidTransactionStatus),
+        }
+    }
+}
+
 impl std::fmt::Display for TransactionDirection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -513,7 +805,9 @@ impl FromStr for TransactionDirection {
 pub struct TransactionId([u8; 32]);
 
 impl TransactionId {
-    /// Create new [`TransactionId`]
+    /// Create a legacy proof-derived [`TransactionId`].
+    ///
+    /// Saga-managed transactions use [`Self::from_saga_id`] instead.
     pub fn new(ys: Vec<PublicKey>) -> Self {
         let mut ys = ys;
         ys.sort();
@@ -525,13 +819,36 @@ impl TransactionId {
         Self(hash.to_byte_array())
     }
 
-    /// From proofs
+    /// Create a legacy proof-derived [`TransactionId`] from proofs.
+    ///
+    /// Saga-managed transactions use [`Self::from_saga_id`] instead.
     pub fn from_proofs(proofs: Proofs) -> Result<Self, nut00::Error> {
         let ys = proofs
             .iter()
             .map(|proof| proof.y())
             .collect::<Result<Vec<PublicKey>, nut00::Error>>()?;
         Ok(Self::new(ys))
+    }
+
+    /// Create a [`TransactionId`] from a wallet saga ID.
+    ///
+    /// The UUID's canonical 32-character representation preserves the existing
+    /// 32-byte transaction ID storage format and is portable across backends.
+    pub fn from_saga_id(saga_id: Uuid) -> Self {
+        let mut bytes = [0_u8; 32];
+        let encoded = saga_id.simple().to_string();
+        for (destination, source) in bytes.iter_mut().zip(encoded.bytes()) {
+            *destination = source;
+        }
+        Self(bytes)
+    }
+
+    /// Create a stable transaction ID for one quote within a batch saga.
+    pub fn from_batch_quote(saga_id: Uuid, quote_id: &str) -> Self {
+        let mut hasher = sha256::Hash::engine();
+        hasher.input(saga_id.as_bytes());
+        hasher.input(quote_id.as_bytes());
+        Self(sha256::Hash::from_engine(hasher).to_byte_array())
     }
 
     /// From bytes
@@ -645,6 +962,28 @@ pub enum KeysetFilter {
     All,
 }
 
+/// Policy controlling how keysets are loaded.
+///
+/// Determines the data-fetching strategy for keyset queries:
+/// memory cache, local database, and/or network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum KeysetLoadPolicy {
+    /// Use in-memory cache and local database only. Never contacts the network.
+    /// Returns an error if neither cache nor database has data.
+    CacheOnly,
+    /// Return cached data when fresh (TTL not expired). When the cache is
+    /// empty, tries the database first, then the network. When the cache is
+    /// populated but stale (TTL expired), fetches directly from the network,
+    /// falling back to the stale cache if the network call fails.
+    /// This is the default.
+    #[default]
+    CacheThenNetwork,
+    /// Fetch data from the mint over the network and update the cache.
+    /// Falls back to stale cached data if the network call fails;
+    /// only returns an error when no cached data exists at all.
+    Refresh,
+}
+
 /// Unified wallet trait providing a common interface for wallet operations.
 ///
 /// This trait abstracts over different wallet implementations (CDK wallet, FFI
@@ -672,6 +1011,8 @@ pub trait Wallet: Send + Sync {
     type MintQuote: Clone + Send + Sync;
     /// Melt quote type
     type MeltQuote: Clone + Send + Sync;
+    /// Cross-mint transfer quote type
+    type CrossMintTransferQuote: Clone + Send + Sync;
     /// Payment method type
     type PaymentMethod: Clone + Send + Sync;
     /// Melt options type
@@ -690,6 +1031,8 @@ pub trait Wallet: Send + Sync {
     type Subscription: Send + Sync;
     /// Subscribe params type
     type SubscribeParams: Clone + Send + Sync;
+    /// Saga recovery report type
+    type RecoveryReport: Clone + Send + Sync;
 
     /// Get the mint URL this wallet is connected to
     fn mint_url(&self) -> Self::MintUrl;
@@ -712,28 +1055,24 @@ pub trait Wallet: Send + Sync {
     /// Load mint info (from cache if fresh, otherwise fetches)
     async fn load_mint_info(&self) -> Result<Self::MintInfo, Self::Error>;
 
-    /// Refresh keysets from the mint (always fetches fresh data)
-    async fn refresh_keysets(&self) -> Result<Vec<Self::KeySetInfo>, Self::Error>;
+    /// Get all keysets for this wallet's unit.
+    ///
+    /// The `policy` parameter controls the fetching strategy:
+    /// - [`CacheOnly`](KeysetLoadPolicy::CacheOnly) — in-memory cache + local DB, no network
+    /// - [`CacheThenNetwork`](KeysetLoadPolicy::CacheThenNetwork) — cache if fresh, network if
+    ///   stale/absent, stale fallback on failure (default)
+    /// - [`Refresh`](KeysetLoadPolicy::Refresh) — network first, stale-cache fallback on failure
+    async fn keysets(&self, policy: KeysetLoadPolicy)
+        -> Result<Vec<Self::KeySetInfo>, Self::Error>;
 
-    /// Get the active keyset with lowest fees
-    async fn get_active_keyset(&self) -> Result<Self::KeySetInfo, Self::Error>;
+    /// Get the active keyset with the lowest fees.
+    ///
+    /// Filters the output of [`keysets()`](Self::keysets) for active keysets
+    /// and returns the one with the minimum `input_fee_ppk`.
+    async fn active_keyset(&self) -> Result<Self::KeySetInfo, Self::Error>;
 
-    /// Load keys for a specific keyset from cache or mint
-    async fn load_keyset_keys(&self, keyset_id: Id) -> Result<Keys, Self::Error>;
-
-    /// Get keysets for this wallet's unit, filtered by active/all
-    async fn get_mint_keysets(
-        &self,
-        filter: KeysetFilter,
-    ) -> Result<Vec<Self::KeySetInfo>, Self::Error>;
-
-    /// Load active keysets (alias for get_mint_keysets with Active filter)
-    async fn load_mint_keysets(&self) -> Result<Vec<Self::KeySetInfo>, Self::Error> {
-        self.get_mint_keysets(KeysetFilter::Active).await
-    }
-
-    /// Fetch the active keyset with lowest fees
-    async fn fetch_active_keyset(&self) -> Result<Self::KeySetInfo, Self::Error>;
+    /// Get a single keyset by ID.
+    async fn keyset(&self, keyset_id: Id) -> Result<Self::KeySetInfo, Self::Error>;
 
     /// Get fees and available amounts for all keysets
     async fn get_keyset_fees_and_amounts(&self) -> Result<KeysetFeeAndAmounts, Self::Error>;
@@ -769,6 +1108,19 @@ pub trait Wallet: Send + Sync {
         extra: Option<String>,
     ) -> Result<Self::MeltQuote, Self::Error>;
 
+    /// Create destination mint and source melt quotes for the maximum amount
+    /// allowed by the source balance and both mints' advertised limits.
+    ///
+    /// # Remote side effects
+    ///
+    /// The search may create multiple quote pairs because the source mint's fee
+    /// reserve is learned from each destination invoice. Only the returned pair
+    /// is persisted locally; unused remote quotes remain until they expire.
+    async fn cross_mint_transfer_quote_max(
+        &self,
+        target_wallet: &Self,
+    ) -> Result<Self::CrossMintTransferQuote, Self::Error>;
+
     /// List transactions, optionally filtered by direction
     async fn list_transactions(
         &self,
@@ -786,6 +1138,9 @@ pub trait Wallet: Send + Sync {
 
     /// Check all pending proofs and return total amount still pending
     async fn check_all_pending_proofs(&self) -> Result<Self::Amount, Self::Error>;
+
+    /// Recover from incomplete operations after a crash
+    async fn recover_incomplete_sagas(&self) -> Result<Self::RecoveryReport, Self::Error>;
 
     /// Check if proofs are spent
     async fn check_proofs_spent(&self, proofs: Proofs) -> Result<Vec<ProofState>, Self::Error>;
@@ -844,6 +1199,9 @@ pub trait Wallet: Send + Sync {
         spending_conditions: Option<SpendingConditions>,
     ) -> Result<Proofs, Self::Error>;
 
+    /// Check and mint any paid but unissued mint quotes
+    async fn mint_unissued_quotes(&self) -> Result<Self::Amount, Self::Error>;
+
     /// Check mint quote status
     async fn check_mint_quote_status(&self, quote_id: &str)
         -> Result<Self::MintQuote, Self::Error>;
@@ -853,6 +1211,20 @@ pub trait Wallet: Send + Sync {
         &self,
         quote_id: &str,
         payment_method: Option<Self::PaymentMethod>,
+    ) -> Result<Self::MintQuote, Self::Error>;
+
+    /// Fetch a mint quote and try to recover its NUT-20 signing key from the seed.
+    ///
+    /// Use after restoring from seed to claim a known quote ID. Searches the
+    /// wallet's NUT-20 keys at counters `0..key_search_limit` for the public key
+    /// the mint reports. Returns `Ok` even if no key matched: the returned quote's
+    /// `secret_key` is set only on success, so check it before minting and retry
+    /// with a larger limit if needed. Zero disables the search.
+    async fn fetch_mint_quote_with_key_search(
+        &self,
+        quote_id: &str,
+        payment_method: Option<Self::PaymentMethod>,
+        key_search_limit: u32,
     ) -> Result<Self::MintQuote, Self::Error>;
 
     /// Prepare a melt operation
@@ -870,6 +1242,26 @@ pub trait Wallet: Send + Sync {
         metadata: HashMap<String, String>,
     ) -> Result<Self::PreparedMelt<'_>, Self::Error>;
 
+    /// Prepare a melt operation with specific proofs and additional options
+    ///
+    /// P2PK/HTLC-locked proofs are signed with `options.p2pk_signing_keys` plus
+    /// any signing keys known to the wallet, and HTLC preimages from
+    /// `options.preimages` are attached, before the proofs are reserved.
+    ///
+    /// The default implementation preserves compatibility with existing
+    /// implementors by forwarding only `options.metadata` to
+    /// [`prepare_melt_proofs`](Wallet::prepare_melt_proofs). Implementors that
+    /// support locked-input options should override this method.
+    async fn prepare_melt_proofs_with_options(
+        &self,
+        quote_id: &str,
+        proofs: Proofs,
+        options: MeltPrepareOptions,
+    ) -> Result<Self::PreparedMelt<'_>, Self::Error> {
+        self.prepare_melt_proofs(quote_id, proofs, options.metadata)
+            .await
+    }
+
     /// Prepare a melt operation from an encoded token
     ///
     /// Decodes the token, extracts proofs (handling keyset state internally),
@@ -881,6 +1273,26 @@ pub trait Wallet: Send + Sync {
         encoded_token: &str,
         metadata: HashMap<String, String>,
     ) -> Result<Self::PreparedMelt<'_>, Self::Error>;
+
+    /// Prepare a melt operation from an encoded token with additional options
+    ///
+    /// Same as [`prepare_melt_token`](Wallet::prepare_melt_token), with locked
+    /// inputs signed as described in
+    /// [`prepare_melt_proofs_with_options`](Wallet::prepare_melt_proofs_with_options).
+    ///
+    /// The default implementation preserves compatibility with existing
+    /// implementors by forwarding only `options.metadata` to
+    /// [`prepare_melt_token`](Wallet::prepare_melt_token). Implementors that
+    /// support locked-input options should override this method.
+    async fn prepare_melt_token_with_options(
+        &self,
+        quote_id: &str,
+        encoded_token: &str,
+        options: MeltPrepareOptions,
+    ) -> Result<Self::PreparedMelt<'_>, Self::Error> {
+        self.prepare_melt_token(quote_id, encoded_token, options.metadata)
+            .await
+    }
 
     /// Swap proofs
     async fn swap(
@@ -911,15 +1323,11 @@ pub trait Wallet: Send + Sync {
     /// Restore wallet from seed
     async fn restore(&self) -> Result<Restored, Self::Error>;
 
+    /// Restore wallet from seed with custom [`NUT13Options`]
+    async fn restore_with_opts(&self, opts: NUT13Options) -> Result<Restored, Self::Error>;
+
     /// Verify DLEQ proofs in a token
     async fn verify_token_dleq(&self, token_str: &str) -> Result<(), Self::Error>;
-
-    /// Pay a NUT-18 payment request
-    async fn pay_request(
-        &self,
-        request: PaymentRequest,
-        custom_amount: Option<Self::Amount>,
-    ) -> Result<(), Self::Error>;
 
     /// Subscribe to mint quote state updates
     ///
@@ -937,6 +1345,29 @@ pub trait Wallet: Send + Sync {
     /// before requiring a refresh from the mint server.
     /// If `None`, cache never expires and is always used.
     fn set_metadata_cache_ttl(&self, ttl_secs: Option<u64>);
+
+    /// Configure client-side request pacing, or turn it off with `None`.
+    ///
+    /// Reaches every host the wallet paces, not only its mint, and is
+    /// repository-wide when the wallet came from a wallet repository, since
+    /// those share one limiter. `None` then `Some` is a reversible toggle.
+    #[cfg(feature = "http")]
+    fn set_rate_limiting_config(&self, config: Option<RateLimitConfig>);
+
+    /// Whether requests from this wallet are being paced right now.
+    ///
+    /// Also false when a custom transport left the limiter wired to nothing,
+    /// which is what silently makes [`Self::set_rate_limiting_config`] a no-op.
+    #[cfg(feature = "http")]
+    fn is_rate_limited(&self) -> bool;
+
+    /// Wait until the rate-limit budget drawn down so far has been persisted.
+    ///
+    /// Persistence is otherwise best effort, so a caller that rebuilds the
+    /// wallet or tears down the runtime without this barrier can lose the final
+    /// write and start the next wallet with a full burst.
+    #[cfg(feature = "http")]
+    async fn flush_rate_limits(&self);
 
     /// Subscribe to wallet events
     async fn subscribe(
@@ -1069,6 +1500,59 @@ mod tests {
     }
 
     #[test]
+    fn transaction_id_from_saga_id_uses_canonical_uuid_bytes() {
+        let saga_id =
+            Uuid::parse_str("019fa338-b72f-7f21-9bb2-a504cdd5927b").expect("valid saga ID");
+        let transaction_id = TransactionId::from_saga_id(saga_id);
+
+        assert_eq!(
+            transaction_id.as_bytes(),
+            b"019fa338b72f7f219bb2a504cdd5927b"
+        );
+    }
+
+    #[test]
+    fn batch_quote_transaction_ids_are_stable_and_distinct() {
+        let saga_id =
+            Uuid::parse_str("019fa338-b72f-7f21-9bb2-a504cdd5927b").expect("valid saga ID");
+
+        let first = TransactionId::from_batch_quote(saga_id, "quote-a");
+        let first_again = TransactionId::from_batch_quote(saga_id, "quote-a");
+        let second = TransactionId::from_batch_quote(saga_id, "quote-b");
+
+        assert_eq!(first, first_again);
+        assert_ne!(first, second);
+        assert_ne!(first, TransactionId::from_saga_id(saga_id));
+    }
+
+    #[test]
+    fn saga_managed_transactions_with_the_same_ys_have_distinct_ids() {
+        let ys = vec![SecretKey::generate().public_key()];
+        let transaction = Transaction {
+            mint_url: MintUrl::from_str("https://mint.example.com").expect("valid mint URL"),
+            direction: TransactionDirection::Outgoing,
+            amount: Amount::from(10),
+            fee: Amount::ZERO,
+            unit: CurrencyUnit::Sat,
+            ys,
+            timestamp: 42,
+            memo: None,
+            metadata: HashMap::new(),
+            quote_id: None,
+            payment_request: None,
+            payment_proof: None,
+            payment_method: None,
+            saga_id: Some(Uuid::new_v4()),
+            status: TransactionStatus::Pending,
+        };
+        let mut received = transaction.clone();
+        received.direction = TransactionDirection::Incoming;
+        received.saga_id = Some(Uuid::new_v4());
+
+        assert_ne!(transaction.id(), received.id());
+    }
+
+    #[test]
     fn test_matches_conditions() {
         let keyset_id = Id::from_str("00deadbeef123456").unwrap();
         let proof = Proof::new(
@@ -1150,5 +1634,184 @@ mod tests {
             conditions: None,
         };
         assert!(!proof_info.matches_conditions(&None, &None, &None, &Some(vec![dummy_condition])));
+    }
+
+    #[test]
+    fn wallet_record_debug_redacts_spendable_secrets() {
+        let proof_secret = "wallet-proof-secret";
+        let payment_proof = "wallet-payment-preimage";
+        let keyset_id = Id::from_str("00deadbeef123456").expect("valid keyset ID");
+        let proof = Proof::new(
+            Amount::from(64),
+            keyset_id,
+            Secret::new(proof_secret),
+            PublicKey::from_hex(
+                "02deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            )
+            .expect("valid public key"),
+        );
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("valid mint URL");
+        let proof_info = ProofInfo::new(proof, mint_url.clone(), State::Unspent, CurrencyUnit::Sat)
+            .expect("valid proof");
+        let melt_quote = MeltQuote {
+            id: "public-quote-id".to_string(),
+            mint_url: Some(mint_url.clone()),
+            unit: CurrencyUnit::Sat,
+            amount: Amount::from(10),
+            request: "public-payment-request".to_string(),
+            fee_reserve: Amount::from(1),
+            state: MeltQuoteState::Paid,
+            expiry: 1_000,
+            payment_proof: Some(payment_proof.to_string()),
+            estimated_blocks: None,
+            fee_index: None,
+            payment_method: PaymentMethod::BOLT11,
+            used_by_operation: None,
+            version: 0,
+        };
+        let transaction = Transaction {
+            mint_url,
+            direction: TransactionDirection::Outgoing,
+            amount: Amount::from(10),
+            fee: Amount::from(1),
+            unit: CurrencyUnit::Sat,
+            ys: vec![],
+            timestamp: 42,
+            memo: None,
+            metadata: HashMap::new(),
+            quote_id: Some("public-quote-id".to_string()),
+            payment_request: None,
+            payment_proof: Some(payment_proof.to_string()),
+            payment_method: Some(PaymentMethod::BOLT11),
+            saga_id: None,
+            status: TransactionStatus::Completed,
+        };
+
+        for debug in [
+            format!("{proof_info:?}"),
+            format!("{melt_quote:?}"),
+            format!("{transaction:?}"),
+        ] {
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains(proof_secret));
+            assert!(!debug.contains(payment_proof));
+        }
+    }
+
+    #[test]
+    fn test_wallet_options_debug_redacts_p2pk_signing_keys() {
+        let secret_key = SecretKey::generate();
+        let secret_hex = secret_key.to_secret_hex();
+        let preimage = "super_secret_htlc_preimage_xyz";
+
+        let send_options = SendOptions {
+            p2pk_signing_keys: vec![secret_key.clone()],
+            ..Default::default()
+        };
+        let receive_options = ReceiveOptions {
+            p2pk_signing_keys: vec![secret_key],
+            preimages: vec![preimage.to_string()],
+            ..Default::default()
+        };
+
+        let send_debug = format!("{:?}", send_options);
+        let receive_debug = format!("{:?}", receive_options);
+
+        assert!(!send_debug.contains(&secret_hex));
+        assert!(send_debug.contains("[redacted]"));
+        assert!(!receive_debug.contains(&secret_hex));
+        assert!(!receive_debug.contains(preimage));
+        assert!(receive_debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn nut13_options_defaults_match_nut13_spec() {
+        // NUT-13 recommends batch_size=100 and gap_limit=3.
+        // https://github.com/cashubtc/nuts/blob/main/13.md#generate-blindedmessages
+        let opts = NUT13Options::default();
+        assert_eq!(opts.batch_size, NUT13Options::DEFAULT_BATCH_SIZE);
+        assert_eq!(opts.max_gap, NUT13Options::DEFAULT_MAX_GAP);
+    }
+
+    #[test]
+    fn nut13_options_new_accepts_custom_values() {
+        let opts = NUT13Options::new(25, 2).unwrap();
+        let cloned = opts.clone();
+        assert_eq!(cloned.batch_size, 25);
+        assert_eq!(cloned.max_gap, 2);
+    }
+
+    #[test]
+    fn nut13_options_reject_zero_batch_size() {
+        let err = NUT13Options::new(0, 2).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::InvalidNut13Options {
+                field: "batch_size",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nut13_options_reject_zero_max_gap() {
+        let err = NUT13Options::new(25, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::InvalidNut13Options {
+                field: "max_gap",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn transaction_status_round_trips_and_rejects_unknown_values() {
+        for status in [
+            TransactionStatus::Pending,
+            TransactionStatus::Completed,
+            TransactionStatus::Failed,
+        ] {
+            assert_eq!(
+                TransactionStatus::from_str(&status.to_string()).expect("valid status"),
+                status
+            );
+        }
+
+        assert!(matches!(
+            TransactionStatus::from_str("unknown"),
+            Err(Error::InvalidTransactionStatus)
+        ));
+    }
+
+    #[test]
+    fn transaction_without_status_defaults_to_completed() {
+        let transaction = Transaction {
+            mint_url: MintUrl::from_str("https://mint.example.com").expect("valid mint URL"),
+            direction: TransactionDirection::Incoming,
+            amount: Amount::from(10),
+            fee: Amount::ZERO,
+            unit: CurrencyUnit::Sat,
+            ys: vec![SecretKey::generate().public_key()],
+            timestamp: 42,
+            memo: None,
+            metadata: HashMap::new(),
+            quote_id: None,
+            payment_request: None,
+            payment_proof: None,
+            payment_method: None,
+            saga_id: None,
+            status: TransactionStatus::Pending,
+        };
+        let mut value = serde_json::to_value(transaction).expect("serialize transaction");
+        value
+            .as_object_mut()
+            .expect("transaction serializes as an object")
+            .remove("status");
+
+        let decoded: Transaction =
+            serde_json::from_value(value).expect("deserialize legacy transaction");
+
+        assert_eq!(decoded.status, TransactionStatus::Completed);
     }
 }

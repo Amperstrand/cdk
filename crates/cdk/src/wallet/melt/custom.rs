@@ -21,12 +21,13 @@ impl Wallet {
         _options: Option<MeltOptions>,
         extra: Option<serde_json::Value>,
     ) -> Result<MeltQuote, Error> {
-        self.refresh_keysets().await?;
+        self.keysets(Default::default()).await?;
 
         let quote_request = MeltQuoteCustomRequest {
             method: method.to_string(),
             request: request.clone(),
             unit: self.unit.clone(),
+            amount: None,
             extra: extra.unwrap_or(serde_json::Value::Null),
         };
         let quote_res = self
@@ -49,11 +50,14 @@ impl Wallet {
             amount: quote_res.amount,
             request: quote_request_str,
             unit: self.unit.clone(),
-            fee_reserve: quote_res.fee_reserve,
+            fee_reserve: quote_res.fee_reserve.unwrap_or_default(),
             state: quote_res.state,
             expiry: quote_res.expiry,
             payment_proof: quote_res.payment_preimage,
+            estimated_blocks: None,
+            fee_index: None,
             payment_method: PaymentMethod::Custom(method.to_string()),
+
             used_by_operation: None,
             version: 0,
         };

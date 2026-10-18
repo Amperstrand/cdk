@@ -10,7 +10,9 @@ use bitcoin::bech32::{self, Bech32, Bech32m, Hrp};
 use super::Error;
 use crate::mint_url::MintUrl;
 use crate::nuts::nut10::Kind;
-use crate::nuts::nut18::{Nut10SecretRequest, PaymentRequest, Transport, TransportType};
+use crate::nuts::nut18::{
+    Nut10SecretRequest, PaymentRequest, SupportedMethod, Transport, TransportType,
+};
 use crate::nuts::CurrencyUnit;
 use crate::Amount;
 
@@ -31,7 +33,7 @@ impl From<CurrencyUnit> for TlvUnit {
             CurrencyUnit::Msat => TlvUnit::Custom("msat".to_string()),
             CurrencyUnit::Usd => TlvUnit::Custom("usd".to_string()),
             CurrencyUnit::Eur => TlvUnit::Custom("eur".to_string()),
-            CurrencyUnit::Custom(c) => TlvUnit::Custom(c),
+            CurrencyUnit::Custom(c) => TlvUnit::Custom(CurrencyUnit::custom(c).to_string()),
             CurrencyUnit::Auth => TlvUnit::Custom("auth".to_string()),
         }
     }
@@ -46,7 +48,7 @@ impl From<TlvUnit> for CurrencyUnit {
                 "usd" => CurrencyUnit::Usd,
                 "eur" => CurrencyUnit::Eur,
                 "auth" => CurrencyUnit::Auth,
-                _ => CurrencyUnit::Custom(s), // preserve unknown units
+                _ => CurrencyUnit::custom(s),
             },
         }
     }
@@ -94,11 +96,12 @@ impl TlvWriter {
         Self { data: Vec::new() }
     }
 
-    fn write_tlv(&mut self, tag: u8, value: &[u8]) {
+    fn write_tlv(&mut self, tag: u8, value: &[u8]) -> Result<(), Error> {
+        let len = u16::try_from(value.len()).map_err(|_| Error::InvalidLength)?;
         self.data.push(tag);
-        let len = value.len() as u16;
         self.data.extend_from_slice(&len.to_be_bytes());
         self.data.extend_from_slice(value);
+        Ok(())
     }
 
     fn into_bytes(self) -> Vec<u8> {
@@ -145,6 +148,8 @@ impl PaymentRequest {
     ///     unit: Some(cashu::nuts::CurrencyUnit::Sat),
     ///     single_use: None,
     ///     mints: vec![MintUrl::from_str("https://mint.example.com")?],
+    ///     mint_preferred: None,
+    ///     supported_methods: vec![],
     ///     description: None,
     ///     transports: vec![],
     ///     nut10: None,
@@ -221,6 +226,8 @@ impl PaymentRequest {
         let mut unit: Option<CurrencyUnit> = None;
         let mut single_use: Option<bool> = None;
         let mut mints: Vec<MintUrl> = Vec::new();
+        let mut mint_preferred: Option<bool> = None;
+        let mut supported_methods: Vec<SupportedMethod> = Vec::new();
         let mut description: Option<String> = None;
         let mut transports: Vec<Transport> = Vec::new();
         let mut nut10: Option<Nut10SecretRequest> = None;
@@ -290,7 +297,29 @@ impl PaymentRequest {
                 }
                 0x08 => {
                     // nut10: sub-TLV
+                    if nut10.is_some() {
+                        return Err(Error::InvalidStructure);
+                    }
                     nut10 = Some(Self::decode_nut10(&value)?);
+                }
+                0x09 => {
+                    // mint_preferred: u8 (0 or 1)
+                    if mint_preferred.is_some() {
+                        return Err(Error::InvalidStructure);
+                    }
+                    if value.len() != 1 {
+                        return Err(Error::InvalidLength);
+                    }
+                    mint_preferred = Some(match value[0] {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(Error::InvalidStructure),
+                    });
+                }
+                0x0a => {
+                    // supported_method: sub-TLV (repeatable)
+                    let method = Self::decode_supported_method(&value)?;
+                    supported_methods.push(method);
                 }
                 _ => {
                     // Unknown tags are ignored
@@ -304,6 +333,8 @@ impl PaymentRequest {
             unit,
             single_use,
             mints,
+            mint_preferred,
+            supported_methods,
             description,
             transports,
             nut10,
@@ -316,50 +347,61 @@ impl PaymentRequest {
 
         // 0x01 id: string
         if let Some(ref id) = self.payment_id {
-            writer.write_tlv(0x01, id.as_bytes());
+            writer.write_tlv(0x01, id.as_bytes())?;
         }
 
         // 0x02 amount: u64
         if let Some(amount) = self.amount {
             let amount_bytes = (amount.to_u64()).to_be_bytes();
-            writer.write_tlv(0x02, &amount_bytes);
+            writer.write_tlv(0x02, &amount_bytes)?;
         }
 
         // 0x03 unit: u8 or string
         if let Some(ref unit) = self.unit {
             let tlv_unit = TlvUnit::from(unit.clone());
             match tlv_unit {
-                TlvUnit::Sat => writer.write_tlv(0x03, &[0]),
-                TlvUnit::Custom(s) => writer.write_tlv(0x03, s.as_bytes()),
+                TlvUnit::Sat => writer.write_tlv(0x03, &[0])?,
+                TlvUnit::Custom(s) => writer.write_tlv(0x03, s.as_bytes())?,
             }
         }
 
         // 0x04 single_use: u8 (0 or 1)
         if let Some(single_use) = self.single_use {
-            writer.write_tlv(0x04, &[if single_use { 1 } else { 0 }]);
+            writer.write_tlv(0x04, &[if single_use { 1 } else { 0 }])?;
         }
 
         // 0x05 mint: string (repeatable)
         for mint in &self.mints {
-            writer.write_tlv(0x05, mint.to_string().as_bytes());
+            writer.write_tlv(0x05, mint.to_string().as_bytes())?;
         }
 
         // 0x06 description: string
         if let Some(ref description) = self.description {
-            writer.write_tlv(0x06, description.as_bytes());
+            writer.write_tlv(0x06, description.as_bytes())?;
         }
 
         // 0x07 transport: sub-TLV (repeatable, order = priority)
         // Note: In-band transport is represented by absence of transport tag per NUT-26
         for transport in &self.transports {
             let transport_bytes = Self::encode_transport(transport)?;
-            writer.write_tlv(0x07, &transport_bytes);
+            writer.write_tlv(0x07, &transport_bytes)?;
         }
 
         // 0x08 nut10: sub-TLV
         if let Some(ref nut10) = self.nut10 {
             let nut10_bytes = Self::encode_nut10(nut10)?;
-            writer.write_tlv(0x08, &nut10_bytes);
+            writer.write_tlv(0x08, &nut10_bytes)?;
+        }
+
+        // 0x09 mint_preferred: u8 (0 or 1)
+        if let Some(mint_preferred) = self.mint_preferred {
+            writer.write_tlv(0x09, &[if mint_preferred { 1 } else { 0 }])?;
+        }
+
+        // 0x0a supported_method: sub-TLV (repeatable)
+        for method in &self.supported_methods {
+            let method_bytes = Self::encode_supported_method(method)?;
+            writer.write_tlv(0x0a, &method_bytes)?;
         }
 
         Ok(writer.into_bytes())
@@ -473,7 +515,7 @@ impl PaymentRequest {
             TransportType::Nostr => 0x00u8,
             TransportType::HttpPost => 0x01u8,
         };
-        writer.write_tlv(0x01, &[kind]);
+        writer.write_tlv(0x01, &[kind])?;
 
         // 0x02 target: bytes
         match transport._type {
@@ -482,27 +524,23 @@ impl PaymentRequest {
                 let (pubkey, relays) = Self::decode_nprofile(&transport.target)?;
 
                 // Write the 32-byte pubkey
-                writer.write_tlv(0x02, &pubkey);
+                writer.write_tlv(0x02, &pubkey)?;
 
                 // Collect all relays (from nprofile and from "relay" tags)
                 let mut all_relays = relays;
 
-                // Extract NIPs and other tags from the tags field
+                // Extract relays from the tags field
                 for tag in &transport.tags {
                     if tag.is_empty() {
                         continue;
                     }
-                    if tag[0] == "n" && tag.len() >= 2 {
-                        // Encode NIPs as tag tuples with key "n"
-                        let tag_bytes = Self::encode_tag_tuple(tag)?;
-                        writer.write_tlv(0x03, &tag_bytes);
-                    } else if tag[0] == "relay" && tag.len() >= 2 {
+                    if tag[0] == "relay" && tag.len() >= 2 {
                         // Collect relays from tags to encode as "r" tag tuples
                         all_relays.push(tag[1].clone());
                     } else {
-                        // Other tags as generic tag tuples
+                        // NIP and other tags are generic tag tuples
                         let tag_bytes = Self::encode_tag_tuple(tag)?;
-                        writer.write_tlv(0x03, &tag_bytes);
+                        writer.write_tlv(0x03, &tag_bytes)?;
                     }
                 }
 
@@ -510,20 +548,74 @@ impl PaymentRequest {
                 for relay in all_relays {
                     let relay_tag = vec!["r".to_string(), relay];
                     let tag_bytes = Self::encode_tag_tuple(&relay_tag)?;
-                    writer.write_tlv(0x03, &tag_bytes);
+                    writer.write_tlv(0x03, &tag_bytes)?;
                 }
             }
             TransportType::HttpPost => {
-                writer.write_tlv(0x02, transport.target.as_bytes());
+                writer.write_tlv(0x02, transport.target.as_bytes())?;
 
                 // 0x03 tag_tuple: generic tuple (repeatable)
                 for tag in &transport.tags {
                     if !tag.is_empty() {
                         let tag_bytes = Self::encode_tag_tuple(tag)?;
-                        writer.write_tlv(0x03, &tag_bytes);
+                        writer.write_tlv(0x03, &tag_bytes)?;
                     }
                 }
             }
+        }
+
+        Ok(writer.into_bytes())
+    }
+
+    /// Decode supported payment method sub-TLV.
+    fn decode_supported_method(bytes: &[u8]) -> Result<SupportedMethod, Error> {
+        let mut reader = TlvReader::new(bytes);
+
+        let mut method: Option<String> = None;
+        let mut fee: Option<Amount> = None;
+
+        while let Some((tag, value)) = reader.read_tlv()? {
+            match tag {
+                0x01 => {
+                    // method: string
+                    if method.is_some() {
+                        return Err(Error::InvalidStructure);
+                    }
+                    method = Some(String::from_utf8(value).map_err(|_| Error::InvalidUtf8)?);
+                }
+                0x02 => {
+                    // fee: u64
+                    if fee.is_some() {
+                        return Err(Error::InvalidStructure);
+                    }
+                    if value.len() != 8 {
+                        return Err(Error::InvalidLength);
+                    }
+                    let fee_val = u64::from_be_bytes([
+                        value[0], value[1], value[2], value[3], value[4], value[5], value[6],
+                        value[7],
+                    ]);
+                    fee = Some(Amount::from(fee_val));
+                }
+                _ => {
+                    // Unknown tags are ignored
+                }
+            }
+        }
+
+        Ok(SupportedMethod {
+            method: method.ok_or(Error::InvalidStructure)?,
+            fee,
+        })
+    }
+
+    /// Encode supported payment method to sub-TLV.
+    fn encode_supported_method(method: &SupportedMethod) -> Result<Vec<u8>, Error> {
+        let mut writer = TlvWriter::new();
+
+        writer.write_tlv(0x01, method.method.as_bytes())?;
+        if let Some(fee) = method.fee {
+            writer.write_tlv(0x02, &fee.to_u64().to_be_bytes())?;
         }
 
         Ok(writer.into_bytes())
@@ -608,16 +700,16 @@ impl PaymentRequest {
             Kind::P2PK => 0u8,
             Kind::HTLC => 1u8,
         };
-        writer.write_tlv(0x01, &[kind_val]);
+        writer.write_tlv(0x01, &[kind_val])?;
 
         // 0x02 data: bytes
-        writer.write_tlv(0x02, nut10.data.as_bytes());
+        writer.write_tlv(0x02, nut10.data.as_bytes())?;
 
         // 0x03 tag_tuple: generic tuple (repeatable)
         if let Some(ref tags) = nut10.tags {
             for tag in tags {
                 let tag_bytes = Self::encode_tag_tuple(tag)?;
-                writer.write_tlv(0x03, &tag_bytes);
+                writer.write_tlv(0x03, &tag_bytes)?;
             }
         }
 
@@ -668,12 +760,14 @@ impl PaymentRequest {
 
         // Key length + key
         let key = &tag[0];
-        bytes.push(key.len() as u8);
+        let key_len = u8::try_from(key.len()).map_err(|_| Error::TagTooLong)?;
+        bytes.push(key_len);
         bytes.extend_from_slice(key.as_bytes());
 
         // Values
         for value in &tag[1..] {
-            bytes.push(value.len() as u8);
+            let value_len = u8::try_from(value.len()).map_err(|_| Error::TagTooLong)?;
+            bytes.push(value_len);
             bytes.extend_from_slice(value.as_bytes());
         }
 
@@ -773,6 +867,142 @@ mod tests {
     use crate::util::hex;
     use crate::TransportType;
 
+    fn nprofile_from_bytes(bytes: &[u8]) -> String {
+        let hrp = bitcoin::bech32::Hrp::parse("nprofile").unwrap();
+        bitcoin::bech32::encode::<bitcoin::bech32::Bech32>(hrp, bytes).unwrap()
+    }
+
+    #[test]
+    fn test_tlv_unit_preserves_protocol_units() {
+        assert_eq!(
+            CurrencyUnit::from(TlvUnit::from(CurrencyUnit::Eur)),
+            CurrencyUnit::Eur
+        );
+        assert_eq!(
+            CurrencyUnit::from(TlvUnit::from(CurrencyUnit::Auth)),
+            CurrencyUnit::Auth
+        );
+        assert_eq!(
+            TlvUnit::from(CurrencyUnit::Custom("BADCOIN".into())),
+            TlvUnit::Custom("badcoin".to_string())
+        );
+        assert_eq!(
+            CurrencyUnit::from(TlvUnit::Custom("BADCOIN".to_string())),
+            CurrencyUnit::Custom("badcoin".into())
+        );
+    }
+
+    #[test]
+    fn test_tlv_reader_accepts_exact_empty_value_and_rejects_truncation() {
+        let mut reader = TlvReader::new(&[0x01, 0x00, 0x00]);
+        assert_eq!(reader.read_tlv().unwrap(), Some((0x01, vec![])));
+        assert_eq!(reader.read_tlv().unwrap(), None);
+
+        let mut reader = TlvReader::new(&[0x01, 0x00]);
+        assert_eq!(reader.read_tlv().unwrap(), None);
+
+        let mut reader = TlvReader::new(&[0x01, 0x00, 0x02, b'a']);
+        assert!(matches!(reader.read_tlv(), Err(Error::InvalidLength)));
+    }
+
+    #[test]
+    fn test_one_byte_nonzero_unit_decodes_as_custom_unit() {
+        let decoded = PaymentRequest::from_bech32_bytes(&[0x03, 0x00, 0x01, b'x']).unwrap();
+
+        assert_eq!(decoded.unit, Some(CurrencyUnit::Custom("x".into())));
+    }
+
+    #[test]
+    fn test_transport_target_without_kind_is_invalid() {
+        let bytes = [0x02, 0x00, 0x03, b'f', b'o', b'o'];
+
+        assert!(matches!(
+            PaymentRequest::decode_transport(&bytes),
+            Err(Error::InvalidStructure)
+        ));
+    }
+
+    #[test]
+    fn test_tag_tuple_rejects_truncated_key_and_value() {
+        assert_eq!(
+            PaymentRequest::decode_tag_tuple(&[1, b'a']).unwrap(),
+            ("a".to_string(), vec![])
+        );
+        assert!(matches!(
+            PaymentRequest::decode_tag_tuple(&[2, b'a']),
+            Err(Error::InvalidLength)
+        ));
+        assert!(matches!(
+            PaymentRequest::decode_tag_tuple(&[1, b'a', 2, b'b']),
+            Err(Error::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn test_nostr_transport_tag_encoding_preserves_nips_relays_and_generic_tags() {
+        let target = PaymentRequest::encode_nprofile(&[7u8; 32], &[]).unwrap();
+        let transport = Transport {
+            _type: TransportType::Nostr,
+            target,
+            tags: vec![
+                vec!["n".to_string(), "17".to_string()],
+                vec!["relay".to_string(), "wss://relay.example".to_string()],
+                vec!["other".to_string(), "value".to_string()],
+            ],
+        };
+        let payment_request = PaymentRequest {
+            payment_id: Some("nostr-tags".to_string()),
+            amount: None,
+            unit: Some(CurrencyUnit::Sat),
+            single_use: None,
+            mints: vec![],
+            mint_preferred: None,
+            supported_methods: vec![],
+            description: None,
+            transports: vec![transport],
+            nut10: None,
+        };
+
+        let encoded = payment_request.to_bech32_string().unwrap();
+        let decoded = PaymentRequest::from_bech32_string(&encoded).unwrap();
+        let tags = &decoded.transports[0].tags;
+
+        assert!(tags.contains(&vec!["n".to_string(), "17".to_string()]));
+        assert!(tags.contains(&vec!["r".to_string(), "wss://relay.example".to_string()]));
+        assert!(tags.contains(&vec!["other".to_string(), "value".to_string()]));
+    }
+
+    #[test]
+    fn test_nprofile_boundaries() {
+        let pubkey = [42u8; 32];
+        let valid = PaymentRequest::encode_nprofile(&pubkey, &[String::new()]).unwrap();
+        let (decoded_pubkey, relays) = PaymentRequest::decode_nprofile(&valid).unwrap();
+        assert_eq!(decoded_pubkey, pubkey);
+        assert_eq!(relays, vec![String::new()]);
+
+        let missing_length = nprofile_from_bytes(&[0]);
+        assert!(matches!(
+            PaymentRequest::decode_nprofile(&missing_length),
+            Err(Error::InvalidStructure)
+        ));
+
+        let mut oversized_pubkey = vec![0, 33];
+        oversized_pubkey.extend([42u8; 33]);
+        let oversized_pubkey = nprofile_from_bytes(&oversized_pubkey);
+        assert!(matches!(
+            PaymentRequest::decode_nprofile(&oversized_pubkey),
+            Err(Error::InvalidLength)
+        ));
+
+        let max_relay = "a".repeat(255);
+        assert!(PaymentRequest::encode_nprofile(&pubkey, &[max_relay]).is_ok());
+        let oversized_relay = "a".repeat(256);
+        assert!(matches!(
+            PaymentRequest::encode_nprofile(&pubkey, &[oversized_relay]),
+            Err(Error::TagTooLong)
+        ));
+    }
+
     #[test]
     fn test_bech32_basic_round_trip() {
         let transport = Transport {
@@ -787,6 +1017,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: Some(true),
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: Some("Test payment".to_string()),
             transports: vec![transport],
             nut10: None,
@@ -809,6 +1041,36 @@ mod tests {
     }
 
     #[test]
+    fn test_bech32_supported_methods_with_method_fee() {
+        let payment_request = PaymentRequest {
+            payment_id: Some("preferred_fee_methods".to_string()),
+            amount: Some(Amount::from(100)),
+            unit: Some(CurrencyUnit::Sat),
+            single_use: None,
+            mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: Some(true),
+            supported_methods: vec![
+                SupportedMethod::new("bolt11"),
+                SupportedMethod::with_fee("bolt12", 5),
+            ],
+            description: None,
+            transports: vec![],
+            nut10: None,
+        };
+
+        let expected_encoded = "CREQB1QYQP2URJV4NX2UNJV4J97EN9V40K6ET5DPHKGUCZQQYQQQQQQQQQQQRYQVQQZQQ9QQVXSAR5WPEN5TE0D45KUAPWV4UXZMTSD3JJUCM0D5YSQQGPPGQQJQGQQE3X7MR5XYCS5QQ5QYQQVCN0D36RZVSZQQYQQQQQQQQQQQQ9FJ2568";
+
+        let encoded = payment_request
+            .to_bech32_string()
+            .expect("encoding should work");
+        assert_eq!(encoded, expected_encoded);
+
+        let decoded =
+            PaymentRequest::from_bech32_string(expected_encoded).expect("decoding should work");
+        assert_eq!(decoded, payment_request);
+    }
+
+    #[test]
     fn test_bech32_minimal() {
         let payment_request = PaymentRequest {
             payment_id: Some("minimal".to_string()),
@@ -816,6 +1078,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -844,6 +1108,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: Some("P2PK locked payment".to_string()),
             transports: vec![],
             nut10: Some(nut10.clone()),
@@ -866,6 +1132,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -911,6 +1179,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -930,6 +1200,8 @@ mod tests {
             unit: Some(CurrencyUnit::Usd),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -963,7 +1235,7 @@ mod tests {
 
     #[test]
     fn test_nprofile_encoding_decoding() {
-        use nostr_sdk::prelude::*;
+        use nostr::prelude::*;
 
         let keys = Keys::generate();
         let pubkey_bytes = keys.public_key().to_bytes().to_vec();
@@ -986,7 +1258,7 @@ mod tests {
 
     #[test]
     fn test_nprofile_matches_nostr_crate() {
-        use nostr_sdk::prelude::*;
+        use nostr::prelude::*;
 
         let keys = Keys::generate();
         let nostr_pubkey = keys.public_key();
@@ -1034,7 +1306,7 @@ mod tests {
 
     #[test]
     fn test_nprofile_empty_relays_matches_nostr_crate() {
-        use nostr_sdk::prelude::*;
+        use nostr::prelude::*;
 
         let keys = Keys::generate();
         let nostr_pubkey = keys.public_key();
@@ -1068,7 +1340,7 @@ mod tests {
 
     #[test]
     fn nut_18_payment_request() {
-        use nostr_sdk::prelude::*;
+        use nostr::prelude::*;
         let nprofile = "nprofile1qy28wumn8ghj7un9d3shjtnyv9kh2uewd9hsz9mhwden5te0wfjkccte9curxven9eehqctrv5hszrthwden5te0dehhxtnvdakqqgydaqy7curk439ykptkysv7udhdhu68sucm295akqefdehkf0d495cwunl5";
 
         let nostr_decoded =
@@ -1106,6 +1378,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: Some("Nostr payment".to_string()),
             transports: vec![transport],
             nut10: None,
@@ -1150,6 +1424,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: Some("Nostr payment with relays".to_string()),
             transports: vec![transport],
             nut10: None,
@@ -1197,6 +1473,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: Some(true),
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: Some("Coffee".to_string()),
             transports: vec![transport],
             nut10: None,
@@ -1273,6 +1551,8 @@ mod tests {
                 MintUrl::from_str("https://mint2.example.com").unwrap(),
                 MintUrl::from_str("https://testnut.cashu.space").unwrap(),
             ],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: Some("Payment with multiple transports and mints".to_string()),
             transports: vec![transport1, transport2],
             nut10: None,
@@ -1767,6 +2047,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: Some("Test payment description".to_string()),
             transports: vec![],
             nut10: None,
@@ -1802,6 +2084,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: Some(true),
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -1832,6 +2116,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: Some(false),
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -1862,6 +2148,8 @@ mod tests {
             unit: Some(CurrencyUnit::Msat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -1893,6 +2181,8 @@ mod tests {
             unit: Some(CurrencyUnit::Usd),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -2087,6 +2377,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![], // Empty transports = in-band per NUT-26
             nut10: None,
@@ -2186,6 +2478,8 @@ mod tests {
             unit: Some(CurrencyUnit::Sat),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -2220,9 +2514,11 @@ mod tests {
         let payment_request = PaymentRequest {
             payment_id: Some("custom_unit".to_string()),
             amount: Some(Amount::from(100)),
-            unit: Some(CurrencyUnit::Custom("btc".to_string())),
+            unit: Some(CurrencyUnit::Custom("btc".into())),
             single_use: None,
             mints: vec![MintUrl::from_str("https://mint.example.com").unwrap()],
+            mint_preferred: None,
+            supported_methods: vec![],
             description: None,
             transports: vec![],
             nut10: None,
@@ -2238,7 +2534,111 @@ mod tests {
         let decoded =
             PaymentRequest::from_bech32_string(expected_encoded).expect("decoding should work");
 
-        assert_eq!(decoded.unit, Some(CurrencyUnit::Custom("btc".to_string())));
+        assert_eq!(decoded.unit, Some(CurrencyUnit::Custom("btc".into())));
         assert_eq!(decoded.payment_id, Some("custom_unit".to_string()));
+    }
+
+    #[test]
+    fn test_rejects_tlv_value_exceeding_u16_length() {
+        let payment_request = PaymentRequest {
+            payment_id: None,
+            amount: None,
+            unit: None,
+            single_use: None,
+            mints: vec![],
+            mint_preferred: None,
+            supported_methods: vec![],
+            description: Some("x".repeat(usize::from(u16::MAX) + 1)),
+            transports: vec![],
+            nut10: None,
+        };
+
+        assert!(matches!(
+            payment_request.to_bech32_string(),
+            Err(Error::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_duplicate_nut10_tlv() {
+        let nut10_a: [u8; 8] = [0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, b'A'];
+        let nut10_b: [u8; 8] = [0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, b'B'];
+
+        let mut writer = TlvWriter::new();
+        writer
+            .write_tlv(0x08, &nut10_a)
+            .expect("nut10_a should fit in TLV length");
+        writer
+            .write_tlv(0x08, &nut10_b)
+            .expect("nut10_b should fit in TLV length");
+
+        let hrp = Hrp::parse(CREQ_B_HRP).expect("valid HRP");
+        let encoded = bech32::encode_upper::<Bech32m>(hrp, &writer.into_bytes())
+            .expect("valid bech32m encoding");
+
+        assert!(matches!(
+            PaymentRequest::from_bech32_string(&encoded),
+            Err(Error::InvalidStructure)
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_malformed_mint_preferred_tlv() {
+        for value in [&[][..], &[0, 1][..]] {
+            let mut writer = TlvWriter::new();
+            writer
+                .write_tlv(0x09, value)
+                .expect("mint_preferred should fit in TLV length");
+
+            assert!(matches!(
+                PaymentRequest::from_bech32_bytes(&writer.into_bytes()),
+                Err(Error::InvalidLength)
+            ));
+        }
+
+        let mut writer = TlvWriter::new();
+        writer
+            .write_tlv(0x09, &[2])
+            .expect("mint_preferred should fit in TLV length");
+
+        assert!(matches!(
+            PaymentRequest::from_bech32_bytes(&writer.into_bytes()),
+            Err(Error::InvalidStructure)
+        ));
+    }
+
+    #[test]
+    fn test_decode_mint_preferred_values() {
+        for (value, expected) in [(0, false), (1, true)] {
+            let mut writer = TlvWriter::new();
+            writer
+                .write_tlv(0x09, &[value])
+                .expect("mint_preferred should fit in TLV length");
+
+            let decoded = PaymentRequest::from_bech32_bytes(&writer.into_bytes())
+                .expect("valid mint_preferred value should decode");
+
+            assert_eq!(decoded.mint_preferred, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_rejects_tag_tuple_key_exceeding_u8_length() {
+        let tag = vec!["x".repeat(usize::from(u8::MAX) + 1)];
+
+        assert!(matches!(
+            PaymentRequest::encode_tag_tuple(&tag),
+            Err(Error::TagTooLong)
+        ));
+    }
+
+    #[test]
+    fn test_rejects_tag_tuple_value_exceeding_u8_length() {
+        let tag = vec!["k".to_string(), "x".repeat(usize::from(u8::MAX) + 1)];
+
+        assert!(matches!(
+            PaymentRequest::encode_tag_tuple(&tag),
+            Err(Error::TagTooLong)
+        ));
     }
 }

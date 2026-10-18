@@ -12,52 +12,45 @@ license.workspace = true
 
 [features]
 default = ["mint", "wallet", "nostr", "bip353"]
-wallet = ["dep:futures", "cdk-common/wallet", "cdk-common/http", "dep:rustls"]
-nostr = ["wallet", "dep:nostr-sdk", "cdk-common/nostr"]
-npubcash = ["wallet", "nostr", "dep:cdk-npubcash"]
+wallet = [
+    "dep:cdk-http-client",
+    "dep:futures",
+    "cdk-common/wallet",
+    "cdk-common/http",
+    "dep:rustls",
+]
+nostr = ["wallet", "dep:nostr", "dep:nostr-sdk", "cdk-common/nostr"]
+npubcash = ["wallet", "nostr", "dep:cdk-nostr", "cdk-nostr/npubcash"]
+nwc = ["wallet", "nostr", "dep:cdk-nostr", "cdk-nostr/nwc"]
 mint = ["dep:futures", "cdk-common/mint", "cdk-common/http", "cdk-signatory"]
-bip353 = ["dep:hickory-resolver", "cdk-common/bip353"]
-# We do not commit to a MSRV with swagger enabled
-swagger = ["mint", "dep:utoipa", "cdk-common/swagger"]
+bip353 = ["wallet", "cdk-common/bip353", "cdk-http-client?/bip353"]
 bench = []
 http_subscription = []
 tor = [
     "wallet",
-    "dep:arti-client",
-    "dep:arti-hyper",
-    "dep:hyper",
-    "dep:http",
-    "dep:rustls",
-    "dep:tor-rtcompat",
-    "dep:tls-api",
-    "dep:tls-api-native-tls",
+    "cdk-http-client/tor",
 ]
 prometheus = ["dep:cdk-prometheus"]
 
 [dependencies]
-arc-swap = "1.7.1"
-cdk-common.workspace = true
-cbor-diag.workspace = true
+arc-swap.workspace = true
+cdk-common = { workspace = true, default-features = false }
 async-trait.workspace = true
 anyhow.workspace = true
 bitcoin.workspace = true
-ciborium.workspace = true
 lightning.workspace = true
 lightning-invoice.workspace = true
-regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_with.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 
 futures = { workspace = true, optional = true, features = ["alloc"] }
 url.workspace = true
-utoipa = { workspace = true, optional = true }
 uuid.workspace = true
-jsonwebtoken.workspace = true
 nostr-sdk = { workspace = true, optional = true }
-cdk-npubcash = { workspace = true, optional = true }
+nostr = { workspace = true, optional = true }
+cdk-nostr = { workspace = true, default-features = false, optional = true }
 cdk-prometheus = {workspace = true, optional = true}
 bitcoin-payment-instructions = { workspace = true }
 web-time.workspace = true
@@ -65,34 +58,28 @@ zeroize = "1"
 tokio-util.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-hickory-resolver = { version = "0.25.2", optional = true, features = ["dnssec-ring"] }
+cdk-http-client = { workspace = true, default-features = false, optional = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "time",
     "macros",
     "sync",
 ] }
-getrandom = { version = "0.2" }
+getrandom = { version = "0.4" }
 cdk-signatory = { workspace = true, features = ["grpc"], optional = true }
 # Tor dependencies (optional; enabled by feature "tor")
-hyper = { version = "0.14", optional = true, features = ["client", "http1", "http2"] }
-http = { version = "0.2", optional = true }
-arti-client = { version = "0.19.0", optional = true, default-features = false, features = ["tokio", "rustls"] }
-arti-hyper = { version = "0.19.0", optional = true }
 rustls = { workspace = true, optional = true }
-tor-rtcompat = { version = "0.19.0", optional = true, features = ["tokio", "rustls"] }
-tls-api = { version = "0.9", optional = true }
-tls-api-native-tls = { version = "0.9", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+cdk-http-client = { workspace = true, default-features = false, optional = true }
+tokio = { workspace = true, default-features = false, features = ["rt", "macros", "sync", "time"] }
 cdk-signatory = { workspace = true, default-features = false }
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 ring = { version = "0.17.14", features = ["wasm32_unknown_unknown_js"] }
 rustls = { workspace = true, optional = true }
 
 uuid = { workspace = true, features = ["js"] }
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { workspace = true }
 
 [[example]]
 name = "mint-token"
@@ -163,6 +150,10 @@ name = "npubcash"
 required-features = ["npubcash"]
 
 [[example]]
+name = "nwc"
+required-features = ["nwc"]
+
+[[example]]
 name = "multimint-npubcash"
 required-features = ["npubcash"]
 
@@ -183,17 +174,25 @@ name = "restore-wallet"
 required-features = ["wallet"]
 
 [[example]]
+name = "restore-mint-quote"
+required-features = ["wallet"]
+
+[[example]]
 name = "revoke_send"
 required-features = ["wallet"]
 
 [dev-dependencies]
+rusqlite = { version = "0.31", default-features = false }
 rand.workspace = true
 cdk-sqlite.workspace = true
+cdk-postgres.workspace = true
 cdk-fake-wallet.workspace = true
 bip39.workspace = true
 tracing-subscriber.workspace = true
 criterion.workspace = true
 anyhow.workspace = true
+nwc = { version = "0.45.0", default-features = false }
+serde_urlencoded = { version = "0.7", default-features = false }
 ureq = { version = "3.1.0", features = ["json"] }
 tokio = { workspace = true, features = ["full"] }
 

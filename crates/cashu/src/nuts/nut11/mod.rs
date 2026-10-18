@@ -15,7 +15,9 @@ use super::nut00::Witness;
 use super::nut01::PublicKey;
 use super::nut05::MeltRequest;
 use super::{Kind, Nut10Secret, Proof, Proofs, SecretKey};
-use crate::nut10::{get_pubkeys_and_required_sigs, Conditions, SpendingConditionVerification};
+use crate::nut10::{
+    get_pubkeys_and_required_sigs, Conditions, SpendingConditionVerification, MAX_LOCKING_SLOTS,
+};
 use crate::nuts::nut00::BlindedMessage;
 use crate::util::unix_time;
 use crate::{SpendingConditions, SwapRequest};
@@ -58,6 +60,17 @@ pub enum Error {
     /// Duplicate public key in multisig (same x-coordinate)
     #[error("Duplicate public key in multisig (same x-coordinate)")]
     DuplicatePubkey,
+    /// More locking slots requested than NUT-28 allows
+    #[error(
+        "Too many pubkeys, {slots} slots provided, maximum allowed is {MAX_LOCKING_SLOTS} in total"
+    )]
+    TooManyPubkeys {
+        /// Slots the conditions would occupy
+        slots: usize,
+    },
+    /// Refund keys given without a locktime, so the refund path is unreachable
+    #[error("refund keys require a locktime")]
+    RefundKeysRequireLocktime,
     /// Impossible multisig configuration: num_sigs exceeds available pubkeys
     #[error(
         "Impossible multisig: required {required} signatures but only {available} keys available"
@@ -82,6 +95,9 @@ pub enum Error {
     /// SIG_ALL not supported in this context
     #[error("SIG_ALL proofs must be verified using a different method")]
     SigAllNotSupportedHere,
+    /// Number of required signatures cannot be zero
+    #[error("Number of required signatures must be 1 or greater")]
+    ZeroSignaturesRequired,
     /// Serde Json error
     #[error(transparent)]
     SerdeJsonError(#[from] serde_json::Error),
@@ -95,7 +111,6 @@ pub enum Error {
 
 /// P2Pk Witness
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct P2PKWitness {
     /// Signatures
     pub signatures: Vec<String>,
@@ -576,6 +591,31 @@ mod tests {
     use crate::secret::Secret;
     use crate::{Amount, BlindedMessage};
 
+    fn proof_for_enforce_sig_flag(num_sigs: u64) -> Proof {
+        let primary = SecretKey::generate().public_key();
+        let signer_two = SecretKey::generate().public_key();
+        let signer_three = SecretKey::generate().public_key();
+        let conditions = Conditions {
+            pubkeys: Some(vec![signer_two, signer_three]),
+            num_sigs: Some(num_sigs),
+            sig_flag: SigFlag::SigAll,
+            ..Default::default()
+        };
+        let secret: Secret = SpendingConditions::new_p2pk(primary, Some(conditions))
+            .try_into()
+            .unwrap();
+
+        Proof {
+            amount: Amount::ONE,
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            secret,
+            c: primary,
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        }
+    }
+
     #[test]
     fn test_secret_ser() {
         let data = PublicKey::from_str(
@@ -604,7 +644,9 @@ mod tests {
             num_sigs_refund: None,
         };
 
-        let secret: Nut10Secret = SpendingConditions::new_p2pk(data, Some(conditions)).into();
+        let secret: Nut10Secret = SpendingConditions::new_p2pk(data, Some(conditions))
+            .try_into()
+            .unwrap();
 
         let secret_str = serde_json::to_string(&secret).unwrap();
 
@@ -660,6 +702,28 @@ mod tests {
         proof.sign_p2pk(signing_key_two).unwrap();
 
         assert!(proof.verify_p2pk().is_ok());
+    }
+
+    #[test]
+    fn test_p2pk_witness_is_empty_tracks_signatures() {
+        assert!(P2PKWitness::default().is_empty());
+        assert!(!P2PKWitness {
+            signatures: vec!["signature".to_string()],
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn test_enforce_sig_flag_keeps_highest_required_signature_count() {
+        let proofs = vec![proof_for_enforce_sig_flag(2), proof_for_enforce_sig_flag(3)]
+            .into_iter()
+            .collect();
+
+        let enforced = enforce_sig_flag(proofs);
+
+        assert_eq!(enforced.sig_flag, SigFlag::SigAll);
+        assert_eq!(enforced.sigs_required, 3);
+        assert_eq!(enforced.pubkeys.len(), 6);
     }
 
     #[test]
@@ -750,6 +814,23 @@ mod tests {
     }
 
     #[test]
+    fn test_blinded_message_verify_p2pk_accepts_single_valid_signature() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+
+        let mut blinded_message = BlindedMessage {
+            amount: Amount::ZERO,
+            blinded_secret: pubkey,
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            witness: None,
+        };
+
+        blinded_message.sign_p2pk(secret_key).unwrap();
+
+        assert!(blinded_message.verify_p2pk(&vec![pubkey], 1).is_ok());
+    }
+
+    #[test]
     fn test_blinded_message_verify_p2pk_duplicate_xonly() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
@@ -778,6 +859,9 @@ mod tests {
         );
     }
 
+    /// The secret is built directly rather than through `SpendingConditions`,
+    /// which now rejects the duplicate: a hostile token can still carry both
+    /// keys, and verification has to reject it.
     #[test]
     fn test_duplicate_key_in_main_pathway() {
         let secret_key = SecretKey::generate();
@@ -798,9 +882,12 @@ mod tests {
             num_sigs_refund: None,
         };
 
-        let secret: Secret = SpendingConditions::new_p2pk(pk_02, Some(conditions))
-            .try_into()
-            .unwrap();
+        let secret: Secret = Nut10Secret::new(
+            Kind::P2PK,
+            crate::nuts::SecretData::new(pk_02.to_hex(), Some(conditions)),
+        )
+        .try_into()
+        .unwrap();
 
         let mut proof = Proof {
             keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
@@ -852,10 +939,12 @@ mod tests {
             num_sigs_refund: Some(2),
         };
 
-        let secret: Secret =
-            SpendingConditions::new_p2pk(secret_key.public_key(), Some(conditions))
-                .try_into()
-                .unwrap();
+        let secret: Secret = Nut10Secret::new(
+            Kind::P2PK,
+            crate::nuts::SecretData::new(secret_key.public_key().to_hex(), Some(conditions)),
+        )
+        .try_into()
+        .unwrap();
 
         let proof = Proof {
             keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
@@ -1036,10 +1125,10 @@ mod tests {
                 .unwrap();
         let pubkey = secret_key.public_key();
 
-        // Create conditions with explicit authorized pubkey
+        // The data key is the authorized key; repeating it in the tag would be a duplicate
         let conditions = Conditions {
             sig_flag: SigFlag::SigAll,
-            pubkeys: Some(vec![pubkey]),
+            pubkeys: None,
             ..Default::default()
         };
 
@@ -1071,7 +1160,7 @@ mod tests {
         // Create conditions with SIG_INPUTS instead of SIG_ALL
         let conditions = Conditions {
             sig_flag: SigFlag::SigInputs,
-            pubkeys: Some(vec![pubkey]),
+            pubkeys: None,
             ..Default::default()
         };
 
@@ -1224,7 +1313,7 @@ mod tests {
 
         let conditions = Conditions {
             sig_flag: SigFlag::SigAll,
-            pubkeys: Some(vec![pubkey]),
+            pubkeys: None,
             ..Default::default()
         };
 
@@ -2178,7 +2267,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::nut10::Error::NUT11(Error::ImpossibleMultisigConfiguration {
+                crate::nut10::Error::NUT11(Error::ImpossibleRefundMultisigConfiguration {
                     required: 3,
                     available: 1,
                 })
@@ -2200,7 +2289,7 @@ mod tests {
 
         // 2 refund keys, requiring 2 should succeed
         let result = Conditions::new(
-            None,
+            Some(crate::util::unix_time() + 3600),
             None,
             Some(vec![refund_key1, refund_key2]),
             None,
@@ -2208,6 +2297,315 @@ mod tests {
             Some(2),
         );
         assert!(result.is_ok(), "2-of-2 refund multisig should be valid");
+    }
+
+    /// Two keys sharing an x-coordinate, the way a caller repeating a key
+    /// with the other parity byte would supply them.
+    fn duplicate_x_only_pair() -> (PublicKey, PublicKey) {
+        let secret_key = SecretKey::generate();
+        let mut bytes = secret_key.public_key().to_bytes();
+        bytes[0] = 0x02;
+        let pk_02 = PublicKey::from_slice(&bytes).unwrap();
+        bytes[0] = 0x03;
+        let pk_03 = PublicKey::from_slice(&bytes).unwrap();
+        (pk_02, pk_03)
+    }
+
+    fn assert_duplicate_pubkey(err: crate::nut10::Error) {
+        assert!(
+            matches!(err, crate::nut10::Error::NUT11(Error::DuplicatePubkey)),
+            "Expected DuplicatePubkey, got: {err:?}"
+        );
+    }
+
+    /// A key repeated between `data` and the `pubkeys` tag is malformed under
+    /// NUT-11. Collapsing it silently would change the signer set the caller
+    /// asked for, so construction rejects it instead.
+    #[test]
+    fn test_duplicate_key_rejected_at_construction() {
+        let (pk_02, pk_03) = duplicate_x_only_pair();
+
+        let conditions = Conditions {
+            locktime: None,
+            pubkeys: Some(vec![pk_03]),
+            refund_keys: None,
+            num_sigs: None,
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let result: Result<Secret, _> =
+            SpendingConditions::new_p2pk(pk_02, Some(conditions)).try_into();
+
+        assert_duplicate_pubkey(result.expect_err("duplicate key should be rejected"));
+    }
+
+    /// The threshold must not change which error a repeated key produces:
+    /// 1-of-[A, A] and 2-of-[A, A] are the same malformed input.
+    #[test]
+    fn test_duplicate_key_multisig_reports_the_duplicate() {
+        let (pk_02, pk_03) = duplicate_x_only_pair();
+
+        let conditions = Conditions {
+            locktime: None,
+            pubkeys: Some(vec![pk_03]),
+            refund_keys: None,
+            num_sigs: Some(2),
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let result: Result<Secret, _> =
+            SpendingConditions::new_p2pk(pk_02, Some(conditions)).try_into();
+
+        assert_duplicate_pubkey(result.expect_err("2-of-2 over one key should be rejected"));
+    }
+
+    /// A threshold above the number of distinct keys is still its own error.
+    #[test]
+    fn test_impossible_multisig_is_still_reported() {
+        let data = SecretKey::generate().public_key();
+        let other = SecretKey::generate().public_key();
+
+        let conditions = Conditions {
+            locktime: None,
+            pubkeys: Some(vec![other]),
+            refund_keys: None,
+            num_sigs: Some(3),
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let result: Result<Secret, _> =
+            SpendingConditions::new_p2pk(data, Some(conditions)).try_into();
+        let err = result.expect_err("3-of-2 should be rejected");
+
+        assert!(
+            matches!(
+                err,
+                crate::nut10::Error::NUT11(Error::ImpossibleMultisigConfiguration {
+                    required: 3,
+                    available: 2,
+                })
+            ),
+            "Expected ImpossibleMultisigConfiguration, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_refund_key_rejected_at_construction() {
+        let (pk_02, pk_03) = duplicate_x_only_pair();
+
+        let conditions = Conditions {
+            locktime: Some(unix_time() + 3600),
+            pubkeys: None,
+            refund_keys: Some(vec![pk_02, pk_03]),
+            num_sigs: None,
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let result: Result<Secret, _> =
+            SpendingConditions::new_p2pk(SecretKey::generate().public_key(), Some(conditions))
+                .try_into();
+
+        assert_duplicate_pubkey(result.expect_err("duplicate refund key should be rejected"));
+    }
+
+    /// The primary and refund pathways are checked separately, so a key that
+    /// can sign before the locktime and reclaim after it stays legal.
+    #[test]
+    fn test_key_may_appear_in_both_pathways() {
+        let pubkey = SecretKey::generate().public_key();
+
+        let conditions = Conditions {
+            locktime: Some(unix_time() + 3600),
+            pubkeys: None,
+            refund_keys: Some(vec![pubkey]),
+            num_sigs: None,
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let secret: Result<Secret, _> =
+            SpendingConditions::new_p2pk(pubkey, Some(conditions)).try_into();
+
+        assert!(
+            secret.is_ok(),
+            "a key in both pathways is not a duplicate: {secret:?}"
+        );
+    }
+
+    #[test]
+    fn test_htlc_duplicate_pubkeys_rejected_at_construction() {
+        use bitcoin::hashes::{sha256, Hash};
+
+        let (pk_02, pk_03) = duplicate_x_only_pair();
+
+        let conditions = Conditions {
+            locktime: None,
+            pubkeys: Some(vec![pk_02, pk_03]),
+            refund_keys: None,
+            num_sigs: None,
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let result: Result<Secret, _> = SpendingConditions::HTLCConditions {
+            data: sha256::Hash::hash(b"preimage"),
+            conditions: Some(conditions),
+        }
+        .try_into();
+
+        assert_duplicate_pubkey(result.expect_err("duplicate HTLC key should be rejected"));
+    }
+
+    #[test]
+    fn test_htlc_duplicate_refund_key_rejected_at_construction() {
+        use bitcoin::hashes::{sha256, Hash};
+
+        let (pk_02, pk_03) = duplicate_x_only_pair();
+
+        let conditions = Conditions {
+            locktime: Some(unix_time() + 3600),
+            pubkeys: None,
+            refund_keys: Some(vec![pk_02, pk_03]),
+            num_sigs: None,
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let result: Result<Secret, _> = SpendingConditions::HTLCConditions {
+            data: sha256::Hash::hash(b"preimage"),
+            conditions: Some(conditions),
+        }
+        .try_into();
+
+        assert_duplicate_pubkey(result.expect_err("duplicate refund key should be rejected"));
+    }
+
+    /// `Conditions::new` cannot see the P2PK `data` key, but it still owns the
+    /// two lists it is given.
+    #[test]
+    fn test_conditions_new_rejects_duplicates_in_each_list() {
+        let (pk_02, pk_03) = duplicate_x_only_pair();
+
+        let err = Conditions::new(None, Some(vec![pk_02, pk_03]), None, None, None, None)
+            .expect_err("duplicate pubkeys should be rejected");
+        assert_duplicate_pubkey(err);
+
+        let err = Conditions::new(
+            Some(unix_time() + 3600),
+            None,
+            Some(vec![pk_02, pk_03]),
+            None,
+            None,
+            None,
+        )
+        .expect_err("duplicate refund keys should be rejected");
+        assert_duplicate_pubkey(err);
+    }
+
+    /// Slot indices exist only for P2BK blinding. A plain lock is bounded by
+    /// what verification accepts, and verification never counts slots.
+    #[test]
+    fn test_plain_p2pk_is_not_slot_capped() {
+        let data = SecretKey::generate().public_key();
+        let pubkeys: Vec<PublicKey> = (0..11)
+            .map(|_| SecretKey::generate().public_key())
+            .collect();
+
+        let conditions = Conditions {
+            locktime: None,
+            pubkeys: Some(pubkeys),
+            refund_keys: None,
+            num_sigs: Some(1),
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let secret: Secret = SpendingConditions::new_p2pk(data, Some(conditions))
+            .try_into()
+            .expect("twelve keys are a valid NUT-11 lock");
+
+        let nut10: Nut10Secret = secret.try_into().unwrap();
+        let requirements = get_pubkeys_and_required_sigs(&nut10, unix_time()).unwrap();
+
+        assert_eq!(requirements.pubkeys.len(), 12);
+    }
+
+    /// The HTLC `data` is a preimage hash, not a key, so it never occupies a
+    /// slot and the P2BK ceiling must not reach this path.
+    #[test]
+    fn test_plain_htlc_is_not_slot_capped() {
+        use bitcoin::hashes::{sha256, Hash};
+
+        let pubkeys: Vec<PublicKey> = (0..11)
+            .map(|_| SecretKey::generate().public_key())
+            .collect();
+        let refund_key = SecretKey::generate().public_key();
+
+        let conditions = Conditions {
+            locktime: None,
+            pubkeys: Some(pubkeys.clone()),
+            refund_keys: None,
+            num_sigs: Some(1),
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+        let hash = sha256::Hash::hash(b"preimage");
+
+        let result: Result<Secret, _> = SpendingConditions::HTLCConditions {
+            data: hash,
+            conditions: Some(conditions),
+        }
+        .try_into();
+        assert!(
+            result.is_ok(),
+            "eleven pubkeys should build: {:?}",
+            result.err()
+        );
+
+        let conditions = Conditions {
+            locktime: Some(unix_time() + 3600),
+            pubkeys: Some(pubkeys[..10].to_vec()),
+            refund_keys: Some(vec![refund_key]),
+            num_sigs: Some(1),
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: Some(1),
+        };
+
+        let result: Result<Secret, _> = SpendingConditions::HTLCConditions {
+            data: hash,
+            conditions: Some(conditions),
+        }
+        .try_into();
+        assert!(
+            result.is_ok(),
+            "ten pubkeys plus a refund key should build: {:?}",
+            result.err()
+        );
+    }
+
+    /// Refund keys only become spendable once the locktime passes, so omitting
+    /// it would lock the funds behind a path that never opens.
+    #[test]
+    fn test_conditions_refund_keys_require_locktime() {
+        let refund_key = PublicKey::from_str(
+            "033281c37677ea273eb7183b783067f5244933ef78d8c3f15b1a77cb246099c26e",
+        )
+        .unwrap();
+
+        let err = Conditions::new(None, None, Some(vec![refund_key]), None, None, None)
+            .expect_err("refund keys without a locktime should be rejected");
+
+        assert!(
+            matches!(
+                err,
+                crate::nut10::Error::NUT11(Error::RefundKeysRequireLocktime)
+            ),
+            "Expected RefundKeysRequireLocktime, got: {err:?}"
+        );
     }
 
     #[test]
@@ -2222,7 +2620,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::nut10::Error::NUT11(Error::ImpossibleMultisigConfiguration {
+                crate::nut10::Error::NUT11(Error::ImpossibleRefundMultisigConfiguration {
                     required: 1,
                     available: 0,
                 })
@@ -2263,5 +2661,151 @@ mod tests {
             None,
         );
         assert!(result.is_err(), "4-of-3 should be impossible");
+    }
+
+    #[test]
+    fn test_p2pk_num_sigs_zero_bypasses_signature_requirement() {
+        // n_sigs=0 makes verify_p2pk() evaluate `valid_sig_count >= required_sigs`
+        // as `0 >= 0` which is trivially true. An empty P2PKWitness therefore
+        // passes verification with no cryptographic check at all.
+        //
+        // Per bkb's record of NUT-11: n_sigs must be "a positive integer".
+        // n_sigs=0 is out-of-spec and produces an anyone-can-spend P2PK proof.
+        //
+        // FAILS on HEAD (verify_p2pk returns Ok). PASSES once fixed.
+        let data_pubkey = PublicKey::from_str(
+            "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+        )
+        .unwrap();
+
+        let conditions = Conditions {
+            locktime: None,
+            pubkeys: None,
+            refund_keys: None,
+            num_sigs: Some(0), // invalid: not a positive integer per NUT-11
+            sig_flag: SigFlag::SigInputs,
+            num_sigs_refund: None,
+        };
+
+        let result: Result<Secret, _> =
+            SpendingConditions::new_p2pk(data_pubkey, Some(conditions)).try_into();
+
+        assert!(matches!(
+            result,
+            Err(crate::nut10::Error::NUT11(Error::ZeroSignaturesRequired))
+        ));
+    }
+
+    #[test]
+    fn test_sig_all_p2pk_nsigs_zero_bypasses_sig_check() {
+        let data_pubkey = PublicKey::from_str(
+            "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+        )
+        .unwrap();
+        let extra_pubkey = PublicKey::from_str(
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+        )
+        .unwrap();
+
+        // Note: We bypass Conditions::new() by constructing it directly,
+        // to test the low-level verify routine. But because we implemented
+        // ZeroSignaturesRequired inside TryFrom for Conditions too,
+        // Secret::try_into() will fail on building the conditions!
+        // To make the test actually exercise verify_sig_all_p2pk on a "bad" Secret,
+        // we have to assert that either creation fails or verify_sig_all_p2pk fails.
+        // Given our fix prevents creation entirely, the test should check that.
+        let nut10_secret = Nut10Secret::new(
+            crate::nuts::nut10::Kind::P2PK,
+            crate::nuts::nut10::SecretData::new(
+                data_pubkey.to_string(),
+                Some(vec![
+                    vec!["pubkeys".to_string(), extra_pubkey.to_string()],
+                    vec!["n_sigs".to_string(), "0".to_string()],
+                    vec!["sigflag".to_string(), "SIG_ALL".to_string()],
+                ]),
+            ),
+        );
+        let conditions_res = crate::nuts::nut10::Conditions::try_from(
+            nut10_secret.secret_data().tags().cloned().unwrap(),
+        );
+        assert!(
+            conditions_res.is_err(),
+            "Conditions should fail to parse due to n_sigs=0"
+        );
+    }
+
+    #[test]
+    fn test_refund_path_num_sigs_refund_zero_bypasses_signature_check() {
+        // When n_sigs_refund=Some(0) and refund_keys are present,
+        // get_pubkeys_and_required_sigs sets required_sigs=0 for the RefundPath.
+        // In verify_p2pk the guard
+        //   if refund_path.required_sigs == 0 { return Ok(()); }
+        // fires once locktime has passed, letting anyone spend with an empty
+        // witness and no valid refund-key signature.
+        //
+        // FAILS on HEAD (verify_p2pk returns Ok). PASSES once the fix is applied.
+
+        let data_pubkey = PublicKey::from_str(
+            "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+        )
+        .unwrap();
+
+        let refund_pubkey = PublicKey::from_str(
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+        )
+        .unwrap();
+
+        let nut10_secret = Nut10Secret::new(
+            crate::nuts::nut10::Kind::P2PK,
+            crate::nuts::nut10::SecretData::new(
+                data_pubkey.to_string(),
+                Some(vec![
+                    vec!["locktime".to_string(), "1".to_string()],
+                    vec!["refund".to_string(), refund_pubkey.to_string()],
+                    vec!["n_sigs".to_string(), "1".to_string()],
+                    vec!["n_sigs_refund".to_string(), "0".to_string()],
+                ]),
+            ),
+        );
+        let conditions_res = crate::nuts::nut10::Conditions::try_from(
+            nut10_secret.secret_data().tags().cloned().unwrap(),
+        );
+        assert!(
+            conditions_res.is_err(),
+            "Conditions should fail to parse due to n_sigs=0"
+        );
+    }
+
+    #[test]
+    fn test_sig_all_p2pk_nsigs_refund_zero_bypasses_refund_sig_check() {
+        let data_pubkey = PublicKey::from_str(
+            "026562efcfadc8e86d44da6a8adf80633d974302e62c850774db1fb36ff4cc7198",
+        )
+        .unwrap();
+        let refund_pubkey = PublicKey::from_str(
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+        )
+        .unwrap();
+
+        let nut10_secret = Nut10Secret::new(
+            crate::nuts::nut10::Kind::P2PK,
+            crate::nuts::nut10::SecretData::new(
+                data_pubkey.to_string(),
+                Some(vec![
+                    vec!["locktime".to_string(), "1".to_string()],
+                    vec!["refund".to_string(), refund_pubkey.to_string()],
+                    vec!["n_sigs".to_string(), "1".to_string()],
+                    vec!["n_sigs_refund".to_string(), "0".to_string()],
+                    vec!["sigflag".to_string(), "SIG_ALL".to_string()],
+                ]),
+            ),
+        );
+        let conditions_res = crate::nuts::nut10::Conditions::try_from(
+            nut10_secret.secret_data().tags().cloned().unwrap(),
+        );
+        assert!(
+            conditions_res.is_err(),
+            "Conditions should fail to parse due to n_sigs_refund=0"
+        );
     }
 }

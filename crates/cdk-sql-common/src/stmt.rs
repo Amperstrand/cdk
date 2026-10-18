@@ -1,9 +1,8 @@
 //! Stataments mod
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use cdk_common::database::Error;
-use once_cell::sync::Lazy;
 
 use crate::database::DatabaseExecutor;
 use crate::value::Value;
@@ -138,13 +137,24 @@ pub fn split_sql_parts(input: &str) -> Result<Vec<SqlPart>, SqlParseError> {
             }
 
             ':' => {
+                chars.next(); // consume ':'
+
+                if chars.peek() == Some(&':') {
+                    current.push(':');
+                    current.push(
+                        chars
+                            .next()
+                            .ok_or(SqlParseError::UnterminatedStringLiteral)?,
+                    );
+                    continue;
+                }
+
                 // Flush current raw SQL
                 if !current.is_empty() {
                     parts.push(SqlPart::Raw(current.clone().into()));
                     current.clear();
                 }
 
-                chars.next(); // consume ':'
                 let mut name = String::new();
 
                 while let Some(&next) = chars.peek() {
@@ -238,7 +248,14 @@ impl Statement {
     /// to be more widely supported, although it can be reimplemented with other formats since part
     /// is public
     pub fn to_sql(self) -> Result<(String, Vec<Value>), Error> {
-        if let Some(cached_sql) = self.cached_sql {
+        let has_set_placeholder = self.parts.iter().any(|part| {
+            matches!(
+                part,
+                SqlPart::Placeholder(_, Some(PlaceholderValue::Set(_)))
+            )
+        });
+
+        if let (false, Some(cached_sql)) = (has_set_placeholder, self.cached_sql) {
             let sql = cached_sql.to_string();
             let values = self
                 .parts
@@ -402,7 +419,8 @@ impl Statement {
 /// Creates a new query statement
 #[inline(always)]
 pub fn query(sql: &str) -> Result<Statement, Error> {
-    static CACHE: Lazy<Arc<RwLock<Cache>>> = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+    static CACHE: LazyLock<Arc<RwLock<Cache>>> =
+        LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
     Statement::new(sql, CACHE.clone()).map_err(|e| Error::Database(Box::new(e)))
 }
 
@@ -416,5 +434,37 @@ mod tests {
         let result = stmt.bind_vec("ids", Vec::<Vec<u8>>::new());
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::EmptyInClause(name) if name == "ids"));
+    }
+
+    #[test]
+    fn parser_preserves_postgres_cast_operator() {
+        let stmt = query("SELECT (ord - 1)::int AS matched WHERE id = :id")
+            .unwrap()
+            .bind("id", "quote-id");
+
+        let (sql, values) = stmt.to_sql().unwrap();
+
+        assert_eq!(sql, "SELECT (ord - 1)::int AS matched WHERE id = $1");
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn bind_vec_ignores_cached_sql_for_same_query_string() {
+        let raw_sql = "SELECT * FROM cached_sql_vec_bug WHERE id IN (:ids)";
+
+        let (cached_sql, cached_values) =
+            query(raw_sql).unwrap().bind("ids", 1_i64).to_sql().unwrap();
+        assert!(cached_sql.contains("$1"));
+        assert_eq!(cached_values.len(), 1);
+
+        let (sql, values) = query(raw_sql)
+            .unwrap()
+            .bind_vec("ids", vec![1_i64, 2, 3])
+            .unwrap()
+            .to_sql()
+            .unwrap();
+
+        assert!(sql.contains("$1, $2, $3"));
+        assert_eq!(values.len(), 3);
     }
 }

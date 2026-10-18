@@ -1,0 +1,19 @@
+[package]
+name = "cdk-ffi-go"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+version.workspace = true
+readme.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+name = "cdk_ffi_go"
+
+[dependencies]
+cdk-ffi = { workspace = true, features = ["npubcash", "nwc", "bip353"] }
+
+[lints]
+workspace = true

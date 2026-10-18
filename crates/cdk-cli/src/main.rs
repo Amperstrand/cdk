@@ -23,6 +23,7 @@ use url::Url;
 
 mod nostr_storage;
 mod sub_commands;
+mod terminal;
 mod token_storage;
 mod utils;
 
@@ -56,6 +57,9 @@ struct Cli {
     /// NWS Proxy
     #[arg(short, long)]
     proxy: Option<Url>,
+    /// Disable TLS certificate verification for proxied HTTPS requests. This permits MITM.
+    #[arg(long)]
+    danger_accept_invalid_certs: bool,
     /// Currency unit to use for the wallet
     #[arg(short, long, global = true)]
     unit: Option<String>,
@@ -108,7 +112,7 @@ enum Commands {
     /// Update Mint Url
     UpdateMintUrl(sub_commands::update_mint_url::UpdateMintUrlSubCommand),
     /// Get proofs from mint.
-    ListMintProofs,
+    ListMintProofs(sub_commands::list_mint_proofs::ListMintProofsSubCommand),
     /// Decode a payment request
     DecodeRequest(sub_commands::decode_request::DecodePaymentRequestSubCommand),
     /// Pay a payment request
@@ -223,7 +227,7 @@ async fn main() -> Result<()> {
     let currency_unit = match args.unit {
         Some(unit) => match unit.to_lowercase().as_str() {
             "" => bail!("Currency unit cannot be empty. Omit the flag to use the default 'sat'."),
-            _ => Some(CurrencyUnit::from_str(&unit).unwrap_or(CurrencyUnit::Custom(unit))),
+            _ => Some(CurrencyUnit::from_str(&unit)?),
         },
         None => None,
     };
@@ -237,6 +241,12 @@ async fn main() -> Result<()> {
 
         if let Some(proxy_url) = &args.proxy {
             builder = builder.proxy_url(proxy_url.clone());
+            if args.danger_accept_invalid_certs {
+                tracing::warn!(
+                    "--danger-accept-invalid-certs disables TLS certificate verification"
+                );
+                builder = builder.danger_accept_invalid_certs(true);
+            }
         }
 
         #[cfg(all(feature = "tor", not(target_arch = "wasm32")))]
@@ -260,7 +270,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    match &args.command {
+    let result = match &args.command {
         Commands::DecodeToken(sub_command_args) => {
             sub_commands::decode_token::decode_token(sub_command_args)
         }
@@ -293,7 +303,7 @@ async fn main() -> Result<()> {
             sub_commands::check_requests::check_requests(&wallet_repository).await
         }
         Commands::MintInfo(sub_command_args) => {
-            sub_commands::mint_info::mint_info(args.proxy, sub_command_args).await
+            sub_commands::mint_info::mint_info(&wallet_repository, sub_command_args).await
         }
         Commands::Mint(sub_command_args) => {
             sub_commands::mint::mint(&wallet_repository, sub_command_args, &default_unit).await
@@ -324,8 +334,8 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Commands::ListMintProofs => {
-            sub_commands::list_mint_proofs::proofs(&wallet_repository).await
+        Commands::ListMintProofs(sub_command_args) => {
+            sub_commands::list_mint_proofs::proofs(&wallet_repository, sub_command_args).await
         }
         Commands::DecodeRequest(sub_command_args) => {
             sub_commands::decode_request::decode_payment_request(sub_command_args)
@@ -392,5 +402,61 @@ async fn main() -> Result<()> {
             )
             .await
         }
+    };
+
+    // Errors may embed mint-controlled response bodies; escape control
+    // characters so a malicious mint cannot inject terminal escape sequences.
+    if let Err(err) = result {
+        eprintln!("Error: {}", terminal::escape_control(&format!("{err:#}")));
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_mint_quote_recovery_options() {
+        let cli = Cli::try_parse_from([
+            "cdk-cli",
+            "mint",
+            "https://mint.example.com",
+            "--quote-id",
+            "lost-quote",
+            "--method",
+            "onchain",
+            "--key-search-limit",
+            "10000",
+        ])
+        .expect("quote recovery should not require an amount");
+        assert!(matches!(cli.command, Commands::Mint(_)));
+    }
+
+    #[test]
+    fn danger_accept_invalid_certs_defaults_to_false() {
+        let cli = Cli::parse_from(["cdk-cli", "mint-info", "https://mint.example.com"]);
+
+        assert!(!cli.danger_accept_invalid_certs);
+    }
+
+    #[test]
+    fn parses_danger_accept_invalid_certs_flag() {
+        let cli = Cli::parse_from([
+            "cdk-cli",
+            "--proxy",
+            "http://127.0.0.1:8080",
+            "--danger-accept-invalid-certs",
+            "mint-info",
+            "https://mint.example.com",
+        ]);
+
+        assert!(cli.danger_accept_invalid_certs);
+        assert_eq!(
+            cli.proxy.as_ref().map(url::Url::as_str),
+            Some("http://127.0.0.1:8080/")
+        );
     }
 }

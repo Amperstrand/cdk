@@ -5,7 +5,10 @@ use cdk::event::MintEvent;
 use serde::{Deserialize, Serialize};
 
 use super::proof::ProofStateUpdate;
-use super::quote::{MeltQuoteBolt11Response, MintQuoteBolt11Response};
+use super::quote::{
+    MeltQuoteBolt11Response, MeltQuoteOnchainResponse, MintQuoteBolt11Response,
+    MintQuoteOnchainResponse,
+};
 use crate::error::FfiError;
 
 /// FFI-compatible SubscriptionKind
@@ -19,6 +22,10 @@ pub enum SubscriptionKind {
     Bolt12MintQuote,
     /// Bolt 12 Melt Quote
     Bolt12MeltQuote,
+    /// Onchain Mint Quote
+    OnchainMintQuote,
+    /// Onchain Melt Quote
+    OnchainMeltQuote,
     /// Proof State
     ProofState,
 }
@@ -30,6 +37,8 @@ impl From<SubscriptionKind> for cdk::nuts::nut17::Kind {
             SubscriptionKind::Bolt11MintQuote => cdk::nuts::nut17::Kind::Bolt11MintQuote,
             SubscriptionKind::Bolt12MintQuote => cdk::nuts::nut17::Kind::Bolt12MintQuote,
             SubscriptionKind::Bolt12MeltQuote => cdk::nuts::nut17::Kind::Bolt12MeltQuote,
+            SubscriptionKind::OnchainMintQuote => cdk::nuts::nut17::Kind::OnchainMintQuote,
+            SubscriptionKind::OnchainMeltQuote => cdk::nuts::nut17::Kind::OnchainMeltQuote,
             SubscriptionKind::ProofState => cdk::nuts::nut17::Kind::ProofState,
         }
     }
@@ -42,6 +51,8 @@ impl From<cdk::nuts::nut17::Kind> for SubscriptionKind {
             cdk::nuts::nut17::Kind::Bolt11MintQuote => SubscriptionKind::Bolt11MintQuote,
             cdk::nuts::nut17::Kind::Bolt12MintQuote => SubscriptionKind::Bolt12MintQuote,
             cdk::nuts::nut17::Kind::Bolt12MeltQuote => SubscriptionKind::Bolt12MeltQuote,
+            cdk::nuts::nut17::Kind::OnchainMintQuote => SubscriptionKind::OnchainMintQuote,
+            cdk::nuts::nut17::Kind::OnchainMeltQuote => SubscriptionKind::OnchainMeltQuote,
             cdk::nuts::nut17::Kind::Custom(_) => {
                 panic!("Custom subscription kind not supported in FFI")
             }
@@ -95,7 +106,12 @@ pub fn encode_subscribe_params(params: SubscribeParams) -> Result<String, FfiErr
     Ok(serde_json::to_string(&params)?)
 }
 
-/// FFI-compatible ActiveSubscription
+/// FFI-compatible active wallet subscription.
+///
+/// Subscriptions may keep polling or receiving network events while callers
+/// wait for notifications. Mobile hosts should cancel, drop, or stop waiting on
+/// subscriptions during app background transitions when background network or
+/// storage activity is not desired.
 #[derive(uniffi::Object)]
 pub struct ActiveSubscription {
     inner: std::sync::Arc<tokio::sync::Mutex<cdk::wallet::subscription::ActiveSubscription>>,
@@ -121,7 +137,11 @@ impl ActiveSubscription {
         self.sub_id.clone()
     }
 
-    /// Receive the next notification
+    /// Receive the next notification.
+    ///
+    /// This waits for subscription activity. Mobile hosts should stop waiting or
+    /// cancel the subscription during app background transitions unless
+    /// background network activity is intended.
     pub async fn recv(&self) -> Result<NotificationPayload, FfiError> {
         let mut guard = self.inner.lock().await;
         guard
@@ -131,7 +151,10 @@ impl ActiveSubscription {
             .map(Into::into)
     }
 
-    /// Try to receive a notification without blocking
+    /// Try to receive a notification without blocking.
+    ///
+    /// Mobile hosts should still cancel or drop the subscription during app
+    /// background transitions when background network activity is not desired.
     pub async fn try_recv(&self) -> Result<Option<NotificationPayload>, FfiError> {
         let mut guard = self.inner.lock().await;
         Ok(guard.try_recv().map(Into::into))
@@ -147,6 +170,10 @@ pub enum NotificationPayload {
     MintQuoteUpdate { quote: MintQuoteBolt11Response },
     /// Melt quote update
     MeltQuoteUpdate { quote: MeltQuoteBolt11Response },
+    /// Onchain mint quote update
+    MintQuoteOnchainUpdate { quote: MintQuoteOnchainResponse },
+    /// Onchain melt quote update
+    MeltQuoteOnchainUpdate { quote: MeltQuoteOnchainResponse },
 }
 
 impl From<MintEvent<String>> for NotificationPayload {
@@ -162,6 +189,16 @@ impl From<MintEvent<String>> for NotificationPayload {
             }
             cdk::nuts::NotificationPayload::MeltQuoteBolt11Response(quote_resp) => {
                 NotificationPayload::MeltQuoteUpdate {
+                    quote: quote_resp.into(),
+                }
+            }
+            cdk::nuts::NotificationPayload::MintQuoteOnchainResponse(quote_resp) => {
+                NotificationPayload::MintQuoteOnchainUpdate {
+                    quote: quote_resp.into(),
+                }
+            }
+            cdk::nuts::NotificationPayload::MeltQuoteOnchainResponse(quote_resp) => {
+                NotificationPayload::MeltQuoteOnchainUpdate {
                     quote: quote_resp.into(),
                 }
             }

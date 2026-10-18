@@ -1,10 +1,12 @@
 use std::str::FromStr;
 
+use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
 use cdk_common::payment::{
     CreateIncomingPaymentResponse, MakePaymentResponse as CdkMakePaymentResponse,
     PaymentIdentifier as CdkPaymentIdentifier, PaymentQuoteResponse as CdkPaymentQuoteResponse,
     WaitPaymentResponse,
 };
+use cdk_common::util::hex;
 use cdk_common::{CurrencyUnit, MeltOptions as CdkMeltOptions};
 
 mod client;
@@ -42,9 +44,9 @@ impl From<CdkPaymentIdentifier> for PaymentIdentifier {
                 r#type: PaymentIdentifierType::PaymentId.into(),
                 value: Some(payment_identifier::Value::Hash(hex::encode(hash))),
             },
-            CdkPaymentIdentifier::QuoteId(id) => Self {
+            CdkPaymentIdentifier::QuoteId(quote_id) => Self {
                 r#type: PaymentIdentifierType::QuoteId.into(),
-                value: Some(payment_identifier::Value::Id(id.to_string())),
+                value: Some(payment_identifier::Value::Id(quote_id.to_string())),
             },
         }
     }
@@ -81,16 +83,17 @@ impl TryFrom<PaymentIdentifier> for CdkPaymentIdentifier {
             (PaymentIdentifierType::CustomId, Some(payment_identifier::Value::Id(id))) => {
                 Ok(CdkPaymentIdentifier::CustomId(id))
             }
+            (PaymentIdentifierType::QuoteId, Some(payment_identifier::Value::Id(id))) => {
+                Ok(CdkPaymentIdentifier::QuoteId(id.parse().map_err(|_| {
+                    crate::error::Error::InvalidPaymentIdentifier
+                })?))
+            }
             (PaymentIdentifierType::PaymentId, Some(payment_identifier::Value::Hash(hash))) => {
                 let decoded = hex::decode(hash)?;
                 let hash_array: [u8; 32] = decoded
                     .try_into()
                     .map_err(|_| crate::error::Error::InvalidHash)?;
                 Ok(CdkPaymentIdentifier::PaymentId(hash_array))
-            }
-            (PaymentIdentifierType::QuoteId, Some(payment_identifier::Value::Id(id))) => {
-                let id = id.parse().map_err(|_| crate::error::Error::InvalidHash)?;
-                Ok(CdkPaymentIdentifier::QuoteId(id))
             }
             _ => Err(crate::error::Error::InvalidPaymentIdentifier),
         }
@@ -185,7 +188,7 @@ impl From<CreateIncomingPaymentResponse> for CreatePaymentResponse {
             request_identifier: Some(value.request_lookup_id.into()),
             request: value.request,
             expiry: value.expiry,
-            extra_json: None,
+            extra_json: value.extra_json.map(|v| v.to_string()),
         }
     }
 }
@@ -202,7 +205,7 @@ impl TryFrom<CreatePaymentResponse> for CreateIncomingPaymentResponse {
             request: value.request,
             expiry: value.expiry,
             extra_json: Some(
-                serde_json::from_str(value.extra_json.unwrap_or_default().as_str())
+                serde_json::from_str(value.extra_json.as_deref().unwrap_or("{}"))
                     .unwrap_or_default(),
             ),
         })
@@ -216,6 +219,33 @@ impl From<CdkPaymentQuoteResponse> for PaymentQuoteResponse {
             fee: Some(value.fee.into()),
             state: QuoteState::from(value.state).into(),
             extra_json: value.extra_json.map(|value| value.to_string()),
+            estimated_blocks: value.estimated_blocks,
+            fee_options: value
+                .fee_options
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+impl From<MeltQuoteOnchainFeeOption> for OnchainFeeOption {
+    fn from(value: MeltQuoteOnchainFeeOption) -> Self {
+        Self {
+            fee_reserve: value.fee_reserve.into(),
+            estimated_blocks: value.estimated_blocks,
+            fee_index: value.fee_index,
+        }
+    }
+}
+
+impl From<OnchainFeeOption> for MeltQuoteOnchainFeeOption {
+    fn from(value: OnchainFeeOption) -> Self {
+        Self {
+            fee_index: value.fee_index,
+            fee_reserve: value.fee_reserve.into(),
+            estimated_blocks: value.estimated_blocks,
         }
     }
 }
@@ -241,23 +271,36 @@ impl TryFrom<PaymentQuoteResponse> for CdkPaymentQuoteResponse {
             extra_json: value
                 .extra_json
                 .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()),
+            estimated_blocks: value.estimated_blocks,
+            fee_options: (!value.fee_options.is_empty()).then(|| {
+                value
+                    .fee_options
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<_>>()
+            }),
         })
     }
 }
 
-impl From<MeltOptions> for CdkMeltOptions {
-    fn from(value: MeltOptions) -> Self {
-        match value.options.expect("option defined") {
-            melt_options::Options::Mpp(mpp) => Self::Mpp {
+impl TryFrom<MeltOptions> for CdkMeltOptions {
+    type Error = crate::error::Error;
+
+    fn try_from(value: MeltOptions) -> Result<Self, Self::Error> {
+        match value
+            .options
+            .ok_or(crate::error::Error::InvalidMeltOptions)?
+        {
+            melt_options::Options::Mpp(mpp) => Ok(Self::Mpp {
                 mpp: cashu::nuts::nut15::Mpp {
                     amount: mpp.amount.into(),
                 },
-            },
-            melt_options::Options::Amountless(amountless) => Self::Amountless {
+            }),
+            melt_options::Options::Amountless(amountless) => Ok(Self::Amountless {
                 amountless: cashu::nuts::nut23::Amountless {
                     amount_msat: amountless.amount_msat.into(),
                 },
-            },
+            }),
         }
     }
 }
@@ -407,11 +450,14 @@ impl TryFrom<PaymentEventResponse> for cdk_common::payment::Event {
 mod tests {
     use std::str::FromStr;
 
+    use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
     use cdk_common::payment::{
-        Event, MakePaymentResponse, PaymentIdentifier,
+        Event, MakePaymentResponse, OnchainSettings, PaymentIdentifier,
         PaymentQuoteResponse as CdkPaymentQuoteResponse, WaitPaymentResponse,
     };
-    use cdk_common::{Amount, CurrencyUnit, MeltQuoteState, QuoteId};
+    use cdk_common::{
+        Amount, CurrencyUnit, MeltOptions as CdkMeltOptions, MeltQuoteState, QuoteId,
+    };
 
     use super::{PaymentEventResponse, PaymentQuoteResponse};
 
@@ -422,11 +468,17 @@ mod tests {
             amount: Amount::new(100, CurrencyUnit::Sat),
             fee: Amount::new(2, CurrencyUnit::Sat),
             state: MeltQuoteState::Unpaid,
+            estimated_blocks: None,
             extra_json: Some(serde_json::json!({
                 "method": "custom",
                 "redirect_url": "https://example.com/pay",
                 "nested": { "attempt": 1 }
             })),
+            fee_options: Some(vec![MeltQuoteOnchainFeeOption {
+                fee_index: 0,
+                fee_reserve: Amount::from(2),
+                estimated_blocks: 6,
+            }]),
         };
 
         let proto: PaymentQuoteResponse = response.clone().into();
@@ -437,6 +489,30 @@ mod tests {
         assert_eq!(roundtrip.fee, response.fee);
         assert_eq!(roundtrip.state, response.state);
         assert_eq!(roundtrip.extra_json, response.extra_json);
+        assert_eq!(roundtrip.fee_options, response.fee_options);
+    }
+
+    #[test]
+    fn onchain_settings_min_send_roundtrip() {
+        let settings = OnchainSettings {
+            confirmations: 3,
+            min_receive_amount_sat: 1_000,
+            min_send_amount_sat: 546,
+        };
+
+        let proto = super::OnchainSettings {
+            confirmations: settings.confirmations,
+            min_receive_amount_sat: settings.min_receive_amount_sat,
+            min_send_amount_sat: settings.min_send_amount_sat,
+        };
+
+        let roundtrip = OnchainSettings {
+            confirmations: proto.confirmations,
+            min_receive_amount_sat: proto.min_receive_amount_sat,
+            min_send_amount_sat: proto.min_send_amount_sat,
+        };
+
+        assert_eq!(roundtrip, settings);
     }
 
     #[test]
@@ -462,7 +538,7 @@ mod tests {
 
     #[test]
     fn payment_event_response_successful_roundtrip() {
-        let quote_id = QuoteId::new_uuid();
+        let quote_id = QuoteId::new();
         let event = Event::PaymentSuccessful {
             quote_id: quote_id.clone(),
             details: MakePaymentResponse {
@@ -499,7 +575,7 @@ mod tests {
 
     #[test]
     fn payment_event_response_failed_roundtrip() {
-        let quote_id = QuoteId::new_uuid();
+        let quote_id = QuoteId::new();
         let event = Event::PaymentFailed {
             quote_id: quote_id.clone(),
             reason: "route not found".to_string(),
@@ -530,6 +606,15 @@ mod tests {
     fn payment_event_response_missing_oneof_errors() {
         let proto = PaymentEventResponse { event: None };
         assert!(Event::try_from(proto).is_err());
+    }
+
+    #[test]
+    fn melt_options_missing_oneof_errors() {
+        let proto = super::MeltOptions { options: None };
+
+        let err = CdkMeltOptions::try_from(proto).expect_err("missing melt options should error");
+
+        assert!(matches!(err, crate::error::Error::InvalidMeltOptions));
     }
 
     #[test]

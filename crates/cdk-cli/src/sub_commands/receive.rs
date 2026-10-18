@@ -9,10 +9,13 @@ use cdk::util::unix_time;
 use cdk::wallet::{ReceiveOptions, WalletRepository};
 use cdk::Amount;
 use clap::Args;
-use nostr_sdk::nips::nip04;
-use nostr_sdk::{Filter, Keys, Kind, Timestamp};
+use nostr::prelude::{
+    nip04, Filter, Keys, Kind, PublicKey, SecretKey as NostrSecretKey, Timestamp,
+};
+use nostr_sdk::prelude::{Client, RelayCapabilities, SignerAuthenticator};
 
 use crate::nostr_storage;
+use crate::terminal::escape_control;
 use crate::utils::get_or_create_wallet;
 
 #[derive(Args)]
@@ -53,7 +56,7 @@ pub async fn receive(
             .iter()
             .map(|s| {
                 if s.starts_with("nsec") {
-                    let nostr_key = nostr_sdk::SecretKey::from_str(s).expect("Invalid secret key");
+                    let nostr_key = NostrSecretKey::from_str(s).expect("Invalid secret key");
 
                     SecretKey::from_str(&nostr_key.to_secret_hex())
                 } else {
@@ -80,7 +83,7 @@ pub async fn receive(
             //wallet.add_p2pk_signing_key(nostr_signing_key).await;
             let nostr_key = match sub_command_args.nostr_key.as_ref() {
                 Some(nostr_key) => {
-                    let secret_key = nostr_sdk::SecretKey::from_str(nostr_key)?;
+                    let secret_key = NostrSecretKey::from_str(nostr_key)?;
                     let secret_key = SecretKey::from_str(&secret_key.to_secret_hex())?;
                     Some(secret_key)
                 }
@@ -122,7 +125,9 @@ pub async fn receive(
                         total_amount += amount;
                     }
                     Err(err) => {
-                        println!("{err}");
+                        // Errors may embed mint-controlled data such as error
+                        // bodies or token mint URLs; escape before printing.
+                        println!("{}", escape_control(&format!("{err:#}")));
                     }
                 }
             }
@@ -153,9 +158,11 @@ async fn receive_token(
 
     // If mint is not trusted and we don't allow untrusted, error out
     if !is_trusted && !allow_untrusted {
+        // The mint URL comes from the received token and may be
+        // attacker-controlled; escape it before it reaches the terminal.
         return Err(anyhow!(
             "Mint {} is not trusted. Use --allow-untrusted to receive from untrusted mints.",
-            mint_url
+            escape_control(&mint_url.to_string())
         ));
     }
 
@@ -183,7 +190,7 @@ async fn nostr_receive(
 
     let x_only_pubkey = verifying_key.x_only_public_key();
 
-    let nostr_pubkey = nostr_sdk::PublicKey::from_hex(&x_only_pubkey.to_string())?;
+    let nostr_pubkey = PublicKey::from_hex(&x_only_pubkey.to_string())?;
 
     let since = since.map(|s| Timestamp::from(s as u64));
 
@@ -197,17 +204,26 @@ async fn nostr_receive(
             .kind(Kind::EncryptedDirectMessage),
     };
 
-    let client = nostr_sdk::Client::default();
+    let keys = Keys::from_str(&(nostr_signing_key).to_secret_hex())?;
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(keys.clone()))
+        .build();
+
+    for relay in &relays {
+        client
+            .add_relay(relay)
+            .capabilities(RelayCapabilities::READ)
+            .await?;
+    }
 
     client.connect().await;
 
     let events = client
-        .fetch_events_from(relays, filter, Duration::from_secs(30))
+        .fetch_events(filter)
+        .timeout(Duration::from_secs(30))
         .await?;
 
     let mut tokens: HashSet<String> = HashSet::new();
-
-    let keys = Keys::from_str(&(nostr_signing_key).to_secret_hex())?;
 
     for event in events {
         if event.kind == Kind::EncryptedDirectMessage {

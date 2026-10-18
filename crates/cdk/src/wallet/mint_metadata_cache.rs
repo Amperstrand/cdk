@@ -39,6 +39,7 @@ use tokio::sync::Mutex;
 use web_time::Instant;
 
 use crate::nuts::Id;
+use crate::wallet::util::escape_log_value;
 use crate::wallet::{AuthMintConnector, AuthWallet, MintConnector};
 use crate::{Error, Wallet};
 
@@ -90,7 +91,7 @@ pub struct MintMetadata {
     pub active_keysets: Vec<Arc<KeySetInfo>>,
 
     /// Freshness tracking for regular (non-auth) mint data
-    status: FreshnessStatus,
+    pub(crate) status: FreshnessStatus,
 
     /// Freshness tracking for blind auth keysets
     auth_status: FreshnessStatus,
@@ -119,6 +120,11 @@ pub struct MintMetadataCache {
     /// Atomically-updated metadata snapshot (lock-free reads)
     metadata: Arc<ArcSwap<MintMetadata>>,
 
+    /// How long cached metadata is considered fresh before re-fetching.
+    /// `None` means cached data never expires (unless manually refreshed).
+    /// Default: 1 hour (3600 seconds).
+    ttl: Arc<RwLock<Option<Duration>>>,
+
     /// Tracks which database instances have been synced to which cache version.
     /// Key: pointer identity of storage Arc, Value: last synced cache version
     db_sync_versions: Arc<RwLock<HashMap<usize, usize>>>,
@@ -139,17 +145,14 @@ impl std::fmt::Debug for MintMetadataCache {
 }
 
 impl Wallet {
-    /// Sets the metadata cache TTL
+    /// Sets the metadata cache TTL.
     ///
-    /// The TTL determines how often the wallet checks the mint for new keysets and information.
+    /// The TTL determines how often the wallet re-fetches keysets and mint info.
+    /// Because the cache is shared, this affects all wallets using the same mint.
     ///
-    /// If `None`, the cache will never expire and the wallet will use cached data indefinitely
-    /// (unless manually refreshed).
-    ///
-    /// The default value is 1 hour (3600 seconds).
+    /// `None` means cached data never expires. Default: 1 hour.
     pub fn set_metadata_cache_ttl(&self, ttl: Option<Duration>) {
-        let mut guarded_ttl = self.metadata_cache_ttl.write();
-        *guarded_ttl = ttl;
+        self.metadata_cache.set_ttl(ttl);
     }
 
     /// Get information about metadata cache info
@@ -186,16 +189,59 @@ impl MintMetadataCache {
     /// # Example
     ///
     /// ```ignore
-    /// let cache = MintMetadataCache::new(mint_url, None);
+    /// let cache = MintMetadataCache::new(mint_url);
     /// // No data loaded yet - call load() to fetch
     /// ```
     pub fn new(mint_url: MintUrl) -> Self {
         Self {
             mint_url,
             metadata: Arc::new(ArcSwap::default()),
+            ttl: Arc::new(RwLock::new(Some(Duration::from_secs(3600)))),
             db_sync_versions: Arc::new(Default::default()),
             fetch_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Set the TTL for cached metadata.
+    ///
+    /// `None` means cached data never expires.
+    pub fn set_ttl(&self, ttl: Option<Duration>) {
+        *self.ttl.write() = ttl;
+    }
+
+    /// Get the current TTL.
+    pub fn ttl(&self) -> Option<Duration> {
+        *self.ttl.read()
+    }
+
+    /// Return cached metadata if populated, without fetching or TTL checks.
+    pub fn get_cached(&self) -> Option<Arc<MintMetadata>> {
+        let m = self.metadata.load().clone();
+        if m.status.is_populated {
+            Some(m)
+        } else {
+            None
+        }
+    }
+
+    /// Load metadata from in-memory cache or database, without network access.
+    ///
+    /// Checks the in-memory cache first. If not populated, loads from the
+    /// database. Returns an error if neither source has data.
+    pub async fn load_cached(
+        &self,
+        storage: &Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
+    ) -> Result<Arc<MintMetadata>, Error> {
+        if let Some(cached) = self.get_cached() {
+            return Ok(cached);
+        }
+
+        let from_db = self.load_from_db(storage).await?;
+        if from_db.status.is_populated {
+            return Ok(from_db);
+        }
+
+        Err(Error::UnknownKeySet)
     }
 
     /// Load metadata from mint server and update cache
@@ -314,9 +360,10 @@ impl MintMetadataCache {
             }
         }
 
-        // Only mark as populated if we actually loaded keysets
+        // Only mark as populated if we actually loaded keysets.
+        // Don't update `updated_at` — the TTL should reflect when we last
+        // fetched from the mint, not when we read from the local DB.
         new_metadata.status.is_populated = !new_metadata.keysets.is_empty();
-        new_metadata.status.updated_at = Instant::now();
         new_metadata.status.version += 1;
 
         tracing::info!(
@@ -367,10 +414,10 @@ impl MintMetadataCache {
         &self,
         storage: &Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
         client: &Arc<dyn MintConnector + Send + Sync>,
-        ttl: Option<Duration>,
     ) -> Result<Arc<MintMetadata>, Error> {
         let cached_metadata = self.metadata.load().clone();
         let storage_id = Self::arc_pointer_id(storage);
+        let ttl = *self.ttl.read();
 
         // Check what version of cache this database has seen
         let db_synced_version = self
@@ -394,26 +441,43 @@ impl MintMetadataCache {
             return Ok(cached_metadata);
         }
 
-        // Try loading from database first (avoids HTTP if data is persisted)
-        if let Ok(metadata) = self.load_from_db(storage).await {
-            if metadata.status.is_populated {
-                return Ok(metadata);
+        // In-memory cache was empty (not just stale) — try database before network
+        if !cached_metadata.status.is_populated {
+            if let Ok(metadata) = self.load_from_db(storage).await {
+                if metadata.status.is_populated {
+                    return Ok(metadata);
+                }
             }
         }
 
-        // Database had no data - fetch from mint
-        self.load_from_mint(storage, client).await
+        // Cache was stale (TTL expired) or neither cache nor DB had data — fetch from mint
+        match self.load_from_mint(storage, client).await {
+            Ok(metadata) => Ok(metadata),
+            Err(e) if cached_metadata.status.is_populated => {
+                // Network failed but we have usable stale data — return it
+                tracing::warn!(
+                    "Failed to refresh metadata from mint {}, using stale cache: {}",
+                    self.mint_url,
+                    e
+                );
+                Ok(cached_metadata)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Load auth keysets and keys (auth feature only)
     ///
-    /// Fetches blind authentication keysets from the mint. Always performs
-    /// an HTTP fetch to get current auth keysets.
+    /// Returns cached blind authentication keysets if they are populated and
+    /// still fresh according to `ttl`; otherwise fetches them from the mint over
+    /// HTTP and updates the cache.
     ///
     /// # Arguments
     ///
     /// * `storage` - Database to persist metadata to
     /// * `auth_client` - Auth-capable HTTP client for fetching blind auth keysets
+    /// * `ttl` - Optional TTL; if not provided, any populated cached data is
+    ///   considered fresh and no HTTP fetch is performed
     ///
     /// # Returns
     ///
@@ -425,6 +489,7 @@ impl MintMetadataCache {
     ) -> Result<Arc<MintMetadata>, Error> {
         let cached_metadata = self.metadata.load().clone();
         let storage_id = Self::arc_pointer_id(storage);
+        let ttl = *self.ttl.read();
 
         let db_synced_version = self
             .db_sync_versions
@@ -433,9 +498,11 @@ impl MintMetadataCache {
             .cloned()
             .unwrap_or_default();
 
-        // Check if auth data is populated in cache
+        // Check if auth data is populated in cache and still fresh
         if cached_metadata.auth_status.is_populated
-            && cached_metadata.auth_status.updated_at > Instant::now()
+            && ttl
+                .map(|ttl| cached_metadata.auth_status.updated_at + ttl > Instant::now())
+                .unwrap_or(true)
         {
             if db_synced_version != cached_metadata.status.version {
                 // Database needs updating - sync before returning
@@ -451,7 +518,9 @@ impl MintMetadataCache {
         // Re-check if auth data was updated while waiting for lock
         let current_metadata = self.metadata.load().clone();
         if current_metadata.auth_status.is_populated
-            && current_metadata.auth_status.updated_at > Instant::now()
+            && ttl
+                .map(|ttl| current_metadata.auth_status.updated_at + ttl > Instant::now())
+                .unwrap_or(true)
         {
             tracing::debug!(
                 "Auth cache was updated while waiting for fetch lock, returning cached data"
@@ -597,7 +666,10 @@ impl MintMetadataCache {
         client: Option<&Arc<dyn MintConnector + Send + Sync>>,
         auth_client: Option<&Arc<dyn AuthMintConnector + Send + Sync>>,
     ) -> Result<Arc<MintMetadata>, Error> {
-        tracing::debug!("Fetching mint metadata from HTTP for {}", self.mint_url);
+        tracing::debug!(
+            "Fetching mint metadata from HTTP for {}",
+            escape_log_value(&self.mint_url)
+        );
 
         // Start with current cache to preserve data from other sources
         let mut new_metadata = (*self.metadata.load().clone()).clone();
@@ -607,7 +679,11 @@ impl MintMetadataCache {
         if let Some(client) = client.as_ref() {
             // Get mint information
             new_metadata.mint_info = client.get_mint_info().await.inspect_err(|err| {
-                tracing::error!("Failed to fetch mint info for {}: {}", self.mint_url, err);
+                tracing::error!(
+                    "Failed to fetch mint info for {}: {}",
+                    escape_log_value(&self.mint_url),
+                    escape_log_value(err)
+                );
             })?;
 
             // Get list of keysets
@@ -616,7 +692,11 @@ impl MintMetadataCache {
                     .get_mint_keysets()
                     .await
                     .inspect_err(|err| {
-                        tracing::error!("Failed to fetch keysets for {}: {}", self.mint_url, err);
+                        tracing::error!(
+                            "Failed to fetch keysets for {}: {}",
+                            escape_log_value(&self.mint_url),
+                            escape_log_value(err)
+                        );
                     })?
                     .keysets,
             );
@@ -630,7 +710,7 @@ impl MintMetadataCache {
         tracing::debug!(
             "Fetched {} keysets for {}",
             keysets_to_fetch.len(),
-            self.mint_url
+            escape_log_value(&self.mint_url)
         );
 
         // Fetch keys for each keyset

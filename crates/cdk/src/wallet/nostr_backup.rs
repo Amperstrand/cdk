@@ -3,10 +3,11 @@
 //! This module provides functionality to backup and restore the mint list
 //! to/from Nostr relays using NUT-27 specification.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-use nostr_sdk::prelude::*;
-use nostr_sdk::{Client as NostrClient, Filter, Keys};
+use nostr::prelude::{EventId, Filter, Keys, PublicKey};
+use nostr_sdk::prelude::{Client as NostrClient, RelayCapabilities, SignerAuthenticator};
 use tracing::instrument;
 
 use super::wallet_repository::WalletRepository;
@@ -126,7 +127,12 @@ impl WalletRepository {
         let keys = self.backup_keys()?;
 
         let wallets = self.get_wallets().await;
-        let mint_urls: Vec<MintUrl> = wallets.iter().map(|w| w.mint_url.clone()).collect();
+        let mint_urls: Vec<MintUrl> = wallets
+            .iter()
+            .map(|w| w.mint_url.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
 
         let backup = MintBackup::new(mint_urls.clone());
 
@@ -135,11 +141,14 @@ impl WalletRepository {
 
         let event_id = event.id;
 
-        let client = NostrClient::new(keys.clone());
+        let client = NostrClient::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
 
         for relay in relays.iter() {
             client
-                .add_write_relay(relay.as_ref())
+                .add_relay(relay.as_ref())
+                .capabilities(RelayCapabilities::WRITE)
                 .await
                 .map_err(|e| Error::Custom(format!("Failed to add relay: {e}")))?;
         }
@@ -202,11 +211,14 @@ impl WalletRepository {
             .identifier(d_tag)
             .limit(1);
 
-        let client = NostrClient::new(keys.clone());
+        let client = NostrClient::builder()
+            .authenticator(SignerAuthenticator::new(keys.clone()))
+            .build();
 
         for relay in relays.iter() {
             client
-                .add_read_relay(relay.as_ref())
+                .add_relay(relay.as_ref())
+                .capabilities(RelayCapabilities::READ)
                 .await
                 .map_err(|e| Error::Custom(format!("Failed to add relay: {e}")))?;
         }
@@ -214,7 +226,8 @@ impl WalletRepository {
         client.connect().await;
 
         let events = client
-            .fetch_events(filter, options.timeout)
+            .fetch_events(filter)
+            .timeout(options.timeout)
             .await
             .map_err(|e| Error::Custom(format!("Failed to fetch backup events: {e}")))?;
 

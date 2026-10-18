@@ -64,24 +64,6 @@ pub fn encode_key_set_info(info: KeySetInfo) -> Result<String, FfiError> {
     Ok(serde_json::to_string(&info)?)
 }
 
-/// FFI-compatible KeysetFilter
-#[derive(Debug, Clone, Copy, uniffi::Enum)]
-pub enum KeysetFilter {
-    /// Only return active keysets
-    Active,
-    /// Return all keysets (active and inactive)
-    All,
-}
-
-impl From<KeysetFilter> for cdk_common::wallet::KeysetFilter {
-    fn from(filter: KeysetFilter) -> Self {
-        match filter {
-            KeysetFilter::Active => cdk_common::wallet::KeysetFilter::Active,
-            KeysetFilter::All => cdk_common::wallet::KeysetFilter::All,
-        }
-    }
-}
-
 /// FFI-compatible PublicKey
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
 #[serde(transparent)]
@@ -108,24 +90,16 @@ impl TryFrom<PublicKey> for cdk::nuts::PublicKey {
     }
 }
 
-/// FFI-compatible Keys (simplified - contains only essential info)
+/// FFI-compatible Keys
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct Keys {
-    /// Keyset ID
-    pub id: String,
-    /// Currency unit
-    pub unit: CurrencyUnit,
-    /// Map of amount to public key hex (simplified from BTreeMap)
+    /// Map of amount to public key hex
     pub keys: HashMap<u64, String>,
 }
 
 impl From<cdk::nuts::Keys> for Keys {
     fn from(keys: cdk::nuts::Keys) -> Self {
-        // Keys doesn't have id and unit - we'll need to get these from context
-        // For now, use placeholder values
         Self {
-            id: "unknown".to_string(), // This should come from KeySet
-            unit: CurrencyUnit::Sat,   // This should come from KeySet
             keys: keys
                 .keys()
                 .iter()
@@ -198,12 +172,7 @@ impl From<cdk::nuts::KeySet> for KeySet {
             unit: keyset.unit.into(),
             active: keyset.active,
             input_fee_ppk: keyset.input_fee_ppk,
-            keys: keyset
-                .keys
-                .keys()
-                .iter()
-                .map(|(amount, pubkey)| (u64::from(*amount), pubkey.to_string()))
-                .collect(),
+            keys: Keys::from(keyset.keys).keys,
             final_expiry: keyset.final_expiry,
         }
     }
@@ -213,7 +182,6 @@ impl TryFrom<KeySet> for cdk::nuts::KeySet {
     type Error = FfiError;
 
     fn try_from(keyset: KeySet) -> Result<Self, Self::Error> {
-        use std::collections::BTreeMap;
         use std::str::FromStr;
 
         // Convert id
@@ -224,16 +192,9 @@ impl TryFrom<KeySet> for cdk::nuts::KeySet {
         let unit: cdk::nuts::CurrencyUnit = keyset.unit.into();
 
         // Convert keys
-        let mut keys_map = BTreeMap::new();
-        for (amount_u64, pubkey_hex) in keyset.keys {
-            let amount = cdk::Amount::from(amount_u64);
-            let pubkey = cdk::nuts::PublicKey::from_str(&pubkey_hex)
-                .map_err(|e| FfiError::internal(format!("Invalid public key: {}", e)))?;
-            keys_map.insert(amount, pubkey);
-        }
-        let keys = cdk::nuts::Keys::new(keys_map);
+        let keys = Keys { keys: keyset.keys }.try_into()?;
 
-        Ok(cdk::nuts::KeySet {
+        Ok(Self {
             id,
             unit,
             active: keyset.active,

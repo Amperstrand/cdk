@@ -93,6 +93,8 @@ mod tests {
             state: MeltQuoteState::Unpaid,
             expiry: 9999999999,
             payment_proof: None,
+            estimated_blocks: None,
+            fee_index: None,
             payment_method: PaymentMethod::Known(KnownMethod::Bolt11),
             used_by_operation: None,
             version: 0,
@@ -109,14 +111,14 @@ mod tests {
         let mint_url = test_mint_url();
         let keyset_id = test_keyset_id();
 
-        // Create and store proof in Reserved state
-        let proof_info = test_proof_info(keyset_id, 100, mint_url.clone(), State::Reserved);
-        let proof_y = proof_info.y;
-        db.update_proofs(vec![proof_info], vec![]).await.unwrap();
-
         let saga = test_melt_saga(mint_url);
         let saga_id = saga.id;
         db.add_saga(saga).await.unwrap();
+
+        let mut proof_info = test_proof_info(keyset_id, 100, test_mint_url(), State::Reserved);
+        proof_info.used_by_operation = Some(saga_id);
+        let proof_y = proof_info.y;
+        db.update_proofs(vec![proof_info], vec![]).await.unwrap();
 
         let compensation = RevertProofReservation {
             localstore: db.clone(),
@@ -142,13 +144,12 @@ mod tests {
         let mint_url = test_mint_url();
         let keyset_id = test_keyset_id();
 
-        // Create and store proof
-        let proof_info = test_proof_info(keyset_id, 100, mint_url.clone(), State::Reserved);
-        let proof_y = proof_info.y;
-        db.update_proofs(vec![proof_info], vec![]).await.unwrap();
-
         // Use a saga_id that doesn't exist
         let saga_id = uuid::Uuid::new_v4();
+        let mut proof_info = test_proof_info(keyset_id, 100, mint_url, State::Reserved);
+        proof_info.used_by_operation = Some(saga_id);
+        let proof_y = proof_info.y;
+        db.update_proofs(vec![proof_info], vec![]).await.unwrap();
 
         let compensation = RevertProofReservation {
             localstore: db.clone(),
@@ -156,12 +157,12 @@ mod tests {
             saga_id,
         };
 
-        // Should succeed even though saga doesn't exist
+        // A stale compensation should no-op without its persisted saga.
         compensation.execute().await.unwrap();
 
-        // Proof should be Unspent
+        // Proof should remain reserved.
         let proofs = db
-            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+            .get_proofs(None, None, Some(vec![State::Reserved]), None)
             .await
             .unwrap();
         assert_eq!(proofs.len(), 1);
@@ -214,14 +215,20 @@ mod tests {
     // =========================================================================
 
     #[tokio::test]
-    async fn test_compensation_only_affects_specified_proofs() {
+    async fn test_compensation_only_affects_owning_operation() {
         let db = create_test_db().await;
         let mint_url = test_mint_url();
         let keyset_id = test_keyset_id();
 
-        // Create two proofs, both Reserved
-        let proof_info_1 = test_proof_info(keyset_id, 100, mint_url.clone(), State::Reserved);
-        let proof_info_2 = test_proof_info(keyset_id, 200, mint_url.clone(), State::Reserved);
+        let saga = test_melt_saga(mint_url.clone());
+        let saga_id = saga.id;
+        db.add_saga(saga).await.unwrap();
+
+        // Create two reserved proofs owned by different operations.
+        let mut proof_info_1 = test_proof_info(keyset_id, 100, mint_url.clone(), State::Reserved);
+        proof_info_1.used_by_operation = Some(saga_id);
+        let mut proof_info_2 = test_proof_info(keyset_id, 200, mint_url, State::Reserved);
+        proof_info_2.used_by_operation = Some(uuid::Uuid::new_v4());
 
         let proof_y_1 = proof_info_1.y;
         let proof_y_2 = proof_info_2.y;
@@ -230,11 +237,6 @@ mod tests {
             .await
             .unwrap();
 
-        let saga = test_melt_saga(mint_url);
-        let saga_id = saga.id;
-        db.add_saga(saga).await.unwrap();
-
-        // Only revert the first proof
         let compensation = RevertProofReservation {
             localstore: db.clone(),
             proof_ys: vec![proof_y_1],

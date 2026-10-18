@@ -1,36 +1,89 @@
 //! HTTP Mint client with pluggable transport
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::{Arc, RwLock as StdRwLock};
 
 use async_trait::async_trait;
+use cdk_common::auth::oidc::{OidcHttpResponse, OidcHttpTransport};
 use cdk_common::{
     nut19, MeltQuoteCreateResponse, MeltQuoteRequest, MeltQuoteResponse, Method,
-    MintQuoteBolt11Response, MintQuoteBolt12Response, MintQuoteCustomResponse, MintQuoteRequest,
-    MintQuoteResponse, ProtectedEndpoint, RoutePath,
+    MintQuoteBolt11Response, MintQuoteBolt12Response, MintQuoteCustomResponse,
+    MintQuoteOnchainResponse, MintQuoteRequest, MintQuoteResponse, PaymentRequestPayload,
+    ProtectedEndpoint, RoutePath,
 };
+use cdk_http_client::{HttpError, RawResponse};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::RwLock;
+use tokio::time::{sleep, timeout};
 use tracing::instrument;
 use url::Url;
 use web_time::{Duration, Instant};
 
 use super::transport::Transport;
 use super::{Error, MintConnector};
+use crate::error::ErrorResponse;
 use crate::mint_url::MintUrl;
 use crate::nuts::nut00::{KnownMethod, PaymentMethod};
 use crate::nuts::nut22::MintAuthRequest;
 use crate::nuts::{
     AuthToken, BatchCheckMintQuoteRequest, BatchMintRequest, CheckStateRequest, CheckStateResponse,
-    Id, KeySet, KeysResponse, KeysetResponse, MeltRequest, MintInfo, MintRequest, MintResponse,
-    RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
+    Id, KeySet, KeysResponse, KeysetResponse, MeltOnchainRequest, MeltRequest, MintInfo,
+    MintRequest, MintResponse, RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
 use crate::wallet::auth::{AuthMintConnector, AuthWallet};
+use crate::OidcClient;
 
 type Cache = (u64, HashSet<(nut19::Method, nut19::Path)>);
 
+/// Delay before the first replay of a failed request.
+const HTTP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Upper bound for the exponential backoff between replays.
+const HTTP_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+fn payment_method_path_segment(method: &PaymentMethod) -> Result<&str, Error> {
+    match method {
+        PaymentMethod::Known(known) => Ok(known.as_str()),
+        PaymentMethod::Custom(method) if PaymentMethod::is_valid_custom_method_name(method) => {
+            Ok(method)
+        }
+        PaymentMethod::Custom(_) => Err(Error::InvalidPaymentMethod),
+    }
+}
+
+fn fill_response_method(value: &mut serde_json::Value, method: &PaymentMethod) {
+    if let serde_json::Value::Object(object) = value {
+        object
+            .entry("method".to_string())
+            .or_insert_with(|| serde_json::Value::String(method.to_string()));
+    }
+}
+
+fn fill_response_methods(value: &mut serde_json::Value, method: &PaymentMethod) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                fill_response_method(item, method);
+            }
+        }
+        _ => fill_response_method(value, method),
+    }
+}
+
+fn deserialize_with_route_method<R>(
+    mut value: serde_json::Value,
+    method: &PaymentMethod,
+) -> Result<R, Error>
+where
+    R: DeserializeOwned,
+{
+    fill_response_methods(&mut value, method);
+    serde_json::from_value(value).map_err(|e| Error::Custom(e.to_string()))
+}
+
 /// Http Client
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpClient<T>
 where
     T: Transport + Send + Sync + 'static,
@@ -39,33 +92,180 @@ where
     mint_url: MintUrl,
     cache_support: Arc<StdRwLock<Cache>>,
     auth_wallet: Arc<RwLock<Option<AuthWallet>>>,
+    /// Set when this client configured the transport with certificate
+    /// verification off, so delivery to a third-party receiver can refuse to
+    /// run over it. A transport handed in pre-configured is asked directly
+    /// instead.
+    tls_verification_disabled: bool,
+}
+
+impl<T> fmt::Debug for HttpClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpClient")
+            .field("transport", &core::any::type_name::<T>())
+            .field("mint_url", &self.mint_url)
+            .field("cache_support", &"[INTERNAL]")
+            .field("auth_wallet", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OidcTransportClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
+    transport: Arc<T>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl<T> OidcHttpTransport for OidcTransportClient<T>
+where
+    T: Transport + Send + Sync + 'static,
+{
+    async fn get(&self, url: &str) -> Result<OidcHttpResponse, HttpError> {
+        let url = Url::parse(url).map_err(|e| HttpError::Other(e.to_string()))?;
+        let response = self.transport.http_get(url, None).await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        Ok(OidcHttpResponse::new(status, body))
+    }
+
+    async fn post_form(
+        &self,
+        url: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<OidcHttpResponse, HttpError> {
+        let url = Url::parse(url).map_err(|e| HttpError::Other(e.to_string()))?;
+        let response = self.transport.http_post_form(url, None, &params).await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        Ok(OidcHttpResponse::new(status, body))
+    }
 }
 
 impl<T> HttpClient<T>
 where
     T: Transport + Send + Sync + 'static,
 {
+    fn map_http_error(err: HttpError) -> Error {
+        match err {
+            HttpError::Status { status, message } => {
+                match serde_json::from_str::<ErrorResponse>(&message) {
+                    Ok(err_response) => err_response.into(),
+                    Err(_) => Error::HttpError(Some(status), message),
+                }
+            }
+            HttpError::Timeout => Error::Timeout,
+            HttpError::Redirect(message)
+            | HttpError::Connection(message)
+            | HttpError::Serialization(message)
+            | HttpError::Proxy(message)
+            | HttpError::Build(message)
+            | HttpError::Other(message) => Error::HttpError(None, message),
+        }
+    }
+
+    /// Whether proofs would leave over a connection with no verified
+    /// certificate.
+    ///
+    /// The client's own flag only covers a transport it configured itself. One
+    /// passed to [`HttpClient::with_transport`] may already have verification
+    /// off and is the only thing that knows, so both are consulted.
+    fn tls_verification_disabled(&self) -> bool {
+        self.tls_verification_disabled || self.transport.tls_verification_disabled()
+    }
+
+    /// Refuse a third-party endpoint when the transport verifies no
+    /// certificate.
+    ///
+    /// The mint is the embedder's own choice; an LNURL service or a NUT-18
+    /// receiver is not, and a MITM there swaps the invoice or redeems the
+    /// proofs.
+    fn ensure_verified_tls(&self, url: &Url) -> Result<(), Error> {
+        if !self.tls_verification_disabled() || url.scheme() != "https" {
+            return Ok(());
+        }
+
+        let host = url
+            .host_str()
+            .ok_or_else(|| Error::Custom("Endpoint must include a host".to_string()))?;
+
+        Err(Error::UnverifiedTlsEndpoint {
+            host: host.to_string(),
+        })
+    }
+
+    async fn transport_http_get<R>(&self, url: Url, auth: Option<AuthToken>) -> Result<R, Error>
+    where
+        R: DeserializeOwned,
+    {
+        self.transport
+            .http_get(url, auth)
+            .await
+            .and_then(RawResponse::json_or_status_error)
+            .map_err(Self::map_http_error)
+    }
+
+    async fn transport_http_post<P, R>(
+        &self,
+        url: Url,
+        auth: Option<AuthToken>,
+        payload: &P,
+    ) -> Result<R, Error>
+    where
+        P: Serialize + Send + Sync,
+        R: DeserializeOwned,
+    {
+        self.transport
+            .http_post(url, auth, payload)
+            .await
+            .and_then(RawResponse::json_or_status_error)
+            .map_err(Self::map_http_error)
+    }
+
     /// Create new [`HttpClient`] with a provided transport implementation.
     pub fn with_transport(
         mint_url: MintUrl,
         transport: T,
         auth_wallet: Option<AuthWallet>,
     ) -> Self {
+        Self::with_shared_transport(mint_url, Arc::new(transport), auth_wallet)
+    }
+
+    /// Create new [`HttpClient`] sharing an existing transport instance.
+    ///
+    /// Lets several clients (for example the main and blind-auth clients) reuse
+    /// one transport, and so its connection pool and any rate limiter it wraps.
+    pub fn with_shared_transport(
+        mint_url: MintUrl,
+        transport: Arc<T>,
+        auth_wallet: Option<AuthWallet>,
+    ) -> Self {
         Self {
-            transport: transport.into(),
+            transport,
             mint_url,
             auth_wallet: Arc::new(RwLock::new(auth_wallet)),
             cache_support: Default::default(),
+            tls_verification_disabled: false,
         }
     }
 
     /// Create new [`HttpClient`]
-    pub fn new(mint_url: MintUrl, auth_wallet: Option<AuthWallet>) -> Self {
+    pub fn new(mint_url: MintUrl, auth_wallet: Option<AuthWallet>) -> Self
+    where
+        T: Default,
+    {
         Self {
             transport: T::default().into(),
             mint_url,
             auth_wallet: Arc::new(RwLock::new(auth_wallet)),
             cache_support: Default::default(),
+            tls_verification_disabled: false,
         }
     }
 
@@ -94,15 +294,21 @@ where
         proxy: Url,
         host_matcher: Option<&str>,
         accept_invalid_certs: bool,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        T: Default,
+    {
         let mut transport = T::default();
-        transport.with_proxy(proxy, host_matcher, accept_invalid_certs)?;
+        transport
+            .with_proxy(proxy, host_matcher, accept_invalid_certs)
+            .map_err(Self::map_http_error)?;
 
         Ok(Self {
             transport: transport.into(),
             mint_url,
             auth_wallet: Arc::new(RwLock::new(None)),
             cache_support: Default::default(),
+            tls_verification_disabled: accept_invalid_certs,
         })
     }
 
@@ -118,7 +324,7 @@ where
         payload: &P,
     ) -> Result<R, Error>
     where
-        P: Serialize + ?Sized + Send + Sync,
+        P: Serialize + Send + Sync,
         R: DeserializeOwned,
     {
         let started = Instant::now();
@@ -137,6 +343,7 @@ where
             .unwrap_or_default();
 
         let transport = self.transport.clone();
+        let mut retry_delay = HTTP_RETRY_INITIAL_BACKOFF;
         loop {
             let url = match &path {
                 nut19::Path::Swap => self.mint_url.join_paths(&["v1", "swap"])?,
@@ -149,34 +356,88 @@ where
                 }
             };
 
-            let result = match method {
-                nut19::Method::Get => transport.http_get(url, auth_token.clone()).await,
-                nut19::Method::Post => transport.http_post(url, auth_token.clone(), payload).await,
-            };
-
-            if result.is_ok() {
-                return result;
-            }
-
-            match result.as_ref() {
-                Err(Error::HttpError(status_code, _)) => {
-                    let status_code = status_code.to_owned().unwrap_or_default();
-                    if (400..=499).contains(&status_code) {
-                        // 4xx errors won't be 'solved' by retrying
-                        return result;
-                    }
-
-                    // retry request, if possible
-                    tracing::error!("Failed http_request {:?}", result.as_ref().err());
-
-                    if retriable_window < started.elapsed() {
-                        return result;
-                    }
+            let request = async {
+                match method {
+                    nut19::Method::Get => transport
+                        .http_get(url, auth_token.clone())
+                        .await
+                        .and_then(RawResponse::json_or_status_error),
+                    nut19::Method::Post => transport
+                        .http_post(url, auth_token.clone(), payload)
+                        .await
+                        .and_then(RawResponse::json_or_status_error),
                 }
-                Err(_) => return result,
-                _ => unreachable!(),
             };
+            let result = if retriable_window.is_zero() {
+                request.await
+            } else {
+                let remaining = retriable_window.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(Error::Timeout);
+                }
+
+                match timeout(remaining, request).await {
+                    Ok(result) => result,
+                    Err(_) => return Err(Error::Timeout),
+                }
+            };
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(http_error) => {
+                    let replay_safe = http_error.is_replay_safe();
+                    let error = Self::map_http_error(http_error);
+                    let elapsed = started.elapsed();
+
+                    if !replay_safe || elapsed >= retriable_window {
+                        return Err(error);
+                    }
+
+                    tracing::warn!(error = %error, "Replay-safe HTTP request failed");
+
+                    // Back off before replaying so a struggling mint is not hammered,
+                    // without ever sleeping past the end of the replay window.
+                    let remaining = retriable_window.saturating_sub(elapsed);
+                    sleep(retry_delay.min(remaining)).await;
+                    if started.elapsed() >= retriable_window {
+                        return Err(error);
+                    }
+                    retry_delay = retry_delay.saturating_mul(2).min(HTTP_RETRY_MAX_BACKOFF);
+                }
+            }
         }
+    }
+}
+
+fn parse_lnurl_callback_url(url: &str) -> Result<Url, Error> {
+    let parsed_url = Url::parse(url).map_err(|e| Error::Custom(format!("Invalid URL: {}", e)))?;
+
+    if parsed_url.scheme() != "https" {
+        return Err(Error::Custom(
+            "LNURL callback URL must use HTTPS".to_string(),
+        ));
+    }
+
+    if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+        return Err(Error::Custom(
+            "LNURL callback URL must not include credentials".to_string(),
+        ));
+    }
+
+    if parsed_url.fragment().is_some() {
+        return Err(Error::Custom(
+            "LNURL callback URL must not include a fragment".to_string(),
+        ));
+    }
+
+    match parsed_url.host() {
+        Some(url::Host::Domain(host)) if host != "localhost" => Ok(parsed_url),
+        Some(_) => Err(Error::Custom(
+            "LNURL callback URL must use a public DNS host".to_string(),
+        )),
+        None => Err(Error::Custom(
+            "LNURL callback URL must include a host".to_string(),
+        )),
     }
 }
 
@@ -186,10 +447,50 @@ impl<T> MintConnector for HttpClient<T>
 where
     T: Transport + Send + Sync + 'static,
 {
+    fn auth_connector(
+        &self,
+        mint_url: MintUrl,
+        cat: Option<AuthToken>,
+    ) -> Arc<dyn AuthMintConnector + Send + Sync> {
+        Arc::new(AuthHttpClient::with_transport(
+            mint_url,
+            self.transport.as_ref().clone(),
+            cat,
+        ))
+    }
+
+    fn oidc_client(&self, openid_discovery: String, client_id: Option<String>) -> OidcClient {
+        OidcClient::with_transport(
+            openid_discovery,
+            client_id,
+            Arc::new(OidcTransportClient {
+                transport: self.transport.clone(),
+            }),
+        )
+    }
+
+    async fn connect_websocket(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<
+        (
+            cdk_common::ws_client::WsSender,
+            cdk_common::ws_client::WsReceiver,
+        ),
+        cdk_common::ws_client::WsError,
+    > {
+        self.transport.ws_connect(url, headers).await
+    }
+
     #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
     #[instrument(skip(self), fields(mint_url = %self.mint_url))]
     async fn resolve_dns_txt(&self, domain: &str) -> Result<Vec<String>, Error> {
-        self.transport.resolve_dns_txt(domain).await
+        self.transport
+            .as_ref()
+            .resolve_dns_txt(domain)
+            .await
+            .map_err(Self::map_http_error)
     }
 
     /// Fetch Lightning address pay request data
@@ -200,7 +501,8 @@ where
     ) -> Result<crate::lightning_address::LnurlPayResponse, Error> {
         let parsed_url =
             url::Url::parse(url).map_err(|e| Error::Custom(format!("Invalid URL: {}", e)))?;
-        self.transport.http_get(parsed_url, None).await
+        self.ensure_verified_tls(&parsed_url)?;
+        self.transport_http_get(parsed_url, None).await
     }
 
     /// Fetch invoice from Lightning address callback
@@ -209,18 +511,77 @@ where
         &self,
         url: &str,
     ) -> Result<crate::lightning_address::LnurlPayInvoiceResponse, Error> {
-        let parsed_url =
-            url::Url::parse(url).map_err(|e| Error::Custom(format!("Invalid URL: {}", e)))?;
-        self.transport.http_get(parsed_url, None).await
+        let parsed_url = parse_lnurl_callback_url(url)?;
+        self.ensure_verified_tls(&parsed_url)?;
+        self.transport_http_get(parsed_url, None).await
+    }
+
+    /// NUT-18 leaves `Transport.target` free-form, but this connector can only
+    /// reach a receiver over http(s), so any other scheme is a refusal the
+    /// wallet can make before it swaps.
+    fn ensure_payment_request_deliverable(&self, url: &str) -> Result<(), Error> {
+        let url = Url::parse(url)?;
+
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(Error::Custom(format!(
+                "Payment request target scheme {} cannot be reached over HTTP",
+                url.scheme()
+            )));
+        }
+
+        self.ensure_verified_tls(&url)
+    }
+
+    /// Deliver a NUT-18 payment request payload to the receiver
+    ///
+    /// The payload carries proofs, so it is never recorded in the span. NUT-18
+    /// defines no response body, so any 2xx counts as delivered.
+    #[instrument(skip_all)]
+    async fn post_payment_request_payload(
+        &self,
+        url: &str,
+        payload: &PaymentRequestPayload,
+    ) -> Result<(), Error> {
+        self.ensure_payment_request_deliverable(url)?;
+        let url = Url::parse(url)?;
+
+        let response =
+            self.transport
+                .http_post(url, None, payload)
+                .await
+                .map_err(|err| match err {
+                    HttpError::Redirect(_) => {
+                        Error::PaymentRequestDeliveryRedirected { status: None }
+                    }
+                    HttpError::Status { status, message } => {
+                        Error::HttpError(Some(status), message)
+                    }
+                    other => Self::map_http_error(other),
+                })?;
+
+        if response.is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        if (300..400).contains(&status) {
+            return Err(Error::PaymentRequestDeliveryRedirected {
+                status: Some(status),
+            });
+        }
+
+        Err(Error::HttpError(Some(status), response.body_lossy()))
     }
 
     /// Get Active Mint Keys [NUT-01]
     #[instrument(skip(self), fields(mint_url = %self.mint_url))]
     async fn get_mint_keys(&self) -> Result<Vec<KeySet>, Error> {
         let url = self.mint_url.join_paths(&["v1", "keys"])?;
-        let transport = self.transport.clone();
 
-        Ok(transport.http_get::<KeysResponse>(url, None).await?.keysets)
+        Ok(self
+            .transport_http_get::<KeysResponse>(url, None)
+            .await?
+            .keysets)
     }
 
     /// Get Keyset Keys [NUT-01]
@@ -230,8 +591,7 @@ where
             .mint_url
             .join_paths(&["v1", "keys", &keyset_id.to_string()])?;
 
-        let transport = self.transport.clone();
-        let keys_response = transport.http_get::<KeysResponse>(url, None).await?;
+        let keys_response = self.transport_http_get::<KeysResponse>(url, None).await?;
 
         Ok(keys_response
             .keysets
@@ -244,8 +604,7 @@ where
     #[instrument(skip(self), fields(mint_url = %self.mint_url))]
     async fn get_mint_keysets(&self) -> Result<KeysetResponse, Error> {
         let url = self.mint_url.join_paths(&["v1", "keysets"])?;
-        let transport = self.transport.clone();
-        transport.http_get(url, None).await
+        self.transport_http_get(url, None).await
     }
 
     /// Mint Quote [NUT-04, NUT-23, NUT-25]
@@ -254,38 +613,39 @@ where
         &self,
         request: MintQuoteRequest,
     ) -> Result<MintQuoteResponse<String>, Error> {
-        let method = request.method().to_string();
-        let path = format!("v1/mint/quote/{}", method);
+        let method = request.method();
+        let method_name = payment_method_path_segment(&method)?;
 
         let url = self
             .mint_url
-            .join_paths(&path.split('/').collect::<Vec<_>>())?;
+            .join_paths(&["v1", "mint", "quote", method_name])?;
 
         let auth_token = self
-            .get_auth_token(
-                Method::Post,
-                RoutePath::MintQuote(request.method().to_string()),
-            )
+            .get_auth_token(Method::Post, RoutePath::MintQuote(method.to_string()))
             .await?;
 
         match &request {
             MintQuoteRequest::Bolt11(req) => {
                 let response: cdk_common::nut23::MintQuoteBolt11Response<String> =
-                    self.transport.http_post(url, auth_token, req).await?;
+                    self.transport_http_post(url, auth_token, req).await?;
                 Ok(MintQuoteResponse::Bolt11(response))
             }
             MintQuoteRequest::Bolt12(req) => {
                 let response: cdk_common::nut25::MintQuoteBolt12Response<String> =
-                    self.transport.http_post(url, auth_token, req).await?;
+                    self.transport_http_post(url, auth_token, req).await?;
                 Ok(MintQuoteResponse::Bolt12(response))
             }
+            MintQuoteRequest::Onchain(req) => {
+                let response: cdk_common::nut30::MintQuoteOnchainResponse<String> =
+                    self.transport_http_post(url, auth_token, req).await?;
+                Ok(MintQuoteResponse::Onchain(response))
+            }
             MintQuoteRequest::Custom { request: req, .. } => {
+                let value: serde_json::Value =
+                    self.transport_http_post(url, auth_token, req).await?;
                 let response: cdk_common::nut04::MintQuoteCustomResponse<String> =
-                    self.transport.http_post(url, auth_token, req).await?;
-                Ok(MintQuoteResponse::Custom {
-                    method: request.method(),
-                    response,
-                })
+                    deserialize_with_route_method(value, &method)?;
+                Ok(MintQuoteResponse::Custom { method, response })
             }
         }
     }
@@ -311,7 +671,7 @@ where
                     .await?;
 
                 let response: MintQuoteBolt11Response<String> =
-                    self.transport.http_get(url, auth_token).await?;
+                    self.transport_http_get(url, auth_token).await?;
 
                 Ok(MintQuoteResponse::Bolt11(response))
             }
@@ -328,21 +688,42 @@ where
                     .await?;
 
                 let response: MintQuoteBolt12Response<String> =
-                    self.transport.http_get(url, auth_token).await?;
+                    self.transport_http_get(url, auth_token).await?;
 
                 Ok(MintQuoteResponse::Bolt12(response))
             }
-            PaymentMethod::Custom(method_name) => {
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                let url = self
+                    .mint_url
+                    .join_paths(&["v1", "mint", "quote", "onchain", quote_id])?;
+
+                let auth_token = self
+                    .get_auth_token(
+                        Method::Get,
+                        RoutePath::MintQuote(
+                            PaymentMethod::Known(KnownMethod::Onchain).to_string(),
+                        ),
+                    )
+                    .await?;
+
+                let response: MintQuoteOnchainResponse<String> =
+                    self.transport_http_get(url, auth_token).await?;
+
+                Ok(MintQuoteResponse::Onchain(response))
+            }
+            PaymentMethod::Custom(_) => {
+                let method_name = payment_method_path_segment(&method)?;
                 let url =
                     self.mint_url
                         .join_paths(&["v1", "mint", "quote", method_name, quote_id])?;
 
                 let auth_token = self
-                    .get_auth_token(Method::Get, RoutePath::MintQuote(method_name.clone()))
+                    .get_auth_token(Method::Get, RoutePath::MintQuote(method_name.to_string()))
                     .await?;
 
+                let value: serde_json::Value = self.transport_http_get(url, auth_token).await?;
                 let response: MintQuoteCustomResponse<String> =
-                    self.transport.http_get(url, auth_token).await?;
+                    deserialize_with_route_method(value, &method)?;
 
                 Ok(MintQuoteResponse::Custom { method, response })
             }
@@ -356,6 +737,7 @@ where
         method: &PaymentMethod,
         request: MintRequest<String>,
     ) -> Result<MintResponse, Error> {
+        let method_name = payment_method_path_segment(method)?;
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::Mint(method.to_string()))
             .await?;
@@ -367,7 +749,10 @@ where
             PaymentMethod::Known(KnownMethod::Bolt12) => {
                 nut19::Path::Custom("/v1/mint/bolt12".to_string())
             }
-            PaymentMethod::Custom(m) => nut19::Path::custom_mint(m),
+            PaymentMethod::Custom(_) => nut19::Path::custom_mint(method_name),
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                nut19::Path::Custom("/v1/mint/onchain".to_string())
+            }
         };
 
         self.retriable_http_request(nut19::Method::Post, path, auth_token, &request)
@@ -380,16 +765,55 @@ where
         &self,
         method: &PaymentMethod,
         request: BatchCheckMintQuoteRequest<String>,
-    ) -> Result<Vec<MintQuoteBolt11Response<String>>, Error> {
-        let url =
-            self.mint_url
-                .join_paths(&["v1", "mint", "quote", &method.to_string(), "check"])?;
+    ) -> Result<Vec<MintQuoteResponse<String>>, Error> {
+        let method_name = payment_method_path_segment(method)?;
+        let url = self
+            .mint_url
+            .join_paths(&["v1", "mint", "quote", method_name, "check"])?;
 
         let auth_token = self
-            .get_auth_token(Method::Post, RoutePath::MintQuote(method.to_string()))
+            .get_auth_token(Method::Post, RoutePath::MintQuote(method_name.to_string()))
             .await?;
 
-        self.transport.http_post(url, auth_token, &request).await
+        match method {
+            PaymentMethod::Known(KnownMethod::Bolt11) => {
+                let responses: Vec<MintQuoteBolt11Response<String>> =
+                    self.transport_http_post(url, auth_token, &request).await?;
+                Ok(responses
+                    .into_iter()
+                    .map(MintQuoteResponse::Bolt11)
+                    .collect())
+            }
+            PaymentMethod::Known(KnownMethod::Bolt12) => {
+                let responses: Vec<MintQuoteBolt12Response<String>> =
+                    self.transport_http_post(url, auth_token, &request).await?;
+                Ok(responses
+                    .into_iter()
+                    .map(MintQuoteResponse::Bolt12)
+                    .collect())
+            }
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                let responses: Vec<MintQuoteOnchainResponse<String>> =
+                    self.transport_http_post(url, auth_token, &request).await?;
+                Ok(responses
+                    .into_iter()
+                    .map(MintQuoteResponse::Onchain)
+                    .collect())
+            }
+            PaymentMethod::Custom(method_name) => {
+                let value: serde_json::Value =
+                    self.transport_http_post(url, auth_token, &request).await?;
+                let responses: Vec<MintQuoteCustomResponse<String>> =
+                    deserialize_with_route_method(value, method)?;
+                Ok(responses
+                    .into_iter()
+                    .map(|response| MintQuoteResponse::Custom {
+                        method: PaymentMethod::Custom(method_name.clone()),
+                        response,
+                    })
+                    .collect())
+            }
+        }
     }
 
     /// Batch mint tokens [NUT-29]
@@ -399,11 +823,12 @@ where
         method: &PaymentMethod,
         request: BatchMintRequest<String>,
     ) -> Result<MintResponse, Error> {
+        let method_name = payment_method_path_segment(method)?;
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::Mint(method.to_string()))
             .await?;
 
-        let path = nut19::Path::Custom(format!("/v1/mint/{}/batch", method));
+        let path = nut19::Path::Custom(format!("/v1/mint/{method_name}/batch"));
 
         self.retriable_http_request(nut19::Method::Post, path, auth_token, &request)
             .await
@@ -415,34 +840,38 @@ where
         &self,
         request: MeltQuoteRequest,
     ) -> Result<MeltQuoteCreateResponse<String>, Error> {
-        let method = request.method().to_string();
-        let path = format!("v1/melt/quote/{}", method);
+        let method = request.method();
+        let method_name = payment_method_path_segment(&method)?;
 
         let url = self
             .mint_url
-            .join_paths(&path.split('/').collect::<Vec<_>>())?;
+            .join_paths(&["v1", "melt", "quote", method_name])?;
         let auth_token = self
-            .get_auth_token(Method::Post, RoutePath::MeltQuote(method))
+            .get_auth_token(Method::Post, RoutePath::MeltQuote(method.to_string()))
             .await?;
 
         match &request {
             MeltQuoteRequest::Bolt11(req) => {
                 let response: cdk_common::nut23::MeltQuoteBolt11Response<String> =
-                    self.transport.http_post(url, auth_token, req).await?;
+                    self.transport_http_post(url, auth_token, req).await?;
                 Ok(MeltQuoteCreateResponse::Bolt11(response))
             }
             MeltQuoteRequest::Bolt12(req) => {
                 let response: cdk_common::nut25::MeltQuoteBolt12Response<String> =
-                    self.transport.http_post(url, auth_token, req).await?;
+                    self.transport_http_post(url, auth_token, req).await?;
                 Ok(MeltQuoteCreateResponse::Bolt12(response))
             }
+            MeltQuoteRequest::Onchain(req) => {
+                let response: cdk_common::nut30::MeltQuoteOnchainResponse<String> =
+                    self.transport_http_post(url, auth_token, req).await?;
+                Ok(MeltQuoteCreateResponse::Onchain(response))
+            }
             MeltQuoteRequest::Custom(req) => {
+                let value: serde_json::Value =
+                    self.transport_http_post(url, auth_token, req).await?;
                 let response: cdk_common::nut05::MeltQuoteCustomResponse<String> =
-                    self.transport.http_post(url, auth_token, req).await?;
-                Ok(MeltQuoteCreateResponse::Custom((
-                    request.method(),
-                    response,
-                )))
+                    deserialize_with_route_method(value, &method)?;
+                Ok(MeltQuoteCreateResponse::Custom((method, response)))
             }
         }
     }
@@ -468,7 +897,7 @@ where
                     .await?;
 
                 let response: cdk_common::nut23::MeltQuoteBolt11Response<String> =
-                    self.transport.http_get(url, auth_token).await?;
+                    self.transport_http_get(url, auth_token).await?;
 
                 Ok(MeltQuoteResponse::Bolt11(response))
             }
@@ -485,21 +914,42 @@ where
                     .await?;
 
                 let response: cdk_common::nut25::MeltQuoteBolt12Response<String> =
-                    self.transport.http_get(url, auth_token).await?;
+                    self.transport_http_get(url, auth_token).await?;
 
                 Ok(MeltQuoteResponse::Bolt12(response))
             }
-            PaymentMethod::Custom(method_name) => {
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                let url = self
+                    .mint_url
+                    .join_paths(&["v1", "melt", "quote", "onchain", quote_id])?;
+
+                let auth_token = self
+                    .get_auth_token(
+                        Method::Get,
+                        RoutePath::MeltQuote(
+                            PaymentMethod::Known(KnownMethod::Onchain).to_string(),
+                        ),
+                    )
+                    .await?;
+
+                let response: cdk_common::nut30::MeltQuoteOnchainResponse<String> =
+                    self.transport_http_get(url, auth_token).await?;
+
+                Ok(MeltQuoteResponse::Onchain(response))
+            }
+            PaymentMethod::Custom(_) => {
+                let method_name = payment_method_path_segment(&method)?;
                 let url =
                     self.mint_url
                         .join_paths(&["v1", "melt", "quote", method_name, quote_id])?;
 
                 let auth_token = self
-                    .get_auth_token(Method::Get, RoutePath::MeltQuote(method_name.clone()))
+                    .get_auth_token(Method::Get, RoutePath::MeltQuote(method_name.to_string()))
                     .await?;
 
+                let value: serde_json::Value = self.transport_http_get(url, auth_token).await?;
                 let response: cdk_common::nut05::MeltQuoteCustomResponse<String> =
-                    self.transport.http_get(url, auth_token).await?;
+                    deserialize_with_route_method(value, &method)?;
 
                 Ok(MeltQuoteResponse::Custom((method.clone(), response)))
             }
@@ -514,6 +964,7 @@ where
         method: &PaymentMethod,
         request: MeltRequest<String>,
     ) -> Result<MeltQuoteResponse<String>, Error> {
+        let method_name = payment_method_path_segment(method)?;
         let auth_token = self
             .get_auth_token(Method::Post, RoutePath::Melt(method.to_string()))
             .await?;
@@ -525,7 +976,10 @@ where
             PaymentMethod::Known(KnownMethod::Bolt12) => {
                 nut19::Path::Custom("/v1/melt/bolt12".to_string())
             }
-            PaymentMethod::Custom(m) => nut19::Path::custom_melt(m),
+            PaymentMethod::Custom(_) => nut19::Path::custom_melt(method_name),
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                nut19::Path::Custom("/v1/melt/onchain".to_string())
+            }
         };
 
         match method {
@@ -541,10 +995,26 @@ where
                     .await?;
                 Ok(MeltQuoteResponse::Bolt12(res))
             }
-            _ => {
-                let res: cdk_common::nuts::MeltQuoteCustomResponse<String> = self
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                let request = MeltOnchainRequest {
+                    quote: request.quote_id().clone(),
+                    fee_index: request
+                        .selected_fee_index()
+                        .ok_or(Error::InvalidPaymentRequest)?,
+                    inputs: request.inputs().clone(),
+                    outputs: request.outputs().clone(),
+                };
+                let res: cdk_common::nuts::MeltQuoteOnchainResponse<String> = self
                     .retriable_http_request(nut19::Method::Post, path, auth_token, &request)
                     .await?;
+                Ok(MeltQuoteResponse::Onchain(res))
+            }
+            PaymentMethod::Custom(_) => {
+                let value: serde_json::Value = self
+                    .retriable_http_request(nut19::Method::Post, path, auth_token, &request)
+                    .await?;
+                let res: cdk_common::nuts::MeltQuoteCustomResponse<String> =
+                    deserialize_with_route_method(value, method)?;
                 Ok(MeltQuoteResponse::Custom((method.clone(), res)))
             }
         }
@@ -567,8 +1037,7 @@ where
     /// Helper to get mint info
     async fn get_mint_info(&self) -> Result<MintInfo, Error> {
         let url = self.mint_url.join_paths(&["v1", "info"])?;
-        let transport = self.transport.clone();
-        let info: MintInfo = transport.http_get(url, None).await?;
+        let info: MintInfo = self.transport_http_get(url, None).await?;
 
         if let Ok(mut cache_support) = self.cache_support.write() {
             *cache_support = (
@@ -605,7 +1074,7 @@ where
             .get_auth_token(Method::Post, RoutePath::Checkstate)
             .await?;
 
-        self.transport.http_post(url, auth_token, &request).await
+        self.transport_http_post(url, auth_token, &request).await
     }
 
     /// Restore request [NUT-13]
@@ -616,7 +1085,7 @@ where
             .get_auth_token(Method::Post, RoutePath::Restore)
             .await?;
 
-        self.transport.http_post(url, auth_token, &request).await
+        self.transport_http_post(url, auth_token, &request).await
     }
 }
 
@@ -636,8 +1105,39 @@ impl<T> AuthHttpClient<T>
 where
     T: Transport + Send + Sync + 'static,
 {
+    async fn transport_http_get<R>(&self, url: Url, auth: Option<AuthToken>) -> Result<R, Error>
+    where
+        R: DeserializeOwned,
+    {
+        self.transport
+            .http_get(url, auth)
+            .await
+            .and_then(RawResponse::json_or_status_error)
+            .map_err(HttpClient::<T>::map_http_error)
+    }
+
+    async fn transport_http_post<P, R>(
+        &self,
+        url: Url,
+        auth: Option<AuthToken>,
+        payload: &P,
+    ) -> Result<R, Error>
+    where
+        P: Serialize + Send + Sync,
+        R: DeserializeOwned,
+    {
+        self.transport
+            .http_post(url, auth, payload)
+            .await
+            .and_then(RawResponse::json_or_status_error)
+            .map_err(HttpClient::<T>::map_http_error)
+    }
+
     /// Create new [`AuthHttpClient`]
-    pub fn new(mint_url: MintUrl, cat: Option<AuthToken>) -> Self {
+    pub fn new(mint_url: MintUrl, cat: Option<AuthToken>) -> Self
+    where
+        T: Default,
+    {
         Self {
             transport: T::default().into(),
             mint_url,
@@ -645,6 +1145,47 @@ where
                 cat.unwrap_or(AuthToken::ClearAuth("".to_string())),
             )),
         }
+    }
+    /// Create new [`AuthHttpClient`] with a provided transport implementation.
+    pub fn with_transport(mint_url: MintUrl, transport: T, cat: Option<AuthToken>) -> Self {
+        Self::with_shared_transport(mint_url, Arc::new(transport), cat)
+    }
+
+    /// Create new [`AuthHttpClient`] sharing an existing transport instance, so
+    /// it reuses the transport's connection pool and any rate limiter it wraps.
+    pub fn with_shared_transport(
+        mint_url: MintUrl,
+        transport: Arc<T>,
+        cat: Option<AuthToken>,
+    ) -> Self {
+        Self {
+            transport,
+            mint_url,
+            cat: Arc::new(RwLock::new(
+                cat.unwrap_or(AuthToken::ClearAuth("".to_string())),
+            )),
+        }
+    }
+
+    /// Create new [`AuthHttpClient`] with a proxy for specific TLDs.
+    /// Specifying `None` for `host_matcher` will use the proxy for all
+    /// requests.
+    pub fn with_proxy(
+        mint_url: MintUrl,
+        proxy: Url,
+        host_matcher: Option<&str>,
+        accept_invalid_certs: bool,
+        cat: Option<AuthToken>,
+    ) -> Result<Self, Error>
+    where
+        T: Default,
+    {
+        let mut transport = T::default();
+        transport
+            .with_proxy(proxy, host_matcher, accept_invalid_certs)
+            .map_err(HttpClient::<T>::map_http_error)?;
+
+        Ok(Self::with_transport(mint_url, transport, cat))
     }
 }
 
@@ -666,7 +1207,7 @@ where
     /// Get Mint Info [NUT-06]
     async fn get_mint_info(&self) -> Result<MintInfo, Error> {
         let url = self.mint_url.join_paths(&["v1", "info"])?;
-        let mint_info: MintInfo = self.transport.http_get::<MintInfo>(url, None).await?;
+        let mint_info: MintInfo = self.transport_http_get::<MintInfo>(url, None).await?;
 
         Ok(mint_info)
     }
@@ -678,7 +1219,7 @@ where
             self.mint_url
                 .join_paths(&["v1", "auth", "blind", "keys", &keyset_id.to_string()])?;
 
-        let mut keys_response = self.transport.http_get::<KeysResponse>(url, None).await?;
+        let mut keys_response = self.transport_http_get::<KeysResponse>(url, None).await?;
 
         let keyset = keys_response
             .keysets
@@ -696,30 +1237,163 @@ where
             .mint_url
             .join_paths(&["v1", "auth", "blind", "keysets"])?;
 
-        self.transport.http_get(url, None).await
+        self.transport_http_get(url, None).await
     }
 
     /// Mint Tokens [NUT-22]
     #[instrument(skip(self, request), fields(mint_url = %self.mint_url))]
     async fn post_mint_blind_auth(&self, request: MintAuthRequest) -> Result<MintResponse, Error> {
         let url = self.mint_url.join_paths(&["v1", "auth", "blind", "mint"])?;
-        self.transport
-            .http_post(url, Some(self.cat.read().await.clone()), &request)
+        self.transport_http_post(url, Some(self.cat.read().await.clone()), &request)
             .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fmt;
     use std::str::FromStr;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use serde::de::DeserializeOwned;
+    use cdk_common::{CurrencyUnit, MintQuoteState};
+    use cdk_http_client::{HttpError, RawResponse};
 
     use super::*;
     use crate::nuts::nut04::MintQuoteCustomRequest;
+    use crate::nuts::nut05::MeltQuoteCustomRequest;
+    use crate::wallet::mint_connector::transport::{
+        RateLimitConfig, RateLimitedTransport, RateLimiterManager,
+    };
+
+    /// Transport double for recipient delivery.
+    ///
+    /// Records every JSON POST together with the proxy configured on the same
+    /// instance, so tests can prove delivery rode the configured transport and
+    /// carried no mint credentials.
+    #[derive(Clone, Default)]
+    struct RecordingPostTransport {
+        proxy: Arc<Mutex<Option<String>>>,
+        accept_invalid_certs: Arc<Mutex<bool>>,
+        calls: Arc<Mutex<Vec<RecordedPost>>>,
+        response: Arc<Mutex<Option<(u16, String)>>>,
+        error: Arc<Mutex<Option<HttpError>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedPost {
+        url: String,
+        had_auth: bool,
+        payload: serde_json::Value,
+    }
+
+    impl fmt::Debug for RecordingPostTransport {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("RecordingPostTransport").finish()
+        }
+    }
+
+    impl RecordingPostTransport {
+        fn with_response(status: u16, body: &str) -> Self {
+            let transport = Self::default();
+            *transport.response.lock().expect("lock") = Some((status, body.to_string()));
+            transport
+        }
+
+        fn with_error(error: HttpError) -> Self {
+            let transport = Self::default();
+            *transport.error.lock().expect("lock") = Some(error);
+            transport
+        }
+
+        fn calls(&self) -> Vec<RecordedPost> {
+            self.calls.lock().expect("lock").clone()
+        }
+
+        fn proxy(&self) -> Option<String> {
+            self.proxy.lock().expect("lock").clone()
+        }
+
+        fn unexpected() -> HttpError {
+            HttpError::Other("unexpected call".to_string())
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl Transport for RecordingPostTransport {
+        fn with_proxy(
+            &mut self,
+            proxy: Url,
+            _host_matcher: Option<&str>,
+            accept_invalid_certs: bool,
+        ) -> Result<(), HttpError> {
+            *self.proxy.lock().expect("lock") = Some(proxy.to_string());
+            *self.accept_invalid_certs.lock().expect("lock") = accept_invalid_certs;
+            Ok(())
+        }
+
+        fn tls_verification_disabled(&self) -> bool {
+            *self.accept_invalid_certs.lock().expect("lock")
+        }
+
+        #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
+        async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, HttpError> {
+            Err(Self::unexpected())
+        }
+
+        async fn http_get(
+            &self,
+            _url: Url,
+            _auth: Option<AuthToken>,
+        ) -> Result<RawResponse, HttpError> {
+            Err(Self::unexpected())
+        }
+
+        async fn http_post<P>(
+            &self,
+            url: Url,
+            auth_token: Option<AuthToken>,
+            payload: &P,
+        ) -> Result<RawResponse, HttpError>
+        where
+            P: serde::Serialize + Send + Sync,
+        {
+            let payload = serde_json::to_value(payload)
+                .map_err(|e| HttpError::Serialization(e.to_string()))?;
+            self.calls.lock().expect("lock").push(RecordedPost {
+                url: url.to_string(),
+                had_auth: auth_token.is_some(),
+                payload,
+            });
+
+            if let Some(error) = self.error.lock().expect("lock").take() {
+                return Err(error);
+            }
+
+            let (status, body) = self
+                .response
+                .lock()
+                .expect("lock")
+                .clone()
+                .ok_or_else(Self::unexpected)?;
+
+            Ok(RawResponse::new(status, body.into_bytes()))
+        }
+
+        async fn http_post_form<P>(
+            &self,
+            _url: Url,
+            _auth_token: Option<AuthToken>,
+            _payload: &P,
+        ) -> Result<RawResponse, HttpError>
+        where
+            P: serde::Serialize + Send + Sync,
+        {
+            Err(Self::unexpected())
+        }
+    }
 
     /// A mock transport that captures the serialized POST payload and returns
     /// a canned JSON response. Follows the same canned-response pattern as
@@ -730,6 +1404,18 @@ mod tests {
         captured_payload: Arc<Mutex<Option<serde_json::Value>>>,
         /// Canned JSON string returned by `http_post`.
         post_response: Arc<Mutex<Option<String>>>,
+        /// Canned JSON string returned by `http_get`.
+        get_response: Arc<Mutex<Option<String>>>,
+        /// URLs passed to `http_get`.
+        get_urls: Arc<Mutex<Vec<String>>>,
+        /// URLs passed to `http_post`.
+        post_urls: Arc<Mutex<Vec<String>>>,
+        /// Errors returned by `http_post` before its canned success response.
+        post_errors: Arc<Mutex<VecDeque<HttpError>>>,
+        /// Artificial delay applied to each `http_post` call.
+        post_delay: Option<Duration>,
+        /// Whether `with_proxy` was told to accept invalid certificates.
+        accept_invalid_certs: Arc<Mutex<bool>>,
     }
 
     impl fmt::Debug for MockTransport {
@@ -741,50 +1427,445 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl Transport for MockTransport {
-        #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
-        async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, Error> {
-            unimplemented!()
-        }
-
         fn with_proxy(
             &mut self,
             _proxy: Url,
             _host_matcher: Option<&str>,
-            _accept_invalid_certs: bool,
-        ) -> Result<(), Error> {
+            accept_invalid_certs: bool,
+        ) -> Result<(), HttpError> {
+            *self.accept_invalid_certs.lock().expect("lock") = accept_invalid_certs;
             Ok(())
         }
 
-        async fn http_get<R>(&self, _url: Url, _auth: Option<AuthToken>) -> Result<R, Error>
-        where
-            R: DeserializeOwned,
-        {
-            unimplemented!()
+        fn tls_verification_disabled(&self) -> bool {
+            *self.accept_invalid_certs.lock().expect("lock")
         }
 
-        async fn http_post<P, R>(
+        #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
+        async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, HttpError> {
+            Ok(vec![])
+        }
+
+        async fn http_get(
             &self,
-            _url: Url,
+            url: Url,
+            _auth: Option<AuthToken>,
+        ) -> Result<RawResponse, HttpError> {
+            self.get_urls.lock().expect("lock").push(url.to_string());
+            let json = self
+                .get_response
+                .lock()
+                .expect("lock")
+                .clone()
+                .expect("no mock response set");
+            Ok(RawResponse::new(200, json.into_bytes()))
+        }
+
+        async fn http_post<P>(
+            &self,
+            url: Url,
             _auth_token: Option<AuthToken>,
             payload: &P,
-        ) -> Result<R, Error>
+        ) -> Result<RawResponse, HttpError>
         where
-            P: serde::Serialize + ?Sized + Send + Sync,
-            R: DeserializeOwned,
+            P: serde::Serialize + Send + Sync,
         {
-            // Capture the serialized payload for test assertions
-            let value = serde_json::to_value(payload).map_err(|e| Error::Custom(e.to_string()))?;
+            self.post_urls.lock().expect("lock").push(url.to_string());
+            let value = serde_json::to_value(payload)
+                .map_err(|e| HttpError::Serialization(e.to_string()))?;
             *self.captured_payload.lock().expect("lock") = Some(value);
 
-            // Return the canned response
+            if let Some(delay) = self.post_delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            if let Some(error) = self.post_errors.lock().expect("lock").pop_front() {
+                return Err(error);
+            }
+
             let json = self
                 .post_response
                 .lock()
                 .expect("lock")
                 .clone()
                 .expect("no mock response set");
-            serde_json::from_str(&json).map_err(|e| Error::Custom(e.to_string()))
+            Ok(RawResponse::new(200, json.into_bytes()))
         }
+
+        async fn http_post_form<P>(
+            &self,
+            url: Url,
+            _auth_token: Option<AuthToken>,
+            payload: &P,
+        ) -> Result<RawResponse, HttpError>
+        where
+            P: serde::Serialize + Send + Sync,
+        {
+            self.post_urls.lock().expect("lock").push(url.to_string());
+            let value = serde_json::to_value(payload)
+                .map_err(|e| HttpError::Serialization(e.to_string()))?;
+            *self.captured_payload.lock().expect("lock") = Some(value);
+
+            let json = self
+                .post_response
+                .lock()
+                .expect("lock")
+                .clone()
+                .expect("no mock response set");
+            Ok(RawResponse::new(200, json.into_bytes()))
+        }
+    }
+
+    fn receiver_url() -> &'static str {
+        "https://receiver.example.com/pay"
+    }
+
+    fn delivery_payload() -> PaymentRequestPayload {
+        PaymentRequestPayload {
+            id: Some("payment-id".to_string()),
+            memo: None,
+            mint: MintUrl::from_str("https://mint.example.com").expect("parse url"),
+            unit: CurrencyUnit::Sat,
+            proofs: Vec::new(),
+        }
+    }
+
+    fn delivery_client<T: Transport>(transport: T) -> HttpClient<T> {
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        HttpClient::with_transport(mint_url, transport, None)
+    }
+
+    fn unverified_tls_delivery_client(
+        transport: RecordingPostTransport,
+    ) -> HttpClient<RecordingPostTransport> {
+        let mut client = delivery_client(transport);
+        client.tls_verification_disabled = true;
+        client
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_uses_configured_proxy_transport() {
+        let mut transport = RecordingPostTransport::with_response(200, "{}");
+        let proxy = Url::parse("http://127.0.0.1:9050").expect("parse proxy url");
+        transport
+            .with_proxy(proxy.clone(), None, false)
+            .expect("configure proxy");
+        let client = delivery_client(transport.clone());
+        let payload = delivery_payload();
+
+        client
+            .post_payment_request_payload(receiver_url(), &payload)
+            .await
+            .expect("delivery should succeed");
+
+        assert_eq!(transport.proxy(), Some(proxy.to_string()));
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].url, receiver_url());
+        assert_eq!(
+            calls[0].payload,
+            serde_json::to_value(&payload).expect("serialize payload")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_sends_no_mint_credentials() {
+        let transport = RecordingPostTransport::with_response(200, "{}");
+        let client = delivery_client(transport.clone());
+
+        client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect("delivery should succeed");
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            !calls[0].had_auth,
+            "recipient request must not carry mint credentials"
+        );
+        assert!(
+            !calls[0].url.contains("mint.example.com"),
+            "delivery must target the receiver, not the mint"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_maps_a_transport_status_error() {
+        let transport = RecordingPostTransport::with_error(HttpError::Status {
+            status: 402,
+            message: "payment required".to_string(),
+        });
+        let client = delivery_client(transport.clone());
+
+        let error = client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect_err("delivery should fail");
+
+        match error {
+            Error::HttpError(status, body) => {
+                assert_eq!(status, Some(402));
+                assert_eq!(body, "payment required");
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+    }
+
+    /// NUT-18 defines no response body, and receivers commonly answer an empty
+    /// 200. Reporting that as a failure would send the payer to `revoke_send`
+    /// for proofs the receiver already holds.
+    #[tokio::test]
+    async fn post_payment_request_payload_accepts_success_without_a_body() {
+        let transport = RecordingPostTransport::with_response(200, "");
+        let client = delivery_client(transport.clone());
+
+        client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect("empty success body is a delivered payment");
+
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_accepts_a_non_json_success_body() {
+        let transport = RecordingPostTransport::with_response(200, "ok");
+        let client = delivery_client(transport.clone());
+
+        client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect("plain text success body is a delivered payment");
+
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_reports_a_redirect_response() {
+        let transport = RecordingPostTransport::with_response(302, "Found");
+        let client = delivery_client(transport.clone());
+
+        let error = client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect_err("delivery should fail");
+
+        assert!(
+            matches!(
+                error,
+                Error::PaymentRequestDeliveryRedirected { status: Some(302) }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_reports_a_blocked_redirect() {
+        let transport = RecordingPostTransport::with_error(HttpError::Redirect(
+            "too many redirections".to_string(),
+        ));
+        let client = delivery_client(transport.clone());
+
+        let error = client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect_err("delivery should fail");
+
+        assert!(
+            matches!(
+                error,
+                Error::PaymentRequestDeliveryRedirected { status: None }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_reports_the_receiver_status() {
+        let transport = RecordingPostTransport::with_response(402, "payment required");
+        let client = delivery_client(transport.clone());
+
+        let error = client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect_err("delivery should fail");
+
+        match error {
+            Error::HttpError(status, body) => {
+                assert_eq!(status, Some(402));
+                assert_eq!(body, "payment required");
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+    }
+
+    /// `--danger-accept-invalid-certs` is configured for the mint, so proofs
+    /// must not ride it to a receiver URL the payment request picked.
+    #[tokio::test]
+    async fn post_payment_request_payload_refuses_https_without_certificate_verification() {
+        let transport = RecordingPostTransport::with_response(200, "");
+        let client = unverified_tls_delivery_client(transport.clone());
+
+        let error = client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect_err("delivery should fail");
+
+        match error {
+            Error::UnverifiedTlsEndpoint { host } => {
+                assert_eq!(host, "receiver.example.com");
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+        assert!(
+            transport.calls().is_empty(),
+            "nothing may be sent before the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_allows_http_without_certificate_verification() {
+        let transport = RecordingPostTransport::with_response(200, "");
+        let client = unverified_tls_delivery_client(transport.clone());
+
+        client
+            .post_payment_request_payload("http://receiver.example.com/pay", &delivery_payload())
+            .await
+            .expect("plain http has no certificate to verify");
+
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    #[test]
+    fn proxy_client_records_disabled_certificate_verification() {
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let proxy = Url::parse("http://127.0.0.1:9050").expect("parse proxy url");
+
+        let verified = HttpClient::<RecordingPostTransport>::with_proxy(
+            mint_url.clone(),
+            proxy.clone(),
+            None,
+            false,
+        )
+        .expect("build proxy client");
+        let unverified =
+            HttpClient::<RecordingPostTransport>::with_proxy(mint_url, proxy, None, true)
+                .expect("build proxy client");
+
+        assert!(!verified.tls_verification_disabled);
+        assert!(unverified.tls_verification_disabled);
+    }
+
+    /// A transport configured before the client wraps it is the only thing
+    /// that knows verification is off, so the client has to ask rather than
+    /// trust its own flag. `with_transport` cannot set that flag, and proofs
+    /// are bearer funds: an unverified https receiver is a MITM's to redeem.
+    #[test]
+    fn ensure_payment_request_deliverable_refuses_a_pre_configured_unverified_transport() {
+        let mut transport = RecordingPostTransport::with_response(200, "{}");
+        let proxy = Url::parse("http://127.0.0.1:9050").expect("parse proxy url");
+        transport
+            .with_proxy(proxy, None, true)
+            .expect("configure proxy");
+        let client = delivery_client(transport);
+
+        assert!(
+            !client.tls_verification_disabled,
+            "with_transport cannot know how the transport was built"
+        );
+
+        let error = client
+            .ensure_payment_request_deliverable(receiver_url())
+            .expect_err("delivery should refuse an unverified connection");
+
+        assert!(
+            matches!(error, Error::UnverifiedTlsEndpoint { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// The wallet's default transport is rate limited, so the refusal has to
+    /// survive decoration: a wrapper that answers for its inner transport
+    /// without asking it would report a verified connection that is not one.
+    #[test]
+    fn ensure_payment_request_deliverable_refuses_a_wrapped_unverified_transport() {
+        let mut inner = RecordingPostTransport::with_response(200, "{}");
+        let proxy = Url::parse("http://127.0.0.1:9050").expect("parse proxy url");
+        inner
+            .with_proxy(proxy, None, true)
+            .expect("configure proxy");
+        let transport = RateLimitedTransport::with_manager(
+            inner,
+            RateLimiterManager::new(RateLimitConfig::default(), None),
+        );
+        let client = delivery_client(transport);
+
+        let error = client
+            .ensure_payment_request_deliverable(receiver_url())
+            .expect_err("delivery should refuse an unverified connection");
+
+        assert!(
+            matches!(error, Error::UnverifiedTlsEndpoint { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// The wallet asks before it swaps, so a target it can never post to has to
+    /// fail here rather than after the payer has paid the input fee.
+    #[test]
+    fn ensure_payment_request_deliverable_rejects_an_unparsable_url() {
+        let client = delivery_client(RecordingPostTransport::with_response(200, ""));
+
+        client
+            .ensure_payment_request_deliverable("receiver.example.com/pay")
+            .expect_err("a target without a scheme is not a receiver URL");
+    }
+
+    /// The url crate parses any scheme, so a target this transport has no verb
+    /// for still reaches the swap unless the scheme itself is checked.
+    #[test]
+    fn ensure_payment_request_deliverable_rejects_a_non_http_scheme() {
+        let client = delivery_client(RecordingPostTransport::with_response(200, ""));
+
+        client
+            .ensure_payment_request_deliverable("ftp://receiver.example.com/pay")
+            .expect_err("an http transport cannot post to an ftp target");
+    }
+
+    #[test]
+    fn ensure_payment_request_deliverable_allows_plain_http_without_certificate_verification() {
+        let client = unverified_tls_delivery_client(RecordingPostTransport::with_response(200, ""));
+
+        client
+            .ensure_payment_request_deliverable("http://receiver.example.com/pay")
+            .expect("plain http has no certificate to verify");
+    }
+
+    #[tokio::test]
+    async fn post_payment_request_payload_does_not_retry_after_transport_error() {
+        let transport =
+            RecordingPostTransport::with_error(HttpError::Connection("refused".to_string()));
+        let client = delivery_client(transport.clone());
+
+        let error = client
+            .post_payment_request_payload(receiver_url(), &delivery_payload())
+            .await
+            .expect_err("delivery should fail");
+
+        assert!(matches!(error, Error::HttpError(None, _)), "{error:?}");
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    #[test]
+    fn http_client_debug_does_not_traverse_auth_wallet() {
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, MockTransport::default(), None);
+
+        let debug = format!("{client:?}");
+
+        assert!(debug.contains("https://mint.example.com"));
+        assert!(debug.contains("auth_wallet: \"[REDACTED]\""));
     }
 
     /// Regression test: `post_mint_quote` must send only the
@@ -793,24 +1874,27 @@ mod tests {
     /// serializes as a JSON array.
     #[tokio::test]
     async fn test_post_mint_quote_custom_sends_request_object() {
-        use cdk_common::nuts::nut23::QuoteState;
-
-        // Build a canned MintQuoteCustomResponse<String> for the mock
-        let canned_response = MintQuoteCustomResponse::<String> {
-            quote: "test-quote-id".to_string(),
-            request: "paypal://pay?id=123".to_string(),
-            amount: Some(cdk_common::Amount::from(1000)),
-            unit: Some(cdk_common::CurrencyUnit::Sat),
-            state: QuoteState::Unpaid,
-            expiry: Some(9999999),
-            pubkey: None,
-            extra: serde_json::Value::Null,
-        };
-        let canned_json = serde_json::to_string(&canned_response).expect("serialize response");
+        let canned_json = serde_json::json!({
+            "quote": "test-quote-id",
+            "request": "paypal://pay?id=123",
+            "amount": 1000,
+            "amount_paid": 0,
+            "amount_issued": 0,
+            "updated_at": 0,
+            "unit": "sat",
+            "expiry": 9999999
+        })
+        .to_string();
 
         let transport = MockTransport {
             captured_payload: Arc::new(Mutex::new(None)),
             post_response: Arc::new(Mutex::new(Some(canned_json))),
+            get_response: Arc::new(Mutex::new(None)),
+            get_urls: Arc::new(Mutex::new(Vec::new())),
+            post_urls: Arc::new(Mutex::new(Vec::new())),
+            post_errors: Arc::new(Mutex::new(VecDeque::new())),
+            post_delay: None,
+            accept_invalid_certs: Arc::new(Mutex::new(false)),
         };
         let captured = transport.captured_payload.clone();
 
@@ -820,7 +1904,7 @@ mod tests {
         let request = MintQuoteRequest::Custom {
             method: PaymentMethod::Custom("paypal".to_string()),
             request: MintQuoteCustomRequest {
-                amount: cdk_common::Amount::from(1000),
+                amount: Some(cdk_common::Amount::from(1000)),
                 unit: cdk_common::CurrencyUnit::Sat,
                 description: None,
                 pubkey: None,
@@ -828,12 +1912,18 @@ mod tests {
             },
         };
 
-        let result = client.post_mint_quote(request).await;
-        assert!(
-            result.is_ok(),
-            "post_mint_quote should succeed: {:?}",
-            result.err()
-        );
+        let response = client
+            .post_mint_quote(request)
+            .await
+            .expect("post_mint_quote should succeed");
+
+        match response {
+            MintQuoteResponse::Custom { method, response } => {
+                assert_eq!(method, PaymentMethod::Custom("paypal".to_string()));
+                assert_eq!(response.method, PaymentMethod::Custom("paypal".to_string()));
+            }
+            _ => panic!("expected custom response"),
+        }
 
         // Verify the payload sent to the transport was a JSON object (not an array)
         let payload = captured
@@ -856,7 +1946,450 @@ mod tests {
 
         // Verify the actual field values round-tripped correctly
         let parsed = parsed.expect("already checked");
-        assert_eq!(parsed.amount, cdk_common::Amount::from(1000));
+        assert_eq!(parsed.amount, Some(cdk_common::Amount::from(1000)));
         assert_eq!(parsed.unit, cdk_common::CurrencyUnit::Sat);
+    }
+
+    #[tokio::test]
+    async fn retriable_request_retries_transient_transport_error() {
+        let transport = MockTransport {
+            post_response: Arc::new(Mutex::new(Some(
+                serde_json::json!({ "ok": true }).to_string(),
+            ))),
+            post_errors: Arc::new(Mutex::new(VecDeque::from([HttpError::Connection(
+                "connection reset".to_string(),
+            )]))),
+            ..Default::default()
+        };
+        let post_urls = transport.post_urls.clone();
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+        *client.cache_support.write().expect("cache lock") =
+            (1, HashSet::from([(nut19::Method::Post, nut19::Path::Swap)]));
+
+        let started = Instant::now();
+        let response: serde_json::Value = client
+            .retriable_http_request(
+                nut19::Method::Post,
+                nut19::Path::Swap,
+                None,
+                &serde_json::json!({}),
+            )
+            .await
+            .expect("transient failure should be retried");
+
+        assert_eq!(response, serde_json::json!({ "ok": true }));
+        assert_eq!(post_urls.lock().expect("lock").len(), 2);
+        assert!(started.elapsed() >= HTTP_RETRY_INITIAL_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn retriable_request_does_not_replay_http_status_response() {
+        let transport = MockTransport {
+            post_response: Arc::new(Mutex::new(Some(
+                serde_json::json!({ "ok": true }).to_string(),
+            ))),
+            post_errors: Arc::new(Mutex::new(VecDeque::from([HttpError::Status {
+                status: 503,
+                message: "unavailable".to_string(),
+            }]))),
+            ..Default::default()
+        };
+        let post_urls = transport.post_urls.clone();
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+        *client.cache_support.write().expect("cache lock") =
+            (1, HashSet::from([(nut19::Method::Post, nut19::Path::Swap)]));
+
+        let result: Result<serde_json::Value, Error> = client
+            .retriable_http_request(
+                nut19::Method::Post,
+                nut19::Path::Swap,
+                None,
+                &serde_json::json!({}),
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::HttpError(Some(503), _))));
+        assert_eq!(post_urls.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retriable_request_is_bounded_by_nut19_window() {
+        let transport = MockTransport {
+            post_response: Arc::new(Mutex::new(Some(
+                serde_json::json!({ "ok": true }).to_string(),
+            ))),
+            post_delay: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let post_urls = transport.post_urls.clone();
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+        *client.cache_support.write().expect("cache lock") =
+            (1, HashSet::from([(nut19::Method::Post, nut19::Path::Swap)]));
+
+        let started = Instant::now();
+        let result: Result<serde_json::Value, Error> = client
+            .retriable_http_request(
+                nut19::Method::Post,
+                nut19::Path::Swap,
+                None,
+                &serde_json::json!({}),
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(post_urls.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retriable_request_does_not_retry_terminal_transport_error() {
+        let transport = MockTransport {
+            post_response: Arc::new(Mutex::new(Some(
+                serde_json::json!({ "ok": true }).to_string(),
+            ))),
+            post_errors: Arc::new(Mutex::new(VecDeque::from([HttpError::Other(
+                "attestation failed".to_string(),
+            )]))),
+            ..Default::default()
+        };
+        let post_urls = transport.post_urls.clone();
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+        *client.cache_support.write().expect("cache lock") =
+            (1, HashSet::from([(nut19::Method::Post, nut19::Path::Swap)]));
+
+        let result: Result<serde_json::Value, Error> = client
+            .retriable_http_request(
+                nut19::Method::Post,
+                nut19::Path::Swap,
+                None,
+                &serde_json::json!({}),
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::HttpError(None, _))));
+        assert_eq!(post_urls.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retriable_request_does_not_replay_without_nut19_cache_support() {
+        let transport = MockTransport {
+            post_response: Arc::new(Mutex::new(Some(
+                serde_json::json!({ "ok": true }).to_string(),
+            ))),
+            post_errors: Arc::new(Mutex::new(VecDeque::from([HttpError::Connection(
+                "connection reset".to_string(),
+            )]))),
+            ..Default::default()
+        };
+        let post_urls = transport.post_urls.clone();
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+
+        let result: Result<serde_json::Value, Error> = client
+            .retriable_http_request(
+                nut19::Method::Post,
+                nut19::Path::Swap,
+                None,
+                &serde_json::json!({}),
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::HttpError(None, _))));
+        assert_eq!(post_urls.lock().expect("lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_custom_method_is_rejected_before_transport() {
+        let transport = MockTransport::default();
+        let get_urls = transport.get_urls.clone();
+        let post_urls = transport.post_urls.clone();
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+        let invalid_method = PaymentMethod::Custom("../../v1/swap".to_string());
+
+        let result = client
+            .post_mint_quote(MintQuoteRequest::Custom {
+                method: invalid_method.clone(),
+                request: MintQuoteCustomRequest {
+                    amount: Some(cdk_common::Amount::from(1000)),
+                    unit: cdk_common::CurrencyUnit::Sat,
+                    description: None,
+                    pubkey: None,
+                    extra: serde_json::Value::Null,
+                },
+            })
+            .await;
+        assert!(matches!(result, Err(Error::InvalidPaymentMethod)));
+
+        let result = client
+            .get_mint_quote_status(invalid_method.clone(), "test-quote-id")
+            .await;
+        assert!(matches!(result, Err(Error::InvalidPaymentMethod)));
+
+        let result = client
+            .post_mint(
+                &invalid_method,
+                MintRequest {
+                    quote: "test-quote-id".to_string(),
+                    outputs: Vec::new(),
+                    signature: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidPaymentMethod)));
+
+        let result = client
+            .post_batch_check_mint_quote_status(
+                &invalid_method,
+                BatchCheckMintQuoteRequest {
+                    quotes: vec!["test-quote-id".to_string()],
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidPaymentMethod)));
+
+        let result = client
+            .post_batch_mint(
+                &invalid_method,
+                BatchMintRequest {
+                    quotes: vec!["test-quote-id".to_string()],
+                    quote_amounts: None,
+                    outputs: Vec::new(),
+                    signatures: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidPaymentMethod)));
+
+        let result = client
+            .post_melt_quote(MeltQuoteRequest::Custom(MeltQuoteCustomRequest {
+                method: "../../v1/swap".to_string(),
+                request: "custom-payment-request".to_string(),
+                unit: cdk_common::CurrencyUnit::Sat,
+                amount: None,
+                extra: serde_json::Value::Null,
+            }))
+            .await;
+        assert!(matches!(result, Err(Error::InvalidPaymentMethod)));
+
+        let result = client
+            .get_melt_quote_status(invalid_method.clone(), "test-quote-id")
+            .await;
+        assert!(matches!(result, Err(Error::InvalidPaymentMethod)));
+
+        let result = client
+            .post_melt(
+                &invalid_method,
+                MeltRequest::new("test-quote-id".to_string(), Vec::new(), None),
+            )
+            .await;
+        assert!(matches!(result, Err(Error::InvalidPaymentMethod)));
+
+        assert!(
+            get_urls.lock().expect("lock").is_empty(),
+            "invalid custom method must be rejected before GET transport"
+        );
+        assert!(
+            post_urls.lock().expect("lock").is_empty(),
+            "invalid custom method must be rejected before POST transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_mint_quote_custom_derives_state_from_amounts() {
+        let canned_json = serde_json::json!({
+            "quote": "test-quote-id",
+            "request": "paypal://pay?id=123",
+            "amount": 1000,
+            "amount_paid": 1000,
+            "amount_issued": 0,
+            "unit": "sat"
+        })
+        .to_string();
+
+        let transport = MockTransport {
+            get_response: Arc::new(Mutex::new(Some(canned_json))),
+            ..Default::default()
+        };
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+
+        let response = client
+            .get_mint_quote_status(PaymentMethod::Custom("paypal".to_string()), "test-quote-id")
+            .await
+            .expect("custom quote status");
+
+        assert_eq!(response.state(), Some(MintQuoteState::Paid));
+        match response {
+            MintQuoteResponse::Custom { method, response } => {
+                assert_eq!(method, PaymentMethod::Custom("paypal".to_string()));
+                assert_eq!(response.method, PaymentMethod::Custom("paypal".to_string()));
+                assert_eq!(response.amount_paid, cdk_common::Amount::from(1000));
+                assert_eq!(response.amount_issued, cdk_common::Amount::ZERO);
+            }
+            _ => panic!("expected custom response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_check_mint_quote_custom_parses_custom_responses() {
+        let canned_json = serde_json::json!([
+            {
+                "quote": "test-quote-id",
+                "request": "paypal://pay?id=123",
+                "amount": 1000,
+                "amount_paid": 1000,
+                "amount_issued": 1000,
+                "unit": "sat"
+            }
+        ])
+        .to_string();
+
+        let transport = MockTransport {
+            post_response: Arc::new(Mutex::new(Some(canned_json))),
+            ..Default::default()
+        };
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+
+        let responses = client
+            .post_batch_check_mint_quote_status(
+                &PaymentMethod::Custom("paypal".to_string()),
+                BatchCheckMintQuoteRequest {
+                    quotes: vec!["test-quote-id".to_string()],
+                },
+            )
+            .await
+            .expect("custom batch quote status");
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].state(), Some(MintQuoteState::Issued));
+        match &responses[0] {
+            MintQuoteResponse::Custom { method, response } => {
+                assert_eq!(method, &PaymentMethod::Custom("paypal".to_string()));
+                assert_eq!(response.method, PaymentMethod::Custom("paypal".to_string()));
+            }
+            _ => panic!("expected custom response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_post_melt_quote_custom_derives_missing_method_from_route() {
+        let canned_json = serde_json::json!({
+            "quote": "test-melt-quote-id",
+            "amount": 1000,
+            "fee_reserve": 10,
+            "state": "UNPAID",
+            "expiry": 9999999,
+            "request": "paypal://pay?id=123",
+            "unit": "sat"
+        })
+        .to_string();
+
+        let transport = MockTransport {
+            post_response: Arc::new(Mutex::new(Some(canned_json))),
+            ..Default::default()
+        };
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+
+        let response = client
+            .post_melt_quote(MeltQuoteRequest::Custom(MeltQuoteCustomRequest {
+                method: "paypal".to_string(),
+                request: "paypal://pay?id=123".to_string(),
+                unit: cdk_common::CurrencyUnit::Sat,
+                amount: None,
+                extra: serde_json::Value::Null,
+            }))
+            .await
+            .expect("custom melt quote");
+
+        match response {
+            MeltQuoteCreateResponse::Custom((method, response)) => {
+                assert_eq!(method, PaymentMethod::Custom("paypal".to_string()));
+                assert_eq!(response.method, PaymentMethod::Custom("paypal".to_string()));
+            }
+            _ => panic!("expected custom response"),
+        }
+    }
+
+    /// An LNURL service is not the mint the embedder chose to trust, and the
+    /// invoice it returns is what the wallet melts to. On an unverified
+    /// connection a MITM substitutes their own and is paid directly.
+    #[tokio::test]
+    async fn fetch_lnurl_pay_request_refuses_an_unverified_transport() {
+        let mut transport = MockTransport::default();
+        let get_urls = transport.get_urls.clone();
+        let proxy = Url::parse("http://127.0.0.1:9050").expect("parse proxy url");
+        transport
+            .with_proxy(proxy, None, true)
+            .expect("configure proxy");
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+
+        let error = client
+            .fetch_lnurl_pay_request("https://service.example.com/.well-known/lnurlp/alice")
+            .await
+            .expect_err("unverified connection should be refused");
+
+        assert!(
+            matches!(error, Error::UnverifiedTlsEndpoint { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            get_urls.lock().expect("lock").is_empty(),
+            "must be refused before the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_lnurl_invoice_refuses_an_unverified_transport() {
+        let mut transport = MockTransport::default();
+        let get_urls = transport.get_urls.clone();
+        let proxy = Url::parse("http://127.0.0.1:9050").expect("parse proxy url");
+        transport
+            .with_proxy(proxy, None, true)
+            .expect("configure proxy");
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+
+        let error = client
+            .fetch_lnurl_invoice("https://service.example.com/callback?amount=1000")
+            .await
+            .expect_err("unverified connection should be refused");
+
+        assert!(
+            matches!(error, Error::UnverifiedTlsEndpoint { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            get_urls.lock().expect("lock").is_empty(),
+            "must be refused before the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_lnurl_invoice_rejects_loopback_url_before_transport() {
+        let transport = MockTransport::default();
+        let get_urls = transport.get_urls.clone();
+        let mint_url = MintUrl::from_str("https://mint.example.com").expect("parse url");
+        let client = HttpClient::with_transport(mint_url, transport, None);
+
+        let result = client
+            .fetch_lnurl_invoice("http://127.0.0.1:8332/?amount=1000")
+            .await;
+
+        assert!(
+            result.is_err(),
+            "fetch_lnurl_invoice must reject loopback URLs to prevent SSRF"
+        );
+        assert!(
+            get_urls.lock().expect("lock").is_empty(),
+            "invalid LNURL callback must be rejected before transport"
+        );
     }
 }

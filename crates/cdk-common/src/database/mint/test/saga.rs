@@ -87,7 +87,12 @@ where
 
     let new_state = SagaStateEnum::Swap(SwapSagaState::Signed);
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    tx.update_saga(&operation_id, new_state.clone())
+    let mut saga = tx
+        .get_saga_for_update(&operation_id)
+        .await
+        .unwrap()
+        .expect("saga should exist");
+    tx.update_acquired_saga(&mut saga, new_state.clone())
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -100,7 +105,7 @@ where
 }
 
 /// Test updating saga state with persisted melt finalization data.
-pub async fn update_saga_with_finalization_data<DB>(db: DB)
+pub async fn update_acquired_saga_with_finalization_data<DB>(db: DB)
 where
     DB: Database<Error>,
 {
@@ -126,8 +131,13 @@ where
     tx.commit().await.unwrap();
 
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    tx.update_saga_with_finalization_data(
-        &operation_id,
+    let mut saga = tx
+        .get_saga_for_update(&operation_id)
+        .await
+        .unwrap()
+        .expect("saga should exist");
+    tx.update_acquired_saga_with_finalization_data(
+        &mut saga,
         SagaStateEnum::Melt(MeltSagaState::Finalizing),
         Some(&finalization_data),
     )
@@ -172,8 +182,13 @@ where
     tx.commit().await.unwrap();
 
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    tx.update_saga_with_finalization_data(
-        &operation_id,
+    let mut saga = tx
+        .get_saga_for_update(&operation_id)
+        .await
+        .unwrap()
+        .expect("saga should exist");
+    tx.update_acquired_saga_with_finalization_data(
+        &mut saga,
         SagaStateEnum::Melt(MeltSagaState::Finalizing),
         Some(&finalization_data),
     )
@@ -182,8 +197,13 @@ where
     tx.commit().await.unwrap();
 
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    tx.update_saga(
-        &operation_id,
+    let mut saga = tx
+        .get_saga_for_update(&operation_id)
+        .await
+        .unwrap()
+        .expect("saga should exist");
+    tx.update_acquired_saga(
+        &mut saga,
         SagaStateEnum::Melt(MeltSagaState::PaymentAttempted),
     )
     .await
@@ -294,7 +314,7 @@ pub async fn get_melt_saga_by_quote_id<DB>(db: DB)
 where
     DB: Database<Error>,
 {
-    let quote_id = crate::QuoteId::new_uuid();
+    let quote_id = crate::QuoteId::new();
     let saga = Saga {
         operation_id: uuid::Uuid::new_v4(),
         operation_kind: OperationKind::Melt,
@@ -321,7 +341,7 @@ pub async fn get_melt_saga_by_quote_id_filters_non_melt<DB>(db: DB)
 where
     DB: Database<Error>,
 {
-    let quote_id = crate::QuoteId::new_uuid();
+    let quote_id = crate::QuoteId::new();
     let swap_saga = Saga {
         operation_id: uuid::Uuid::new_v4(),
         operation_kind: OperationKind::Swap,
@@ -420,15 +440,15 @@ where
     tx.commit().await.unwrap();
 }
 
-/// Test updating non-existent saga fails gracefully
-pub async fn update_nonexistent_saga<DB>(db: DB)
+/// Test acquiring a non-existent saga returns `None`.
+pub async fn get_saga_for_update_nonexistent<DB>(db: DB)
 where
     DB: Database<Error>,
 {
     let operation_id = uuid::Uuid::new_v4();
 
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    let saga = tx.get_saga(&operation_id).await.unwrap();
+    let saga = tx.get_saga_for_update(&operation_id).await.unwrap();
     assert!(saga.is_none(), "Non-existent saga should return None");
     tx.commit().await.unwrap();
 }

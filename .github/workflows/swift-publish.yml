@@ -1,0 +1,526 @@
+name: "FFI - Swift Bindings"
+
+permissions:
+  contents: read
+  actions: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to create for release (e.g. v0.17.0)"
+        required: true
+      cdk_ref:
+        description: 'CDK git ref to publish from. Must match release_tag unless this is a nightly.'
+        required: false
+      prerelease:
+        description: 'Mark the GitHub release as a pre-release'
+        type: boolean
+        default: false
+      nightly:
+        description: 'Build an immutable nightly prerelease from an exact CDK commit.'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: true
+      cdk_ref:
+        type: string
+        required: false
+      prerelease:
+        type: boolean
+        required: false
+        default: false
+      nightly:
+        type: boolean
+        required: false
+        default: false
+env:
+  CARGO_TERM_COLOR: ${{ vars.CARGO_TERM_COLOR }}
+  TAG: ${{ inputs.release_tag }}
+  CDK_REF: ${{ inputs.cdk_ref || inputs.release_tag }}
+  CDK_CHECKOUT_REF: ${{ inputs.nightly && inputs.cdk_ref || format('refs/tags/{0}', inputs.release_tag) }}
+  RELEASE_BRANCH: release/${{ inputs.release_tag }}
+
+jobs:
+  release-ci:
+    uses: ./.github/workflows/release-ci.yml
+    with:
+      ref: ${{ inputs.nightly && inputs.cdk_ref || inputs.release_tag }}
+
+  validate-release-ref:
+    needs: release-ci
+    name: "swift: Validate release ref"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release ref
+        shell: bash
+        run: |
+          if [[ "${{ inputs.nightly }}" == "true" ]]; then
+            if [[ "${{ inputs.prerelease }}" != "true" ]]; then
+              echo "::error::Nightly releases must be marked as prereleases"
+              exit 1
+            fi
+
+            if [[ ! "${CDK_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Nightly cdk_ref must be an exact 40-character commit SHA; got ${CDK_REF}"
+              exit 1
+            fi
+
+            if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+-nightly[.][0-9]{8}[.]g[0-9a-f]{7}$ ]]; then
+              echo "::error::Nightly release_tag must look like v0.18.0-nightly.20260801.g1a2b3c4; got ${TAG}"
+              exit 1
+            fi
+          elif [[ "${CDK_REF}" != "${TAG}" ]]; then
+            echo "::error::cdk_ref must match release_tag (${TAG}); got ${CDK_REF}"
+            exit 1
+          fi
+
+          if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release_tag must be a version tag such as v0.17.0; got ${TAG}"
+            exit 1
+          fi
+
+      - name: Verify release source exists
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          fetch-depth: 1
+          persist-credentials: false
+
+  swift-sync-sources:
+    name: "swift: Sync sources to cdk-swift"
+    needs: [validate-release-ref]
+    runs-on: ubuntu-latest
+    steps:
+      # Fail here rather than deep in the assemble job, which derives the same
+      # value again to stamp the frameworks.
+      - name: Validate the framework bundle version
+        run: |
+          BUNDLE_SHORT_VERSION="${TAG#v}"
+          BUNDLE_SHORT_VERSION="${BUNDLE_SHORT_VERSION%%[-+]*}"
+
+          if [[ ! "${BUNDLE_SHORT_VERSION}" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "::error::Could not derive App Store-safe CFBundleShortVersionString from ${TAG}; got ${BUNDLE_SHORT_VERSION}"
+            exit 1
+          fi
+
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - name: Clone cdk-swift
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" \
+            clone https://github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
+
+      - name: Copy bindings/swift to cdk-swift
+        run: |
+          rsync -av --delete \
+            --exclude='.github' \
+            --exclude='target' \
+            --exclude='.git' \
+            --exclude='build' \
+            --exclude='rust' \
+            --exclude='resources' \
+            bindings/swift/ cdk-swift/
+
+          # The binding repo carries artifacts only. Nothing there is built, so
+          # the Rust crate, its toolchain pin and the Info.plist templates the
+          # assemble job stamps are removed rather than synced. rsync --delete
+          # protects excluded paths in the destination, hence the explicit rm.
+          rm -rf cdk-swift/rust cdk-swift/rust-toolchain.toml cdk-swift/resources
+
+      - name: Push to cdk-swift release branch
+        working-directory: cdk-swift
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git show-ref --verify --quiet "refs/remotes/origin/${RELEASE_BRANCH}"; then
+            git checkout -B "${RELEASE_BRANCH}" "origin/${RELEASE_BRANCH}"
+          else
+            git checkout -b "${RELEASE_BRANCH}"
+          fi
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "sync: update sources for ${TAG}"
+          git -c "http.extraheader=$(auth_header)" push origin "${RELEASE_BRANCH}"
+
+  swift-build-native:
+    name: "swift: Build ${{ matrix.target }}"
+    needs: [validate-release-ref]
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-ios
+            artifact: libcdk_ffi_swift.a
+            unset_macos_env: true
+          - target: aarch64-apple-ios-sim
+            artifact: libcdk_ffi_swift.a
+            unset_macos_env: true
+          - target: x86_64-apple-ios
+            artifact: libcdk_ffi_swift.a
+            unset_macos_env: true
+          - target: aarch64-apple-darwin
+            artifact: libcdk_ffi_swift.dylib
+            unset_macos_env: false
+          - target: x86_64-apple-darwin
+            artifact: libcdk_ffi_swift.dylib
+            unset_macos_env: false
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          export DEVELOPER_DIR=$(/usr/bin/xcrun xcode-select -p)
+          if [[ "${{ matrix.unset_macos_env }}" == "true" ]]; then
+            env -u MACOSX_DEPLOYMENT_TARGET -u SDKROOT \
+              cargo build --locked --profile release-ffi -p cdk-ffi-swift \
+                --target ${{ matrix.target }}
+          else
+            cargo build --locked --profile release-ffi -p cdk-ffi-swift \
+              --target ${{ matrix.target }}
+          fi
+
+      - name: Fix dylib install name
+        if: endsWith(matrix.artifact, '.dylib')
+        run: |
+          install_name_tool -id @rpath/CashuDevKitFFI.framework/Versions/A/CashuDevKitFFI \
+            target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}
+
+      - name: Strip debug symbols
+        run: strip -S target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }} \
+             dist/${{ matrix.target }}-${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-native-${{ matrix.target }}
+          path: dist/
+
+  swift-assemble-xcframework:
+    name: "swift: Assemble XCFramework"
+    needs: [swift-build-native]
+    runs-on: macos-14
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Stamp framework Info.plist versions
+        run: |
+          RELEASE_VER="${TAG#v}"
+          BUNDLE_SHORT_VERSION="${RELEASE_VER%%[-+]*}"
+
+          if [[ ! "${BUNDLE_SHORT_VERSION}" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "::error::Could not derive App Store-safe CFBundleShortVersionString from ${TAG}; got ${BUNDLE_SHORT_VERSION}"
+            exit 1
+          fi
+
+          sed -i '' -e "s|__CDK_SWIFT_FRAMEWORK_VERSION__|${BUNDLE_SHORT_VERSION}|g" \
+            bindings/swift/resources/Info-iOS.plist \
+            bindings/swift/resources/Info-iOSSimulator.plist \
+            bindings/swift/resources/Info-macOS.plist
+
+          # An unstamped plist produces a framework that builds and only fails
+          # at App Store submission, so fail loudly here instead.
+          if grep -l __CDK_SWIFT_FRAMEWORK_VERSION__ bindings/swift/resources/Info-*.plist; then
+            echo "::error::Info.plist still contains the version placeholder"
+            exit 1
+          fi
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts
+          pattern: swift-native-*
+          merge-multiple: true
+
+      - name: Create universal binaries
+        run: |
+          # iOS simulator universal binary (arm64 + x86_64)
+          mkdir -p build/ios-simulator
+          lipo -create \
+            artifacts/aarch64-apple-ios-sim-libcdk_ffi_swift.a \
+            artifacts/x86_64-apple-ios-libcdk_ffi_swift.a \
+            -output build/ios-simulator/libcdk_ffi_swift.a
+
+          # macOS universal binary (arm64 + x86_64)
+          mkdir -p build/macos
+          lipo -create \
+            artifacts/aarch64-apple-darwin-libcdk_ffi_swift.dylib \
+            artifacts/x86_64-apple-darwin-libcdk_ffi_swift.dylib \
+            -output build/macos/libcdk_ffi_swift.dylib
+
+      - name: Create framework structures
+        run: |
+          # iOS device framework
+          IOS_FW="build/ios-device/CashuDevKitFFI.framework"
+          mkdir -p "$IOS_FW"
+          cp artifacts/aarch64-apple-ios-libcdk_ffi_swift.a "$IOS_FW/CashuDevKitFFI"
+          cp bindings/swift/resources/Info-iOS.plist "$IOS_FW/Info.plist"
+
+          # iOS simulator framework
+          SIM_FW="build/ios-simulator-framework/CashuDevKitFFI.framework"
+          mkdir -p "$SIM_FW"
+          cp build/ios-simulator/libcdk_ffi_swift.a "$SIM_FW/CashuDevKitFFI"
+          cp bindings/swift/resources/Info-iOSSimulator.plist "$SIM_FW/Info.plist"
+
+          # macOS framework (versioned bundle layout)
+          MAC_FW="build/macos-framework/CashuDevKitFFI.framework"
+          mkdir -p "$MAC_FW/Versions/A/Resources"
+          cp build/macos/libcdk_ffi_swift.dylib "$MAC_FW/Versions/A/CashuDevKitFFI"
+          cp bindings/swift/resources/Info-macOS.plist "$MAC_FW/Versions/A/Resources/Info.plist"
+
+          # Create symlinks for versioned framework structure
+          ln -s A "$MAC_FW/Versions/Current"
+          ln -s Versions/Current/CashuDevKitFFI "$MAC_FW/CashuDevKitFFI"
+          ln -s Versions/Current/Headers "$MAC_FW/Headers"
+          ln -s Versions/Current/Modules "$MAC_FW/Modules"
+          ln -s Versions/Current/Resources "$MAC_FW/Resources"
+
+      - name: Generate Swift bindings
+        run: |
+          # Build uniffi-bindgen-swift binary. This is a host dev tool, so it
+          # stays on the plain release profile rather than release-ffi.
+          cargo build --locked --release -p cdk-ffi-swift --bin uniffi-bindgen-swift
+
+          BINDGEN="./target/release/uniffi-bindgen-swift"
+
+          # Generate headers and modulemaps for iOS device
+          IOS_FW="build/ios-device/CashuDevKitFFI.framework"
+          $BINDGEN artifacts/aarch64-apple-ios-libcdk_ffi_swift.a \
+            "$IOS_FW/Headers" --headers
+          $BINDGEN artifacts/aarch64-apple-ios-libcdk_ffi_swift.a \
+            "$IOS_FW/Modules" --xcframework --modulemap \
+            --module-name CashuDevKitFFI --modulemap-filename module.modulemap
+
+          # Generate headers and modulemaps for iOS simulator
+          SIM_FW="build/ios-simulator-framework/CashuDevKitFFI.framework"
+          $BINDGEN artifacts/aarch64-apple-ios-sim-libcdk_ffi_swift.a \
+            "$SIM_FW/Headers" --headers
+          $BINDGEN artifacts/aarch64-apple-ios-sim-libcdk_ffi_swift.a \
+            "$SIM_FW/Modules" --xcframework --modulemap \
+            --module-name CashuDevKitFFI --modulemap-filename module.modulemap
+
+          # Generate headers and modulemaps for macOS
+          MAC_FW="build/macos-framework/CashuDevKitFFI.framework"
+          $BINDGEN artifacts/aarch64-apple-darwin-libcdk_ffi_swift.dylib \
+            "$MAC_FW/Versions/A/Headers" --headers
+          $BINDGEN artifacts/aarch64-apple-darwin-libcdk_ffi_swift.dylib \
+            "$MAC_FW/Versions/A/Modules" --xcframework --modulemap \
+            --module-name CashuDevKitFFI --modulemap-filename module.modulemap
+
+          # Generate Swift source files
+          SOURCES_DIR="build/Sources/Cdk"
+          mkdir -p "$SOURCES_DIR"
+          $BINDGEN artifacts/aarch64-apple-darwin-libcdk_ffi_swift.dylib \
+            "$SOURCES_DIR" --swift-sources
+
+          # Fix FFI module import to match the XCFramework module name
+          sed -i '' 's/canImport(cdk_ffiFFI)/canImport(CashuDevKitFFI)/g' "$SOURCES_DIR"/*.swift
+          sed -i '' 's/import cdk_ffiFFI/import CashuDevKitFFI/g' "$SOURCES_DIR"/*.swift
+
+      - name: Re-sign macOS framework
+        run: codesign --force --sign - build/macos-framework/CashuDevKitFFI.framework
+
+      - name: Create XCFramework
+        run: |
+          xcodebuild -create-xcframework \
+            -framework build/ios-device/CashuDevKitFFI.framework \
+            -framework build/ios-simulator-framework/CashuDevKitFFI.framework \
+            -framework build/macos-framework/CashuDevKitFFI.framework \
+            -output build/xcframework/CashuDevKitFFI.xcframework
+
+      - name: Create distribution archive
+        working-directory: build/xcframework
+        run: |
+          zip -r CashuDevKitFFI.xcframework.zip CashuDevKitFFI.xcframework
+          # Logged for verifying a downloaded asset by hand. SPM no longer needs
+          # it: the archive is committed and resolved as a local binary target.
+          echo "XCFramework sha256: $(shasum -a 256 CashuDevKitFFI.xcframework.zip | cut -d' ' -f1)"
+
+      - name: Upload XCFramework artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-xcframework
+          path: build/xcframework/CashuDevKitFFI.xcframework.zip
+
+      - name: Upload Swift sources artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-sources-generated
+          path: build/Sources/Cdk/
+
+  swift-publish:
+    name: "swift: Publish to cdk-swift"
+    runs-on: ubuntu-latest
+    needs: [swift-sync-sources, swift-assemble-xcframework]
+    steps:
+      - name: Clone cdk-swift
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" \
+            clone --branch "${RELEASE_BRANCH}" \
+            https://github.com/${{ vars.CDK_SWIFT_REPO }}.git cdk-swift
+
+      - name: Download XCFramework
+        uses: actions/download-artifact@v8
+        with:
+          name: swift-xcframework
+          path: ./artifacts
+
+      - name: Download generated Swift sources
+        uses: actions/download-artifact@v8
+        with:
+          name: swift-sources-generated
+          path: cdk-swift/Sources/Cdk
+
+      - name: Stage the XCFramework in cdk-swift
+        run: cp artifacts/CashuDevKitFFI.xcframework.zip cdk-swift/
+
+      - name: Generate Package.swift
+        run: |
+          cat > cdk-swift/Package.swift << EOF
+          // swift-tools-version: 5.9
+          import PackageDescription
+
+          let package = Package(
+              name: "cdk-swift",
+              platforms: [.iOS(.v14), .macOS(.v13)],
+              products: [
+                  .library(name: "Cdk", targets: ["Cdk"]),
+              ],
+              targets: [
+                  .binaryTarget(
+                      name: "CashuDevKitFFI",
+                      path: "CashuDevKitFFI.xcframework.zip"
+                  ),
+                  .target(
+                      name: "Cdk",
+                      dependencies: ["CashuDevKitFFI"],
+                      path: "Sources/Cdk"
+                  ),
+              ]
+          )
+          EOF
+
+      - name: Commit to release branch
+        working-directory: cdk-swift
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "release: ${TAG} - add Swift sources, the XCFramework and Package.swift"
+
+      - name: Push release branch
+        working-directory: cdk-swift
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" push origin "${RELEASE_BRANCH}"
+
+      - name: Create release on cdk-swift (creates tag and uploads asset atomically)
+        working-directory: cdk-swift
+        env:
+          GH_TOKEN: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          COMMIT_SHA=$(git rev-parse HEAD)
+          RELEASE_OPTIONS=(--generate-notes)
+          if [[ "${{ inputs.nightly }}" == "true" ]]; then
+            RELEASE_OPTIONS+=(
+              --prerelease
+              --latest=false
+              --notes "Nightly bindings built from CDK commit ${CDK_REF}: https://github.com/${GITHUB_REPOSITORY}/commit/${CDK_REF}"
+            )
+          elif [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            RELEASE_OPTIONS+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            --repo ${{ vars.CDK_SWIFT_REPO }} \
+            --target "${COMMIT_SHA}" \
+            --title "Release ${TAG}" \
+            "${RELEASE_OPTIONS[@]}" \
+            ../artifacts/CashuDevKitFFI.xcframework.zip
+
+      - name: Merge to default branch
+        if: ${{ !inputs.nightly }}
+        working-directory: cdk-swift
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+          echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}" >> "$GITHUB_ENV"
+          git checkout "${DEFAULT_BRANCH}"
+          git merge "${RELEASE_BRANCH}" --squash
+          git commit -m "release: ${TAG}"
+          git -c "http.extraheader=$(auth_header)" push origin "${DEFAULT_BRANCH}"
+
+      - name: Clean up release branch
+        working-directory: cdk-swift
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" push origin --delete "${RELEASE_BRANCH}"

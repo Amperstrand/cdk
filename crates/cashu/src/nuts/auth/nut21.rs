@@ -19,7 +19,6 @@ pub enum Error {
 
 /// Clear Auth Settings
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct Settings {
     /// Openid discovery
     pub openid_discovery: String,
@@ -42,6 +41,18 @@ impl Settings {
             protected_endpoints,
         }
     }
+}
+
+fn is_disallowed_path_character(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 // Custom deserializer for Settings to expand patterns in protected endpoints
@@ -71,6 +82,12 @@ impl<'de> Deserialize<'de> for Settings {
         let mut protected_endpoints = HashSet::new();
 
         for raw_endpoint in raw.protected_endpoints {
+            if raw_endpoint.path.chars().any(is_disallowed_path_character) {
+                return Err(serde::de::Error::custom(
+                    "Invalid protected endpoint path: control and bidirectional formatting characters are not allowed",
+                ));
+            }
+
             let expanded_paths = matching_route_paths(&raw_endpoint.path).map_err(|e| {
                 serde::de::Error::custom(format!("Invalid pattern '{}': {}", raw_endpoint.path, e))
             })?;
@@ -91,7 +108,6 @@ impl<'de> Deserialize<'de> for Settings {
 
 /// List of the methods and paths that are protected
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct ProtectedEndpoint {
     /// HTTP Method
     pub method: Method,
@@ -104,12 +120,20 @@ impl ProtectedEndpoint {
     pub fn new(method: Method, path: RoutePath) -> Self {
         Self { method, path }
     }
+
+    /// Returns how specifically this protected endpoint matches a request endpoint.
+    pub fn match_specificity(&self, endpoint: &Self) -> Option<usize> {
+        if self.method != endpoint.method {
+            return None;
+        }
+
+        self.path.match_specificity(&endpoint.path)
+    }
 }
 
 /// HTTP method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub enum Method {
     /// Get
     Get,
@@ -119,8 +143,9 @@ pub enum Method {
 
 /// Route path
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub enum RoutePath {
+    /// Wildcard route path prefix
+    Wildcard(String),
     /// Mint Quote for a specific payment method
     MintQuote(String),
     /// Mint for a specific payment method
@@ -154,6 +179,10 @@ impl std::str::FromStr for RoutePath {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(prefix) = s.strip_suffix('*') {
+            return Self::wildcard(prefix.to_string());
+        }
+
         // Try to parse as a known static path first
         match s {
             "/v1/swap" => Ok(RoutePath::Swap),
@@ -164,13 +193,13 @@ impl std::str::FromStr for RoutePath {
             _ => {
                 // Try to parse as a payment method route
                 if let Some(method) = s.strip_prefix("/v1/mint/quote/") {
-                    Ok(RoutePath::MintQuote(method.to_string()))
+                    Ok(RoutePath::MintQuote(normalize_payment_method(method)))
                 } else if let Some(method) = s.strip_prefix("/v1/mint/") {
-                    Ok(RoutePath::Mint(method.to_string()))
+                    Ok(RoutePath::Mint(normalize_payment_method(method)))
                 } else if let Some(method) = s.strip_prefix("/v1/melt/quote/") {
-                    Ok(RoutePath::MeltQuote(method.to_string()))
+                    Ok(RoutePath::MeltQuote(normalize_payment_method(method)))
                 } else if let Some(method) = s.strip_prefix("/v1/melt/") {
-                    Ok(RoutePath::Melt(method.to_string()))
+                    Ok(RoutePath::Melt(normalize_payment_method(method)))
                 } else {
                     // Unknown path - this might be an old database value or config
                     // Provide a helpful error message
@@ -192,6 +221,64 @@ impl<'de> Deserialize<'de> for RoutePath {
 }
 
 impl RoutePath {
+    /// Create a wildcard route path.
+    pub fn wildcard(prefix: String) -> Result<Self, Error> {
+        if prefix.contains('*') {
+            return Err(Error::InvalidPattern(
+                "Wildcard '*' must be the last character".to_string(),
+            ));
+        }
+
+        Ok(Self::Wildcard(prefix))
+    }
+
+    /// Returns true if this route path is a wildcard pattern.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self, Self::Wildcard(_))
+    }
+
+    /// Returns how specifically this route matches an endpoint.
+    ///
+    /// Exact routes are always preferred over wildcard routes. Wildcard routes
+    /// are ranked by prefix length so `/v1/mint/quote/*` wins over `/v1/*`.
+    pub fn match_specificity(&self, endpoint: &Self) -> Option<usize> {
+        match self {
+            Self::Wildcard(prefix) if endpoint.to_string().starts_with(prefix) => {
+                Some(prefix.len())
+            }
+            Self::MintQuote(method) => match endpoint {
+                Self::MintQuote(endpoint_method)
+                    if payment_methods_match(method, endpoint_method) =>
+                {
+                    Some(usize::MAX)
+                }
+                _ => None,
+            },
+            Self::Mint(method) => match endpoint {
+                Self::Mint(endpoint_method) if payment_methods_match(method, endpoint_method) => {
+                    Some(usize::MAX)
+                }
+                _ => None,
+            },
+            Self::MeltQuote(method) => match endpoint {
+                Self::MeltQuote(endpoint_method)
+                    if payment_methods_match(method, endpoint_method) =>
+                {
+                    Some(usize::MAX)
+                }
+                _ => None,
+            },
+            Self::Melt(method) => match endpoint {
+                Self::Melt(endpoint_method) if payment_methods_match(method, endpoint_method) => {
+                    Some(usize::MAX)
+                }
+                _ => None,
+            },
+            _ if self == endpoint => Some(usize::MAX),
+            _ => None,
+        }
+    }
+
     /// Get all non-payment-method route paths
     /// These are routes that don't depend on payment methods
     pub fn static_paths() -> Vec<RoutePath> {
@@ -228,23 +315,29 @@ impl RoutePath {
     }
 }
 
+fn normalize_payment_method(method: &str) -> String {
+    method.to_lowercase()
+}
+
+fn payment_methods_match(configured: &str, endpoint: &str) -> bool {
+    configured.to_lowercase() == endpoint.to_lowercase()
+}
+
 /// Returns [`RoutePath`]s that match the pattern (Exact or Prefix)
 pub fn matching_route_paths(pattern: &str) -> Result<Vec<RoutePath>, Error> {
     // Check for wildcard
     if let Some(prefix) = pattern.strip_suffix('*') {
-        // Prefix matching
-        // Ensure '*' is only at the end
-        if prefix.contains('*') {
-            return Err(Error::InvalidPattern(
-                "Wildcard '*' must be the last character".to_string(),
-            ));
-        }
+        let wildcard = RoutePath::wildcard(prefix.to_string())?;
 
         // Filter all known paths
-        Ok(RoutePath::all_known_paths()
+        let mut paths: Vec<RoutePath> = RoutePath::all_known_paths()
             .into_iter()
             .filter(|path| path.to_string().starts_with(prefix))
-            .collect())
+            .collect();
+
+        paths.push(wildcard);
+
+        Ok(paths)
     } else {
         // Exact matching
         if pattern.contains('*') {
@@ -255,13 +348,14 @@ pub fn matching_route_paths(pattern: &str) -> Result<Vec<RoutePath>, Error> {
 
         match RoutePath::from_str(pattern) {
             Ok(path) => Ok(vec![path]),
-            Err(_) => Ok(vec![]), // Ignore unknown paths for matching
+            Err(e) => Err(e),
         }
     }
 }
 impl std::fmt::Display for RoutePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RoutePath::Wildcard(prefix) => write!(f, "{}*", prefix),
             RoutePath::MintQuote(method) => write!(f, "/v1/mint/quote/{}", method),
             RoutePath::Mint(method) => write!(f, "/v1/mint/{}", method),
             RoutePath::MeltQuote(method) => write!(f, "/v1/melt/quote/{}", method),
@@ -287,8 +381,9 @@ mod tests {
         // Pattern that matches everything
         let paths = matching_route_paths("*").unwrap();
 
-        // Should match all known variants
-        assert_eq!(paths.len(), RoutePath::all_known_paths().len());
+        // Should match all known variants plus the wildcard policy.
+        assert_eq!(paths.len(), RoutePath::all_known_paths().len() + 1);
+        assert!(paths.contains(&RoutePath::Wildcard(String::new())));
     }
 
     #[test]
@@ -304,8 +399,9 @@ mod tests {
         // "/v1/mint*" matches "/v1/mint" and "/v1/mint/..."
         let paths = matching_route_paths("/v1/mint*").unwrap();
 
-        // Should match all mint paths + mint quote paths
-        assert_eq!(paths.len(), 4);
+        // Should match all mint paths + mint quote paths plus the wildcard policy.
+        assert_eq!(paths.len(), 5);
+        assert!(paths.contains(&RoutePath::Wildcard("/v1/mint".to_string())));
 
         // Should NOT match /v1/melt...
         assert!(!paths.contains(&RoutePath::MeltQuote(
@@ -315,9 +411,11 @@ mod tests {
 
     #[test]
     fn test_matching_route_paths_exact_match_unknown() {
-        // Exact match for unknown path structure should return empty list
-        let paths = matching_route_paths("/v1/invalid/path").unwrap();
-        assert!(paths.is_empty());
+        let result = matching_route_paths("/v1/invalid/path");
+        assert!(matches!(
+            result,
+            Err(Error::UnknownRoute(route)) if route == "/v1/invalid/path"
+        ));
     }
 
     #[test]
@@ -333,8 +431,9 @@ mod tests {
         // Prefix that matches all paths
         let paths = matching_route_paths("/v1/*").unwrap();
 
-        // Should match all known variants
-        assert_eq!(paths.len(), RoutePath::all_known_paths().len());
+        // Should match all known variants plus the wildcard policy.
+        assert_eq!(paths.len(), RoutePath::all_known_paths().len() + 1);
+        assert!(paths.contains(&RoutePath::Wildcard("/v1/".to_string())));
 
         // Verify all variants are included
         assert!(paths.contains(&RoutePath::MintQuote(
@@ -366,8 +465,9 @@ mod tests {
         // Regex that matches only mint paths
         let paths = matching_route_paths("/v1/mint/*").unwrap();
 
-        // Should match only mint paths (4 paths: mint quote and mint for bolt11 and bolt12)
-        assert_eq!(paths.len(), 4);
+        // Should match mint paths plus the wildcard policy.
+        assert_eq!(paths.len(), 5);
+        assert!(paths.contains(&RoutePath::Wildcard("/v1/mint/".to_string())));
         assert!(paths.contains(&RoutePath::MintQuote(
             PaymentMethod::Known(KnownMethod::Bolt11).to_string()
         )));
@@ -402,8 +502,9 @@ mod tests {
         // Regex that matches only quote paths
         let paths = matching_route_paths("/v1/mint/quote/*").unwrap();
 
-        // Should match only quote paths (2 paths: mint quote for bolt11 and bolt12)
-        assert_eq!(paths.len(), 2);
+        // Should match quote paths plus the wildcard policy.
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&RoutePath::Wildcard("/v1/mint/quote/".to_string())));
         assert!(paths.contains(&RoutePath::MintQuote(
             PaymentMethod::Known(KnownMethod::Bolt11).to_string()
         )));
@@ -422,11 +523,11 @@ mod tests {
 
     #[test]
     fn test_matching_route_paths_no_match() {
-        // Regex that matches nothing
-        let paths = matching_route_paths("/nonexistent/path").unwrap();
-
-        // Should match nothing
-        assert!(paths.is_empty());
+        let result = matching_route_paths("/nonexistent/path");
+        assert!(matches!(
+            result,
+            Err(Error::UnknownRoute(route)) if route == "/nonexistent/path"
+        ));
     }
 
     #[test]
@@ -455,6 +556,10 @@ mod tests {
     fn test_route_path_to_string() {
         // Test that to_string() returns the correct path strings
         assert_eq!(
+            RoutePath::Wildcard("/v1/mint/".to_string()).to_string(),
+            "/v1/mint/*"
+        );
+        assert_eq!(
             RoutePath::MintQuote(PaymentMethod::Known(KnownMethod::Bolt11).to_string()).to_string(),
             "/v1/mint/quote/bolt11"
         );
@@ -481,6 +586,119 @@ mod tests {
     }
 
     #[test]
+    fn test_route_path_is_wildcard() {
+        assert!(RoutePath::Wildcard("/v1/mint/".to_string()).is_wildcard());
+        assert!(!RoutePath::MintQuote("bolt11".to_string()).is_wildcard());
+        assert!(!RoutePath::Swap.is_wildcard());
+    }
+
+    #[test]
+    fn test_protected_endpoint_match_specificity() {
+        let request = ProtectedEndpoint::new(
+            Method::Post,
+            RoutePath::MintQuote(PaymentMethod::Known(KnownMethod::Bolt11).to_string()),
+        );
+        let exact = ProtectedEndpoint::new(
+            Method::Post,
+            RoutePath::MintQuote(PaymentMethod::Known(KnownMethod::Bolt11).to_string()),
+        );
+        let wildcard =
+            ProtectedEndpoint::new(Method::Post, RoutePath::Wildcard("/v1/mint/".to_string()));
+        let different_method = ProtectedEndpoint::new(
+            Method::Get,
+            RoutePath::MintQuote(PaymentMethod::Known(KnownMethod::Bolt11).to_string()),
+        );
+        let non_matching_path = ProtectedEndpoint::new(Method::Post, RoutePath::Swap);
+
+        assert_eq!(exact.match_specificity(&request), Some(usize::MAX));
+        assert_eq!(
+            wildcard.match_specificity(&request),
+            Some("/v1/mint/".len())
+        );
+        assert_eq!(different_method.match_specificity(&request), None);
+        assert_eq!(non_matching_path.match_specificity(&request), None);
+    }
+
+    #[test]
+    fn test_route_path_specificity_rejects_nonmatching_wildcard_and_accepts_static_exact() {
+        assert_eq!(
+            RoutePath::Wildcard("/v1/mint/".to_string())
+                .match_specificity(&RoutePath::Melt("bolt11".to_string())),
+            None
+        );
+        assert_eq!(
+            RoutePath::Swap.match_specificity(&RoutePath::Swap),
+            Some(usize::MAX)
+        );
+    }
+
+    #[test]
+    fn test_payment_method_routes_match_case_insensitively() {
+        let cases = [
+            (
+                RoutePath::MintQuote("bolt11".to_string()),
+                RoutePath::MintQuote("BOLT11".to_string()),
+            ),
+            (
+                RoutePath::Mint("paypal".to_string()),
+                RoutePath::Mint("PayPal".to_string()),
+            ),
+            (
+                RoutePath::MeltQuote("bolt12".to_string()),
+                RoutePath::MeltQuote("BOLT12".to_string()),
+            ),
+            (
+                RoutePath::Melt("custom".to_string()),
+                RoutePath::Melt("CUSTOM".to_string()),
+            ),
+        ];
+
+        for (configured, request) in cases {
+            assert_eq!(configured.match_specificity(&request), Some(usize::MAX));
+        }
+    }
+
+    #[test]
+    fn test_payment_method_routes_reject_wrong_route_or_method() {
+        let cases = [
+            (
+                RoutePath::MintQuote("bolt11".to_string()),
+                RoutePath::MintQuote("bolt12".to_string()),
+            ),
+            (
+                RoutePath::Mint("bolt11".to_string()),
+                RoutePath::Mint("bolt12".to_string()),
+            ),
+            (
+                RoutePath::MeltQuote("bolt11".to_string()),
+                RoutePath::MeltQuote("bolt12".to_string()),
+            ),
+            (
+                RoutePath::Melt("bolt11".to_string()),
+                RoutePath::Melt("bolt12".to_string()),
+            ),
+            (
+                RoutePath::Mint("bolt11".to_string()),
+                RoutePath::Melt("bolt11".to_string()),
+            ),
+        ];
+
+        for (configured, request) in cases {
+            assert_eq!(configured.match_specificity(&request), None);
+        }
+    }
+
+    #[test]
+    fn test_protected_endpoint_matches_case_insensitive_payment_method() {
+        let configured =
+            ProtectedEndpoint::new(Method::Post, RoutePath::MintQuote("bolt11".to_string()));
+        let request =
+            ProtectedEndpoint::new(Method::Post, RoutePath::MintQuote("BOLT11".to_string()));
+
+        assert_eq!(configured.match_specificity(&request), Some(usize::MAX));
+    }
+
+    #[test]
     fn test_route_path_serialization() {
         // Test serialization of payment method paths
         let json = serde_json::to_string(&RoutePath::Mint(
@@ -498,6 +716,9 @@ mod tests {
             path,
             RoutePath::Mint(PaymentMethod::Known(KnownMethod::Bolt11).to_string())
         );
+
+        let path: RoutePath = serde_json::from_str("\"/v1/mint/quote/BOLT11\"").unwrap();
+        assert_eq!(path, RoutePath::MintQuote("bolt11".to_string()));
 
         let path: RoutePath = serde_json::from_str("\"/v1/melt/quote/venmo\"").unwrap();
         assert_eq!(path, RoutePath::MeltQuote("venmo".to_string()));
@@ -572,7 +793,7 @@ mod tests {
             "https://example.com/.well-known/openid-configuration"
         );
         assert_eq!(settings.client_id, "client123");
-        assert_eq!(settings.protected_endpoints.len(), 5); // 4 mint paths (bolt11+bolt12 quote+mint) + 1 swap path
+        assert_eq!(settings.protected_endpoints.len(), 6); // 4 mint paths + wildcard + 1 swap path
 
         let expected_protected: HashSet<ProtectedEndpoint> = HashSet::from_iter(vec![
             ProtectedEndpoint::new(Method::Post, RoutePath::Swap),
@@ -592,6 +813,7 @@ mod tests {
                 Method::Get,
                 RoutePath::Mint(PaymentMethod::Known(KnownMethod::Bolt12).to_string()),
             ),
+            ProtectedEndpoint::new(Method::Get, RoutePath::Wildcard("/v1/mint/".to_string())),
         ]);
 
         let deserlized_protected = settings.protected_endpoints.into_iter().collect();
@@ -608,6 +830,44 @@ mod tests {
                 {
                     "method": "GET",
                     "path": "/*wildcard_start"
+                }
+            ]
+        }"#;
+
+        let result = serde_json::from_str::<Settings>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_settings_deserialize_rejects_controls_with_safe_error() {
+        let path = "/invalid/\u{1b}]52;c;clipboard\u{07}\r\u{85}\u{202e}";
+        let value = serde_json::json!({
+            "openid_discovery": "https://example.com/.well-known/openid-configuration",
+            "client_id": "client123",
+            "protected_endpoints": [{
+                "method": "GET",
+                "path": path,
+            }],
+        });
+
+        let error = serde_json::from_value::<Settings>(value)
+            .expect_err("invalid path should fail")
+            .to_string();
+
+        assert!(!error.chars().any(is_disallowed_path_character));
+        assert!(error.contains("control and bidirectional formatting characters are not allowed"));
+        assert!(!error.contains("clipboard"));
+    }
+
+    #[test]
+    fn test_settings_deserialize_unknown_exact_path() {
+        let json = r#"{
+            "openid_discovery": "https://example.com/.well-known/openid-configuration",
+            "client_id": "client123",
+            "protected_endpoints": [
+                {
+                    "method": "POST",
+                    "path": "/v1/swp"
                 }
             ]
         }"#;
@@ -654,22 +914,20 @@ mod tests {
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(
             settings.protected_endpoints.len(),
-            RoutePath::all_known_paths().len()
+            RoutePath::all_known_paths().len() + 1
         );
     }
 
     #[test]
     fn test_matching_route_paths_empty_pattern() {
-        // Empty pattern should return empty list (nothing matches)
-        let paths = matching_route_paths("").unwrap();
-        assert!(paths.is_empty());
+        let result = matching_route_paths("");
+        assert!(matches!(result, Err(Error::UnknownRoute(route)) if route.is_empty()));
     }
 
     #[test]
     fn test_matching_route_paths_just_slash() {
-        // Pattern "/" should not match any known paths (all start with /v1/)
-        let paths = matching_route_paths("/").unwrap();
-        assert!(paths.is_empty());
+        let result = matching_route_paths("/");
+        assert!(matches!(result, Err(Error::UnknownRoute(route)) if route == "/"));
     }
 
     #[test]
@@ -743,8 +1001,9 @@ mod tests {
         // Test prefix matching for melt endpoints: "/v1/melt/*"
         let paths = matching_route_paths("/v1/melt/*").unwrap();
 
-        // Should match 4 melt paths (bolt11/12 for melt and melt quote)
-        assert_eq!(paths.len(), 4);
+        // Should match 4 melt paths plus the wildcard policy.
+        assert_eq!(paths.len(), 5);
+        assert!(paths.contains(&RoutePath::Wildcard("/v1/melt/".to_string())));
         assert!(paths.contains(&RoutePath::Melt(
             PaymentMethod::Known(KnownMethod::Bolt11).to_string()
         )));
@@ -834,7 +1093,8 @@ mod tests {
     fn test_matching_route_paths_only_wildcard() {
         // Pattern with just "*" matches everything
         let paths = matching_route_paths("*").unwrap();
-        assert_eq!(paths.len(), RoutePath::all_known_paths().len());
+        assert_eq!(paths.len(), RoutePath::all_known_paths().len() + 1);
+        assert!(paths.contains(&RoutePath::Wildcard(String::new())));
     }
 
     #[test]
@@ -849,20 +1109,12 @@ mod tests {
 
     #[test]
     fn test_exact_match_no_child_paths() {
-        // Exact match "/v1/mint" should NOT match child paths like "/v1/mint/bolt11"
-        let paths = matching_route_paths("/v1/mint").unwrap();
-
-        // "/v1/mint" is not a valid RoutePath by itself (needs payment method)
-        // So it should return empty
-        assert!(paths.is_empty());
-
-        // Also verify it doesn't match any mint paths with payment methods
-        assert!(!paths.contains(&RoutePath::Mint(
-            PaymentMethod::Known(KnownMethod::Bolt11).to_string()
-        )));
-        assert!(!paths.contains(&RoutePath::MintQuote(
-            PaymentMethod::Known(KnownMethod::Bolt11).to_string()
-        )));
+        // Exact match "/v1/mint" is not a valid RoutePath by itself.
+        let result = matching_route_paths("/v1/mint");
+        assert!(matches!(
+            result,
+            Err(Error::UnknownRoute(route)) if route == "/v1/mint"
+        ));
     }
 
     #[test]
@@ -954,11 +1206,14 @@ mod tests {
         let paths_upper = matching_route_paths("/v1/MINT/*").unwrap();
         let paths_lower = matching_route_paths("/v1/mint/*").unwrap();
 
-        // Uppercase should NOT match any known paths
-        assert!(paths_upper.is_empty());
+        // Uppercase should not match any known paths, but the wildcard policy is preserved.
+        assert_eq!(
+            paths_upper,
+            vec![RoutePath::Wildcard("/v1/MINT/".to_string())]
+        );
 
-        // Lowercase should match 4 mint paths
-        assert_eq!(paths_lower.len(), 4);
+        // Lowercase should match 4 mint paths plus the wildcard policy.
+        assert_eq!(paths_lower.len(), 5);
     }
 
     #[test]
@@ -986,13 +1241,25 @@ mod tests {
         assert!(!swap_paths.contains(&RoutePath::Restore));
         assert!(!swap_paths.contains(&RoutePath::MintBlindAuth));
 
-        // 4. Case sensitivity - wrong case matches nothing
-        assert!(matching_route_paths("/V1/SWAP").unwrap().is_empty());
-        assert!(matching_route_paths("/V1/MINT/*").unwrap().is_empty());
+        // 4. Case sensitivity - wrong exact case fails, wildcard case is preserved.
+        assert!(matches!(
+            matching_route_paths("/V1/SWAP"),
+            Err(Error::UnknownRoute(route)) if route == "/V1/SWAP"
+        ));
+        assert_eq!(
+            matching_route_paths("/V1/MINT/*").unwrap(),
+            vec![RoutePath::Wildcard("/V1/MINT/".to_string())]
+        );
 
-        // 5. Invalid/unknown paths match nothing
-        assert!(matching_route_paths("/unknown/path").unwrap().is_empty());
-        assert!(matching_route_paths("/invalid").unwrap().is_empty());
+        // 5. Invalid/unknown exact paths fail closed.
+        assert!(matches!(
+            matching_route_paths("/unknown/path"),
+            Err(Error::UnknownRoute(route)) if route == "/unknown/path"
+        ));
+        assert!(matches!(
+            matching_route_paths("/invalid"),
+            Err(Error::UnknownRoute(route)) if route == "/invalid"
+        ));
     }
 
     #[test]
@@ -1014,7 +1281,31 @@ mod tests {
         )));
 
         // But there is no RoutePath::MintQuote without a payment method
-        // So the list should only contain 2 items (bolt11 and bolt12), not a bare "/v1/mint/quote"
-        assert_eq!(paths.len(), 2);
+        // So the list should only contain bolt11/bolt12 and the wildcard policy,
+        // not a bare "/v1/mint/quote".
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&RoutePath::Wildcard("/v1/mint/quote/".to_string())));
+    }
+
+    #[test]
+    fn test_wildcard_protects_custom_payment_methods() {
+        let paths_star = matching_route_paths("/v1/*").unwrap();
+        let paths_mint = matching_route_paths("/v1/mint/*").unwrap();
+
+        let custom_mint = RoutePath::Mint("paypal".to_string());
+        let custom_mint_quote = RoutePath::MintQuote("paypal".to_string());
+
+        assert!(paths_star
+            .iter()
+            .any(|path| path.match_specificity(&custom_mint).is_some()));
+        assert!(paths_star
+            .iter()
+            .any(|path| path.match_specificity(&custom_mint_quote).is_some()));
+        assert!(paths_mint
+            .iter()
+            .any(|path| path.match_specificity(&custom_mint).is_some()));
+        assert!(paths_mint
+            .iter()
+            .any(|path| path.match_specificity(&custom_mint_quote).is_some()));
     }
 }

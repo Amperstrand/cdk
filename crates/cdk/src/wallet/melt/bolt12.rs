@@ -46,7 +46,7 @@ impl Wallet {
                 .or_else(|| amount_for_offer(&offer, &CurrencyUnit::Msat).ok())
                 .ok_or(Error::AmountUndefined)?;
             let amount_quote_unit = Amount::new(amount_msat.into(), CurrencyUnit::Msat)
-                .convert_to(&self.unit)?
+                .convert_to_ceil(&self.unit)?
                 .into();
 
             if quote_res.amount != amount_quote_unit {
@@ -69,7 +69,10 @@ impl Wallet {
             state: quote_res.state,
             expiry: quote_res.expiry,
             payment_proof: quote_res.payment_preimage,
+            estimated_blocks: None,
+            fee_index: None,
             payment_method: PaymentMethod::Known(KnownMethod::Bolt12),
+
             used_by_operation: None,
             version: 0,
         };

@@ -2,6 +2,7 @@
 //!
 //! <https://github.com/cashubtc/nuts/blob/main/14.md>
 
+use std::fmt;
 use std::str::FromStr;
 
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
@@ -72,14 +73,22 @@ pub enum Error {
 }
 
 /// HTLC Witness
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+#[derive(Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HTLCWitness {
     /// Preimage
     pub preimage: String,
     /// Signatures
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signatures: Option<Vec<String>>,
+}
+
+impl fmt::Debug for HTLCWitness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HTLCWitness")
+            .field("preimage", &"[REDACTED]")
+            .field("signatures", &self.signatures)
+            .finish()
+    }
 }
 
 impl HTLCWitness {
@@ -141,9 +150,15 @@ impl Proof {
                 _ => Error::SpendConditionsNotMet,
             })?;
 
-        // Try to extract HTLC witness - must be correct type
+        // Extract a witness for the receiver or refund path.
         let htlc_witness = match &self.witness {
-            Some(Witness::HTLCWitness(witness)) => witness,
+            Some(Witness::HTLCWitness(witness)) => witness.to_owned(),
+            Some(Witness::P2PKWitness(witness)) if requirements.refund_path.is_some() => {
+                HTLCWitness {
+                    preimage: String::new(),
+                    signatures: Some(witness.signatures.clone()),
+                }
+            }
             _ => {
                 // Wrong witness type or no witness
                 // If refund path is available with 0 required sigs, anyone can spend
@@ -157,7 +172,7 @@ impl Proof {
         };
 
         // Try to verify the preimage and capture the specific error if it fails
-        let preimage_result = verify_htlc_preimage(htlc_witness, &secret);
+        let preimage_result = verify_htlc_preimage(&htlc_witness, &secret);
 
         // Determine which path to use:
         // - If preimage is valid → use receiver path (always available)
@@ -387,13 +402,151 @@ pub(crate) fn verify_sig_all_htlc(first_input: &Proof, msg_to_sign: String) -> R
 mod tests {
     use bitcoin::hashes::sha256::Hash as Sha256Hash;
     use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::{Keypair, Message};
 
     use super::*;
     use crate::nuts::nut00::Witness;
     use crate::nuts::nut10::Kind;
     use crate::nuts::Nut10Secret;
     use crate::secret::Secret as SecretString;
-    use crate::SecretData;
+    use crate::{SecretData, SecretKey};
+
+    fn sign_refund_proof(proof: &mut Proof, key: &SecretKey) {
+        let digest = Sha256Hash::hash(proof.secret.as_bytes());
+        let message = Message::from_digest(digest.to_byte_array());
+        let keypair = Keypair::from_secret_key(&crate::SECP256K1, key);
+        let signature = crate::SECP256K1.sign_schnorr_no_aux_rand(&message, &keypair);
+        proof.witness = Some(Witness::P2PKWitness(crate::nuts::nut11::P2PKWitness {
+            signatures: vec![signature.to_string()],
+        }));
+    }
+
+    fn signed_htlc_refund_proof(locktime: Option<u64>) -> Proof {
+        let refund_key =
+            SecretKey::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
+        let refund_pubkey = refund_key.public_key().to_string();
+        let hash = Sha256Hash::hash(&[42u8; 32]).to_string();
+        let mut tags = vec![vec!["refund".to_string(), refund_pubkey]];
+        if let Some(locktime) = locktime {
+            tags.push(vec!["locktime".to_string(), locktime.to_string()]);
+        }
+        let secret_data: SecretData = serde_json::from_value(serde_json::json!({
+            "nonce": "0000000000000000000000000000000000000000000000000000000000000000",
+            "data": hash,
+            "tags": tags,
+        }))
+        .unwrap();
+        let nut10_secret = Nut10Secret::new(Kind::HTLC, secret_data);
+        let secret: SecretString = nut10_secret.try_into().unwrap();
+
+        let mut proof = Proof {
+            amount: crate::Amount::from(1),
+            keyset_id: crate::nuts::nut02::Id::from_str("00deadbeef123456").unwrap(),
+            secret,
+            c: crate::nuts::nut01::PublicKey::from_hex(
+                "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            )
+            .unwrap(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+
+        sign_refund_proof(&mut proof, &refund_key);
+        proof
+    }
+
+    #[test]
+    fn test_verify_htlc_refund_signature_only_witness_repro() {
+        let proof = signed_htlc_refund_proof(Some(1));
+        assert!(matches!(proof.witness, Some(Witness::P2PKWitness(_))));
+        let result = proof.verify_htlc();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn test_verify_htlc_refund_signature_only_wire_witness() {
+        use crate::nuts::nut03::SwapRequest;
+        use crate::nuts::nut10::SpendingConditionVerification;
+
+        let proof = signed_htlc_refund_proof(Some(1));
+        let signatures = proof.witness.as_ref().unwrap().signatures().unwrap();
+        for witness in [
+            serde_json::json!({"preimage": null, "signatures": &signatures}),
+            serde_json::json!({"signatures": &signatures}),
+        ] {
+            let mut encoded = serde_json::to_value(&proof).unwrap();
+            encoded["witness"] = serde_json::Value::String(witness.to_string());
+            let proof: Proof = serde_json::from_value(encoded).unwrap();
+            assert!(matches!(proof.witness, Some(Witness::P2PKWitness(_))));
+
+            let request = SwapRequest::new(vec![proof], vec![]);
+            let result = request.verify_spending_conditions();
+            assert!(result.is_ok(), "witness {witness}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_verify_htlc_refund_signature_only_requires_expiry_and_refund_key() {
+        let mut control = signed_htlc_refund_proof(Some(1));
+        control.add_preimage(String::new());
+        assert!(control.verify_htlc().is_ok());
+
+        for locktime in [None, Some(u64::MAX)] {
+            let proof = signed_htlc_refund_proof(locktime);
+            assert!(proof.verify_htlc().is_err());
+        }
+
+        let mut proof = signed_htlc_refund_proof(Some(1));
+        proof.witness = None;
+        let wrong_key =
+            SecretKey::from_hex("0000000000000000000000000000000000000000000000000000000000000002")
+                .unwrap();
+        sign_refund_proof(&mut proof, &wrong_key);
+        assert!(proof.verify_htlc().is_err());
+    }
+
+    #[allow(clippy::use_debug)]
+    #[test]
+    fn htlc_witness_debug_redacts_preimage() {
+        let preimage = "known-htlc-preimage";
+        let signature = "public-signature";
+        let witness = HTLCWitness {
+            preimage: preimage.to_string(),
+            signatures: Some(vec![signature.to_string()]),
+        };
+
+        let debug = format!("{witness:?}");
+
+        assert!(!debug.contains(preimage));
+        assert!(debug.contains("preimage: \"[REDACTED]\""));
+        assert!(debug.contains(signature));
+    }
+
+    fn htlc_proof(
+        preimage_bytes: [u8; 32],
+        conditions: Option<Conditions>,
+        witness: Option<Witness>,
+    ) -> Proof {
+        let hash = Sha256Hash::hash(&preimage_bytes);
+        let nut10_secret =
+            Nut10Secret::new(Kind::HTLC, SecretData::new(hash.to_string(), conditions));
+        let secret: SecretString = nut10_secret.try_into().unwrap();
+
+        Proof {
+            amount: crate::Amount::ONE,
+            keyset_id: crate::nuts::nut02::Id::from_str("00deadbeef123456").unwrap(),
+            secret,
+            c: crate::nuts::nut01::PublicKey::from_hex(
+                "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            )
+            .unwrap(),
+            witness,
+            dleq: None,
+            p2pk_e: None,
+        }
+    }
 
     /// Tests that verify_htlc correctly accepts a valid HTLC with the correct preimage.
     ///
@@ -435,6 +588,46 @@ mod tests {
 
         // Valid HTLC should verify successfully
         assert!(proof.verify_htlc().is_ok());
+    }
+
+    #[test]
+    fn test_htlc_preimage_size_boundaries() {
+        let valid_preimage = hex::encode([42u8; 32]);
+        let short_preimage = hex::encode([42u8; 31]);
+        let long_preimage = hex::encode([42u8; 33]);
+
+        assert!(SpendingConditions::new_htlc(valid_preimage.clone(), None).is_ok());
+        assert!(matches!(
+            SpendingConditions::new_htlc(short_preimage.clone(), None),
+            Err(Error::PreimageInvalidSize)
+        ));
+        assert!(matches!(
+            SpendingConditions::new_htlc(long_preimage.clone(), None),
+            Err(Error::PreimageInvalidSize)
+        ));
+
+        assert!(HTLCWitness {
+            preimage: valid_preimage,
+            signatures: None,
+        }
+        .preimage_data()
+        .is_ok());
+        assert!(matches!(
+            HTLCWitness {
+                preimage: short_preimage,
+                signatures: None,
+            }
+            .preimage_data(),
+            Err(Error::PreimageInvalidSize)
+        ));
+        assert!(matches!(
+            HTLCWitness {
+                preimage: long_preimage,
+                signatures: None,
+            }
+            .preimage_data(),
+            Err(Error::PreimageInvalidSize)
+        ));
     }
 
     /// Tests that verify_htlc correctly rejects an HTLC with a wrong preimage.
@@ -484,6 +677,99 @@ mod tests {
         assert!(matches!(result.unwrap_err(), Error::Preimage));
     }
 
+    #[test]
+    fn test_verify_htlc_requires_refund_signature_when_refund_path_is_not_anyone_can_spend() {
+        let refund_key = SecretKey::generate().public_key();
+        let proof = htlc_proof(
+            [42u8; 32],
+            Some(Conditions {
+                locktime: Some(1),
+                refund_keys: Some(vec![refund_key]),
+                num_sigs_refund: Some(1),
+                ..Default::default()
+            }),
+            None,
+        );
+
+        assert!(matches!(
+            proof.verify_htlc(),
+            Err(Error::IncorrectSecretKind)
+        ));
+    }
+
+    #[test]
+    fn test_verify_htlc_rejects_insufficient_receiver_signatures() {
+        let required_key = SecretKey::generate().public_key();
+        let wrong_key = SecretKey::generate();
+        let mut proof = htlc_proof(
+            [42u8; 32],
+            Some(Conditions {
+                pubkeys: Some(vec![required_key]),
+                num_sigs: Some(1),
+                ..Default::default()
+            }),
+            None,
+        );
+        let signature = wrong_key.sign(proof.secret.as_bytes()).unwrap();
+        proof.witness = Some(Witness::HTLCWitness(HTLCWitness {
+            preimage: hex::encode([42u8; 32]),
+            signatures: Some(vec![signature.to_string()]),
+        }));
+
+        assert!(matches!(
+            proof.verify_htlc(),
+            Err(Error::NUT11(
+                crate::nuts::nut11::Error::SpendConditionsNotMet
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_verify_htlc_rejects_insufficient_refund_signatures() {
+        let refund_key = SecretKey::generate().public_key();
+        let wrong_key = SecretKey::generate();
+        let mut proof = htlc_proof(
+            [42u8; 32],
+            Some(Conditions {
+                locktime: Some(1),
+                refund_keys: Some(vec![refund_key]),
+                num_sigs_refund: Some(1),
+                ..Default::default()
+            }),
+            None,
+        );
+        let signature = wrong_key.sign(proof.secret.as_bytes()).unwrap();
+        proof.witness = Some(Witness::HTLCWitness(HTLCWitness {
+            preimage: hex::encode([99u8; 32]),
+            signatures: Some(vec![signature.to_string()]),
+        }));
+
+        assert!(matches!(
+            proof.verify_htlc(),
+            Err(Error::NUT11(
+                crate::nuts::nut11::Error::SpendConditionsNotMet
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_verify_sig_all_htlc_allows_expired_anyone_can_spend_refund_path() {
+        let proof = htlc_proof(
+            [42u8; 32],
+            Some(Conditions {
+                locktime: Some(1),
+                sig_flag: crate::nuts::SigFlag::SigAll,
+                ..Default::default()
+            }),
+            Some(Witness::HTLCWitness(HTLCWitness {
+                preimage: hex::encode([99u8; 32]),
+                signatures: None,
+            })),
+        );
+
+        assert!(verify_sig_all_htlc(&proof, "sig-all message".to_string()).is_ok());
+    }
+
     /// Tests that verify_htlc correctly rejects an HTLC with an invalid hash format.
     ///
     /// This test ensures that the verification function properly validates that the
@@ -525,6 +811,63 @@ mod tests {
         let result = proof.verify_htlc();
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::InvalidHash));
+    }
+
+    #[test]
+    fn test_htlc_num_sigs_zero_bypasses_signature_requirement() {
+        let pubkey = crate::nuts::nut01::PublicKey::from_hex(
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+        )
+        .unwrap();
+
+        let preimage_bytes = [42u8; 32];
+        let hash = Sha256Hash::hash(&preimage_bytes);
+        let hash_str = hash.to_string();
+
+        let tags = vec![
+            vec!["pubkeys".to_string(), pubkey.to_string()],
+            vec!["n_sigs".to_string(), "0".to_string()],
+        ];
+
+        let nut10_secret = Nut10Secret::new(Kind::HTLC, SecretData::new(hash_str, Some(tags)));
+        // Since we patched deserialization itself (TryFrom<Secret>), let's verify that
+        // extracting the conditions out of a constructed secret will error
+        let conditions_res = crate::nuts::nut10::Conditions::try_from(
+            nut10_secret.secret_data().tags().cloned().unwrap(),
+        );
+        assert!(
+            conditions_res.is_err(),
+            "Conditions should fail to parse due to n_sigs=0"
+        );
+    }
+
+    #[test]
+    fn test_verify_sig_all_htlc_nsigs_zero_bypasses_sig_check() {
+        let preimage_bytes = [42u8; 32];
+        let hash = Sha256Hash::hash(&preimage_bytes);
+        let hash_str = hash.to_string();
+
+        let required_pubkey = crate::nuts::nut01::PublicKey::from_hex(
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+        )
+        .unwrap();
+
+        // SIG_ALL HTLC with pubkeys but n_sigs=0
+        let tags = vec![
+            vec!["pubkeys".to_string(), required_pubkey.to_string()],
+            vec!["n_sigs".to_string(), "0".to_string()],
+            vec!["sigflag".to_string(), "SIG_ALL".to_string()],
+        ];
+
+        let nut10_secret = Nut10Secret::new(Kind::HTLC, SecretData::new(hash_str, Some(tags)));
+
+        let conditions_res = crate::nuts::nut10::Conditions::try_from(
+            nut10_secret.secret_data().tags().cloned().unwrap(),
+        );
+        assert!(
+            conditions_res.is_err(),
+            "Conditions should fail to parse due to n_sigs=0"
+        );
     }
 
     /// Tests that verify_htlc correctly rejects an HTLC with the wrong witness type.
@@ -690,5 +1033,85 @@ mod tests {
             result.is_err(),
             "Should fail when using refund path with refund keys but no signature"
         );
+    }
+
+    #[test]
+    fn test_htlc_generated_empty_refund_keys_are_omitted() {
+        use crate::nuts::nut10::Conditions;
+
+        let preimage_bytes = [42u8; 32];
+        let hash = Sha256Hash::hash(&preimage_bytes);
+        let hash_str = hash.to_string();
+
+        let conditions = Conditions {
+            locktime: Some(1),
+            pubkeys: None,
+            refund_keys: Some(vec![]),
+            num_sigs: None,
+            sig_flag: crate::nuts::nut11::SigFlag::default(),
+            num_sigs_refund: None,
+        };
+
+        let nut10_secret =
+            Nut10Secret::new(Kind::HTLC, SecretData::new(hash_str, Some(conditions)));
+        let secret: SecretString = nut10_secret.try_into().unwrap();
+
+        let htlc_witness = HTLCWitness {
+            preimage: hex::encode([0xffu8; 32]),
+            signatures: None,
+        };
+
+        let proof = Proof {
+            amount: crate::Amount::from(1),
+            keyset_id: crate::nuts::nut02::Id::from_str("00deadbeef123456").unwrap(),
+            secret,
+            c: crate::nuts::nut01::PublicKey::from_hex(
+                "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            )
+            .unwrap(),
+            witness: Some(Witness::HTLCWitness(htlc_witness)),
+            dleq: None,
+            p2pk_e: None,
+        };
+
+        assert!(proof.verify_htlc().is_ok());
+    }
+
+    #[test]
+    fn test_htlc_empty_refund_tag_is_rejected() {
+        let preimage_bytes = [42u8; 32];
+        let hash = Sha256Hash::hash(&preimage_bytes);
+        let hash_str = hash.to_string();
+
+        let tags = vec![
+            vec!["locktime".to_string(), "1".to_string()],
+            vec!["refund".to_string()],
+        ];
+
+        let nut10_secret = Nut10Secret::new(Kind::HTLC, SecretData::new(hash_str, Some(tags)));
+        let secret: SecretString = nut10_secret.try_into().unwrap();
+
+        let htlc_witness = HTLCWitness {
+            preimage: hex::encode([0xffu8; 32]),
+            signatures: None,
+        };
+
+        let proof = Proof {
+            amount: crate::Amount::from(1),
+            keyset_id: crate::nuts::nut02::Id::from_str("00deadbeef123456").unwrap(),
+            secret,
+            c: crate::nuts::nut01::PublicKey::from_hex(
+                "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            )
+            .unwrap(),
+            witness: Some(Witness::HTLCWitness(htlc_witness)),
+            dleq: None,
+            p2pk_e: None,
+        };
+
+        assert!(matches!(
+            proof.verify_htlc(),
+            Err(Error::SpendConditionsNotMet)
+        ));
     }
 }

@@ -1,9 +1,11 @@
 //! Open Id Connect
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use serde::Deserialize;
@@ -13,7 +15,46 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::instrument;
 
-use crate::HttpClient;
+use crate::{HttpClient, HttpError};
+
+fn validate_client_id_claim(
+    claim_name: &str,
+    claim_value: &serde_json::Value,
+    client_id: &str,
+) -> Result<(), Error> {
+    let Some(token_client_id) = claim_value.as_str() else {
+        tracing::warn!("{} claim is not a string", claim_name);
+        return Err(Error::InvalidClientId);
+    };
+
+    if token_client_id != client_id {
+        tracing::warn!(
+            "Client ID ({}) mismatch: expected {}, got {}",
+            claim_name,
+            client_id,
+            token_client_id
+        );
+        return Err(Error::InvalidClientId);
+    }
+
+    Ok(())
+}
+
+fn validate_client_id_claims(
+    claims: &HashMap<String, serde_json::Value>,
+    client_id: &str,
+) -> Result<(), Error> {
+    match claims.get("client_id") {
+        Some(token_client_id) => validate_client_id_claim("client_id", token_client_id, client_id),
+        None => match claims.get("azp") {
+            Some(azp) => validate_client_id_claim("azp", azp, client_id),
+            None => {
+                tracing::warn!("CAT missing client_id or azp claim for configured client ID");
+                Err(Error::InvalidClientId)
+            }
+        },
+    }
+}
 
 /// OIDC Error
 #[derive(Debug, Error)]
@@ -58,10 +99,92 @@ pub struct OidcConfig {
     pub device_authorization_endpoint: String,
 }
 
-/// Http Client
+/// Raw OIDC HTTP response.
+#[derive(Debug)]
+pub struct OidcHttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+impl OidcHttpResponse {
+    /// Create a raw OIDC HTTP response.
+    pub fn new(status: u16, body: Vec<u8>) -> Self {
+        Self { status, body }
+    }
+
+    /// Get the HTTP status code.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Check whether the response has a successful HTTP status.
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// Deserialize the response body as JSON without checking the status code.
+    pub fn json<T: serde::de::DeserializeOwned>(self) -> Result<T, HttpError> {
+        serde_json::from_slice(&self.body).map_err(HttpError::from)
+    }
+
+    fn json_or_status_error<T: serde::de::DeserializeOwned>(self) -> Result<T, HttpError> {
+        if !(200..300).contains(&self.status) {
+            return Err(HttpError::Status {
+                status: self.status,
+                message: String::from_utf8_lossy(&self.body).to_string(),
+            });
+        }
+
+        serde_json::from_slice(&self.body).map_err(HttpError::from)
+    }
+}
+
+/// HTTP transport used by [`OidcClient`].
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait OidcHttpTransport: Debug + Send + Sync {
+    /// HTTP GET returning raw response bytes.
+    async fn get(&self, url: &str) -> Result<OidcHttpResponse, HttpError>;
+
+    /// HTTP POST with form-encoded parameters returning raw response bytes.
+    async fn post_form(
+        &self,
+        url: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<OidcHttpResponse, HttpError>;
+}
+
+#[derive(Debug, Clone)]
+struct DefaultOidcHttpTransport {
+    client: HttpClient,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl OidcHttpTransport for DefaultOidcHttpTransport {
+    async fn get(&self, url: &str) -> Result<OidcHttpResponse, HttpError> {
+        let response = self.client.get_raw(url).await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        Ok(OidcHttpResponse::new(status, body))
+    }
+
+    async fn post_form(
+        &self,
+        url: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<OidcHttpResponse, HttpError> {
+        let response = self.client.post(url).form(&params).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        Ok(OidcHttpResponse::new(status, body))
+    }
+}
+
+/// OIDC client.
 #[derive(Debug, Clone)]
 pub struct OidcClient {
-    client: HttpClient,
+    client: Arc<dyn OidcHttpTransport>,
     openid_discovery: String,
     client_id: Option<String>,
     oidc_config: Arc<RwLock<Option<OidcConfig>>>,
@@ -106,8 +229,23 @@ pub struct TokenResponse {
 impl OidcClient {
     /// Create new [`OidcClient`]
     pub fn new(openid_discovery: String, client_id: Option<String>) -> Self {
+        Self::with_transport(
+            openid_discovery,
+            client_id,
+            Arc::new(DefaultOidcHttpTransport {
+                client: HttpClient::new(),
+            }),
+        )
+    }
+
+    /// Create new [`OidcClient`] with a provided HTTP transport.
+    pub fn with_transport(
+        openid_discovery: String,
+        client_id: Option<String>,
+        client: Arc<dyn OidcHttpTransport>,
+    ) -> Self {
         Self {
-            client: HttpClient::new(),
+            client,
             openid_discovery,
             client_id,
             oidc_config: Arc::new(RwLock::new(None)),
@@ -124,7 +262,11 @@ impl OidcClient {
     #[instrument(skip(self))]
     pub async fn get_oidc_config(&self) -> Result<OidcConfig, Error> {
         tracing::debug!("Getting oidc config");
-        let oidc_config: OidcConfig = self.client.fetch(&self.openid_discovery).await?;
+        let oidc_config: OidcConfig = self
+            .client
+            .get(&self.openid_discovery)
+            .await?
+            .json_or_status_error()?;
 
         let mut current_config = self.oidc_config.write().await;
 
@@ -137,7 +279,7 @@ impl OidcClient {
     #[instrument(skip(self))]
     pub async fn get_jwkset(&self, jwks_uri: &str) -> Result<JwkSet, Error> {
         tracing::debug!("Getting jwks set");
-        let jwks_set: JwkSet = self.client.fetch(jwks_uri).await?;
+        let jwks_set: JwkSet = self.client.get(jwks_uri).await?.json_or_status_error()?;
 
         let mut current_set = self.jwks_set.write().await;
 
@@ -207,29 +349,7 @@ impl OidcClient {
             Ok(claims) => {
                 tracing::debug!("Successfully verified cat");
                 if let Some(client_id) = &self.client_id {
-                    if let Some(token_client_id) = claims.claims.get("client_id") {
-                        if let Some(token_client_id_value) = token_client_id.as_str() {
-                            if token_client_id_value != client_id {
-                                tracing::warn!(
-                                    "Client ID mismatch: expected {}, got {}",
-                                    client_id,
-                                    token_client_id_value
-                                );
-                                return Err(Error::InvalidClientId);
-                            }
-                        }
-                    } else if let Some(azp) = claims.claims.get("azp") {
-                        if let Some(azp_value) = azp.as_str() {
-                            if azp_value != client_id {
-                                tracing::warn!(
-                                    "Client ID (azp) mismatch: expected {}, got {}",
-                                    client_id,
-                                    azp_value
-                                );
-                                return Err(Error::InvalidClientId);
-                            }
-                        }
-                    }
+                    validate_client_id_claims(&claims.claims, client_id)?;
                 }
             }
             Err(err) => {
@@ -241,6 +361,30 @@ impl OidcClient {
         Ok(())
     }
 
+    /// POST form-encoded parameters and parse a JSON response.
+    pub async fn post_form_response(
+        &self,
+        url: &str,
+        params: Vec<(String, String)>,
+    ) -> Result<OidcHttpResponse, Error> {
+        self.client
+            .post_form(url, params)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// POST form-encoded parameters and parse a successful JSON response.
+    pub async fn post_form<T>(&self, url: &str, params: Vec<(String, String)>) -> Result<T, Error>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.client
+            .post_form(url, params)
+            .await?
+            .json_or_status_error()
+            .map_err(Error::from)
+    }
+
     /// Get new access token using refresh token
     #[cfg(feature = "wallet")]
     pub async fn refresh_access_token(
@@ -250,14 +394,96 @@ impl OidcClient {
     ) -> Result<TokenResponse, Error> {
         let token_url = self.get_oidc_config().await?.token_endpoint;
 
-        let request = RefreshTokenRequest {
-            grant_type: GrantType::RefreshToken,
-            client_id,
-            refresh_token,
-        };
-
-        let response: TokenResponse = self.client.post_form(&token_url, &request).await?;
+        let response: TokenResponse = self
+            .post_form(
+                &token_url,
+                vec![
+                    ("grant_type".to_string(), "refresh_token".to_string()),
+                    ("client_id".to_string(), client_id),
+                    ("refresh_token".to_string(), refresh_token),
+                ],
+            )
+            .await?;
 
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn claims(value: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        serde_json::from_value(value).expect("claims should be an object")
+    }
+
+    #[test]
+    fn validate_client_id_claims_accepts_client_id() {
+        let claims = claims(json!({
+            "client_id": "expected-client",
+            "azp": "other-client",
+        }));
+
+        assert!(validate_client_id_claims(&claims, "expected-client").is_ok());
+    }
+
+    #[test]
+    fn validate_client_id_claims_accepts_azp_fallback() {
+        let claims = claims(json!({
+            "azp": "expected-client",
+        }));
+
+        assert!(validate_client_id_claims(&claims, "expected-client").is_ok());
+    }
+
+    #[test]
+    fn validate_client_id_claims_rejects_missing_claims() {
+        let claims = claims(json!({
+            "sub": "user",
+        }));
+
+        assert!(matches!(
+            validate_client_id_claims(&claims, "expected-client"),
+            Err(Error::InvalidClientId)
+        ));
+    }
+
+    #[test]
+    fn validate_client_id_claims_rejects_non_string_client_id() {
+        let claims = claims(json!({
+            "client_id": null,
+            "azp": "expected-client",
+        }));
+
+        assert!(matches!(
+            validate_client_id_claims(&claims, "expected-client"),
+            Err(Error::InvalidClientId)
+        ));
+    }
+
+    #[test]
+    fn validate_client_id_claims_rejects_non_string_azp() {
+        let claims = claims(json!({
+            "azp": 42,
+        }));
+
+        assert!(matches!(
+            validate_client_id_claims(&claims, "expected-client"),
+            Err(Error::InvalidClientId)
+        ));
+    }
+
+    #[test]
+    fn validate_client_id_claims_rejects_mismatch() {
+        let claims = claims(json!({
+            "client_id": "other-client",
+        }));
+
+        assert!(matches!(
+            validate_client_id_claims(&claims, "expected-client"),
+            Err(Error::InvalidClientId)
+        ));
     }
 }

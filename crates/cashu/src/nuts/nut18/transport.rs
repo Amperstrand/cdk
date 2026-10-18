@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use bitcoin::base64::engine::{general_purpose, GeneralPurpose};
 use bitcoin::base64::{alphabet, Engine};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::nuts::nut18::error::Error;
 
@@ -51,8 +51,19 @@ pub struct Transport {
     pub target: String,
     /// Tags
     #[serde(rename = "g")]
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        default,
+        deserialize_with = "deserialize_tags"
+    )]
     pub tags: Vec<Vec<String>>,
+}
+
+fn deserialize_tags<'de, D>(deserializer: D) -> Result<Vec<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<Vec<String>>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl Transport {
@@ -123,5 +134,39 @@ impl TransportBuilder {
 impl AsRef<String> for Transport {
     fn as_ref(&self) -> &String {
         &self.target
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_type_display_and_from_str_cover_wire_values() {
+        assert_eq!(TransportType::Nostr.to_string(), "\"nostr\"");
+        assert_eq!(TransportType::HttpPost.to_string(), "\"post\"");
+        assert_eq!(
+            TransportType::from_str("nostr").unwrap(),
+            TransportType::Nostr
+        );
+        assert_eq!(
+            TransportType::from_str("post").unwrap(),
+            TransportType::HttpPost
+        );
+    }
+
+    #[test]
+    fn builder_preserves_target_and_tags() {
+        let tags = vec![vec!["n".to_string(), "17".to_string()]];
+        let transport = Transport::builder()
+            .transport_type(TransportType::Nostr)
+            .target("wss://relay.example.com")
+            .tags(tags.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(transport._type, TransportType::Nostr);
+        assert_eq!(transport.as_ref(), "wss://relay.example.com");
+        assert_eq!(transport.tags, tags);
     }
 }

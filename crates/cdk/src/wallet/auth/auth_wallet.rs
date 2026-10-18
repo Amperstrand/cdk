@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use cdk_common::database::{self, WalletDatabase};
@@ -34,7 +35,7 @@ struct _Claims {
 /// CDK Auth Wallet
 ///
 /// A [`AuthWallet`] is for auth operations with a single mint.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthWallet {
     /// Mint Url
     pub mint_url: MintUrl,
@@ -51,8 +52,23 @@ pub struct AuthWallet {
     oidc_client: Arc<RwLock<Option<OidcClient>>>,
 }
 
+impl fmt::Debug for AuthWallet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthWallet")
+            .field("mint_url", &self.mint_url)
+            .field("localstore", &"[CONFIGURED]")
+            .field("metadata_cache", &"[CONFIGURED]")
+            .field("protected_endpoints", &self.protected_endpoints)
+            .field("refresh_token", &"[REDACTED]")
+            .field("auth_client", &"[CONFIGURED]")
+            .field("oidc_client", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl AuthWallet {
     /// Create a new [`AuthWallet`] instance
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mint_url: MintUrl,
         cat: Option<AuthToken>,
@@ -62,13 +78,32 @@ impl AuthWallet {
         oidc_client: Option<OidcClient>,
     ) -> Self {
         let http_client = Arc::new(AuthHttpClient::new(mint_url.clone(), cat));
+        Self::with_auth_client(
+            mint_url,
+            localstore,
+            metadata_cache,
+            protected_endpoints,
+            oidc_client,
+            http_client,
+        )
+    }
+
+    /// Create a new [`AuthWallet`] instance with a provided auth connector.
+    pub fn with_auth_client(
+        mint_url: MintUrl,
+        localstore: Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
+        metadata_cache: Arc<MintMetadataCache>,
+        protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
+        oidc_client: Option<OidcClient>,
+        auth_client: Arc<dyn AuthMintConnector + Send + Sync>,
+    ) -> Self {
         Self {
             mint_url,
             localstore,
             metadata_cache,
             protected_endpoints: Arc::new(RwLock::new(protected_endpoints)),
             refresh_token: Arc::new(RwLock::new(None)),
-            auth_client: http_client,
+            auth_client,
             oidc_client: Arc::new(RwLock::new(oidc_client)),
         }
     }
@@ -118,7 +153,7 @@ impl AuthWallet {
     }
 
     /// Set a new refresh token
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn set_refresh_token(&self, token: Option<String>) {
         *self.refresh_token.write().await = token;
     }
@@ -185,18 +220,17 @@ impl AuthWallet {
             .metadata_cache
             .load_auth(&self.localstore, &self.auth_client)
             .await?;
-        let active = metadata
-            .active_keysets
-            .iter()
-            .find(|x| x.unit == CurrencyUnit::Auth)
-            .cloned()
-            .ok_or(Error::NoActiveKeyset)?;
+
+        match metadata.keysets.get(&keyset_id) {
+            Some(keyset) if keyset.unit == CurrencyUnit::Auth => (),
+            _ => return Err(Error::UnknownKeySet),
+        }
 
         metadata
             .keys
-            .get(&active.id)
+            .get(&keyset_id)
             .map(|x| (*(x.clone())).clone())
-            .ok_or(Error::NoActiveKeyset)
+            .ok_or(Error::UnknownKeySet)
     }
 
     /// Get blind auth keysets from metadata cache
@@ -280,7 +314,17 @@ impl AuthWallet {
     pub async fn is_protected(&self, method: &ProtectedEndpoint) -> Option<AuthRequired> {
         let protected_endpoints = self.protected_endpoints.read().await;
 
-        protected_endpoints.get(method).copied()
+        protected_endpoints.get(method).copied().or_else(|| {
+            protected_endpoints
+                .iter()
+                .filter_map(|(endpoint, auth)| {
+                    endpoint
+                        .match_specificity(method)
+                        .map(|specificity| (specificity, *auth))
+                })
+                .max_by_key(|(specificity, _)| *specificity)
+                .map(|(_, auth)| auth)
+        })
     }
 
     /// Get Auth Token
@@ -424,6 +468,20 @@ impl AuthWallet {
                 )));
             }
             for (sig, premint) in mint_res.signatures.iter().zip(&premint_secrets.secrets) {
+                if sig.amount != premint.blinded_message.amount {
+                    return Err(Error::InvalidMintResponse(format!(
+                        "mint auth signature amount ({}) does not match requested amount ({})",
+                        sig.amount, premint.blinded_message.amount
+                    )));
+                }
+
+                if sig.keyset_id != premint.blinded_message.keyset_id {
+                    return Err(Error::InvalidMintResponse(format!(
+                        "mint auth signature keyset ({}) does not match requested keyset ({})",
+                        sig.keyset_id, premint.blinded_message.keyset_id
+                    )));
+                }
+
                 let keys = self.load_keyset_keys(sig.keyset_id).await?;
                 let key = keys.amount_key(sig.amount).ok_or(Error::AmountKey)?;
                 match sig.verify_dleq(key, premint.blinded_message.blinded_secret) {
@@ -469,5 +527,264 @@ impl AuthWallet {
         Ok(Amount::from(
             self.get_unspent_auth_proofs().await?.len() as u64
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use async_trait::async_trait;
+    use bitcoin::bip32::DerivationPath;
+    use bitcoin::secp256k1::Secp256k1;
+    use cdk_common::mint_url::MintUrl;
+    use cdk_common::nut02::KeySetVersion;
+    use cdk_common::nuts::{BlindSignature, KeySet, KeysetResponse, MintKeySet, MintResponse};
+
+    use super::*;
+    use crate::nuts::{Method, RoutePath};
+
+    async fn auth_wallet(
+        protected_endpoints: HashMap<ProtectedEndpoint, AuthRequired>,
+    ) -> AuthWallet {
+        let mint_url = MintUrl::from_str("https://test-mint.example.com")
+            .expect("test mint URL should be valid");
+        let localstore = Arc::new(
+            cdk_sqlite::wallet::memory::empty()
+                .await
+                .expect("in-memory wallet database should initialize"),
+        );
+        let metadata_cache = Arc::new(MintMetadataCache::new(mint_url.clone()));
+
+        AuthWallet::new(
+            mint_url,
+            None,
+            localstore,
+            metadata_cache,
+            protected_endpoints,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn debug_redacts_refresh_token() {
+        let secret = "wallet-refresh-token";
+        let wallet = auth_wallet(HashMap::new()).await;
+        wallet.set_refresh_token(Some(secret.to_string())).await;
+
+        let debug = format!("{wallet:?}");
+
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("refresh_token: \"[REDACTED]\""));
+    }
+
+    fn build_auth_keyset(seed_byte: u8) -> KeySet {
+        let secp = Secp256k1::new();
+        let seed = [seed_byte; 32];
+        let path = DerivationPath::from_str("m/0'").expect("valid derivation path");
+        let mint_keyset = MintKeySet::generate_from_seed(
+            &secp,
+            &seed,
+            &[1, 2],
+            CurrencyUnit::Auth,
+            path,
+            0,
+            None,
+            KeySetVersion::Version00,
+        );
+
+        KeySet {
+            id: mint_keyset.id,
+            unit: mint_keyset.unit.clone(),
+            active: None,
+            keys: mint_keyset.keys.into(),
+            input_fee_ppk: mint_keyset.input_fee_ppk,
+            final_expiry: mint_keyset.final_expiry,
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockAuthConnector {
+        keyset_active: KeySet,
+        keyset_inactive: KeySet,
+        respond_with_unrequested_keyset: bool,
+    }
+
+    #[async_trait]
+    impl AuthMintConnector for MockAuthConnector {
+        async fn get_auth_token(&self) -> Result<AuthToken, Error> {
+            Ok(AuthToken::ClearAuth("dummy".to_string()))
+        }
+
+        async fn set_auth_token(&self, _: AuthToken) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn get_mint_info(&self) -> Result<MintInfo, Error> {
+            Ok(MintInfo::default())
+        }
+
+        async fn get_mint_blind_auth_keyset(&self, keyset_id: Id) -> Result<KeySet, Error> {
+            match keyset_id {
+                id if id == self.keyset_active.id => Ok(self.keyset_active.clone()),
+                id if id == self.keyset_inactive.id => Ok(self.keyset_inactive.clone()),
+                _ => Err(Error::UnknownKeySet),
+            }
+        }
+
+        async fn get_mint_blind_auth_keysets(&self) -> Result<KeysetResponse, Error> {
+            Ok(KeysetResponse {
+                keysets: vec![
+                    KeySetInfo {
+                        id: self.keyset_active.id,
+                        unit: CurrencyUnit::Auth,
+                        active: true,
+                        input_fee_ppk: 0,
+                        final_expiry: None,
+                    },
+                    KeySetInfo {
+                        id: self.keyset_inactive.id,
+                        unit: CurrencyUnit::Auth,
+                        active: false,
+                        input_fee_ppk: 0,
+                        final_expiry: None,
+                    },
+                ],
+            })
+        }
+
+        async fn post_mint_blind_auth(
+            &self,
+            request: MintAuthRequest,
+        ) -> Result<MintResponse, Error> {
+            let signatures = request
+                .outputs
+                .into_iter()
+                .map(|output| BlindSignature {
+                    amount: output.amount,
+                    keyset_id: if self.respond_with_unrequested_keyset {
+                        match output.keyset_id {
+                            id if id == self.keyset_active.id => self.keyset_inactive.id,
+                            _ => self.keyset_active.id,
+                        }
+                    } else {
+                        output.keyset_id
+                    },
+                    c: output.blinded_secret,
+                    dleq: None,
+                })
+                .collect();
+
+            Ok(MintResponse { signatures })
+        }
+    }
+
+    async fn auth_wallet_with_connector(
+        connector: Arc<dyn AuthMintConnector + Send + Sync>,
+    ) -> AuthWallet {
+        let mint_url = MintUrl::from_str("https://test-mint.example.com")
+            .expect("test mint URL should be valid");
+        let localstore = Arc::new(
+            cdk_sqlite::wallet::memory::empty()
+                .await
+                .expect("in-memory wallet database should initialize"),
+        );
+        let metadata_cache = Arc::new(MintMetadataCache::new(mint_url.clone()));
+
+        AuthWallet {
+            mint_url,
+            localstore,
+            metadata_cache,
+            protected_endpoints: Arc::new(RwLock::new(HashMap::new())),
+            refresh_token: Arc::new(RwLock::new(None)),
+            auth_client: connector,
+            oidc_client: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_keyset_keys_returns_keys_for_requested_id() {
+        let keyset_active = build_auth_keyset(1);
+        let keyset_inactive = build_auth_keyset(2);
+        assert_ne!(keyset_active.id, keyset_inactive.id);
+        assert_ne!(keyset_active.keys, keyset_inactive.keys);
+
+        let wallet = auth_wallet_with_connector(Arc::new(MockAuthConnector {
+            keyset_active,
+            keyset_inactive: keyset_inactive.clone(),
+            respond_with_unrequested_keyset: false,
+        }))
+        .await;
+
+        let loaded = wallet
+            .load_keyset_keys(keyset_inactive.id)
+            .await
+            .expect("load_keyset_keys should succeed");
+
+        assert_eq!(loaded, keyset_inactive.keys);
+    }
+
+    #[tokio::test]
+    async fn mint_blind_auth_rejects_signature_for_unrequested_keyset() {
+        let keyset_active = build_auth_keyset(1);
+        let keyset_inactive = build_auth_keyset(2);
+
+        let wallet = auth_wallet_with_connector(Arc::new(MockAuthConnector {
+            keyset_active,
+            respond_with_unrequested_keyset: true,
+            keyset_inactive,
+        }))
+        .await;
+
+        let err = wallet
+            .mint_blind_auth(Amount::from(1))
+            .await
+            .expect_err("mismatched keyset response should fail");
+
+        assert!(
+            matches!(err, Error::InvalidMintResponse(ref message) if message.contains("keyset")),
+            "expected keyset mismatch error, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_protected_matches_wildcard_by_specificity() {
+        let request =
+            ProtectedEndpoint::new(Method::Post, RoutePath::MintQuote("bolt11".to_string()));
+        let exact =
+            ProtectedEndpoint::new(Method::Post, RoutePath::MintQuote("bolt11".to_string()));
+        let broad_wildcard =
+            ProtectedEndpoint::new(Method::Post, RoutePath::Wildcard("/v1/".to_string()));
+        let specific_wildcard = ProtectedEndpoint::new(
+            Method::Post,
+            RoutePath::Wildcard("/v1/mint/quote/".to_string()),
+        );
+        let different_method_wildcard = ProtectedEndpoint::new(
+            Method::Get,
+            RoutePath::Wildcard("/v1/mint/quote/".to_string()),
+        );
+
+        let wallet = auth_wallet(HashMap::from([
+            (broad_wildcard, AuthRequired::Clear),
+            (specific_wildcard, AuthRequired::Blind),
+            (different_method_wildcard, AuthRequired::Clear),
+        ]))
+        .await;
+
+        assert_eq!(
+            wallet.is_protected(&request).await,
+            Some(AuthRequired::Blind)
+        );
+
+        wallet
+            .protected_endpoints
+            .write()
+            .await
+            .insert(exact, AuthRequired::Clear);
+
+        assert_eq!(
+            wallet.is_protected(&request).await,
+            Some(AuthRequired::Clear)
+        );
     }
 }

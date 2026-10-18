@@ -13,11 +13,11 @@ crate-type = ["staticlib", "cdylib"]
 name = "cdk_ffi_kotlin"
 
 [[bin]]
-name = "uniffi-bindgen"
+name = "uniffi-bindgen-kotlin"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
-cdk-ffi.workspace = true
+cdk-ffi = { workspace = true, default-features = false, features = ["npubcash", "nwc", "bip353"] }
 uniffi = { workspace = true, features = ["cli"] }
 
 [build-dependencies]

@@ -1,0 +1,427 @@
+name: "FFI - Kotlin Bindings"
+
+permissions:
+  contents: read
+  actions: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to create for release (e.g. v0.17.0)"
+        required: true
+      cdk_ref:
+        description: 'CDK git ref to publish from. Must match release_tag unless this is a nightly.'
+        required: false
+      prerelease:
+        description: 'Mark the GitHub release as a pre-release'
+        type: boolean
+        default: false
+      nightly:
+        description: 'Build an immutable nightly prerelease from an exact CDK commit.'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: true
+      cdk_ref:
+        type: string
+        required: false
+      prerelease:
+        type: boolean
+        required: false
+        default: false
+      nightly:
+        type: boolean
+        required: false
+        default: false
+env:
+  CARGO_TERM_COLOR: ${{ vars.CARGO_TERM_COLOR }}
+  TAG: ${{ inputs.release_tag }}
+  CDK_REF: ${{ inputs.cdk_ref || inputs.release_tag }}
+  CDK_CHECKOUT_REF: ${{ inputs.nightly && inputs.cdk_ref || format('refs/tags/{0}', inputs.release_tag) }}
+  RELEASE_BRANCH: release/${{ inputs.release_tag }}
+
+jobs:
+  release-ci:
+    uses: ./.github/workflows/release-ci.yml
+    with:
+      ref: ${{ inputs.nightly && inputs.cdk_ref || inputs.release_tag }}
+
+  validate-release-ref:
+    needs: release-ci
+    name: "kotlin: Validate release ref"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release ref
+        shell: bash
+        run: |
+          if [[ "${{ inputs.nightly }}" == "true" ]]; then
+            if [[ "${{ inputs.prerelease }}" != "true" ]]; then
+              echo "::error::Nightly releases must be marked as prereleases"
+              exit 1
+            fi
+
+            if [[ ! "${CDK_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Nightly cdk_ref must be an exact 40-character commit SHA; got ${CDK_REF}"
+              exit 1
+            fi
+
+            if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+-nightly[.][0-9]{8}[.]g[0-9a-f]{7}$ ]]; then
+              echo "::error::Nightly release_tag must look like v0.18.0-nightly.20260801.g1a2b3c4; got ${TAG}"
+              exit 1
+            fi
+          elif [[ "${CDK_REF}" != "${TAG}" ]]; then
+            echo "::error::cdk_ref must match release_tag (${TAG}); got ${CDK_REF}"
+            exit 1
+          fi
+
+          if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release_tag must be a version tag such as v0.17.0; got ${TAG}"
+            exit 1
+          fi
+
+      - name: Verify release source exists
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          fetch-depth: 1
+          persist-credentials: false
+
+  kotlin-sync-sources:
+    name: "kotlin: Sync sources to cdk-kotlin"
+    needs: [validate-release-ref]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve variables
+        run: |
+          echo "RELEASE_VER=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - name: Clone cdk-kotlin
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" \
+            clone https://github.com/${{ vars.CDK_KOTLIN_REPO }}.git cdk-kotlin
+
+      - name: Copy bindings/kotlin to cdk-kotlin
+        run: |
+          rsync -av --delete \
+            --exclude='.github' \
+            --exclude='rust' \
+            --exclude='target' \
+            --exclude='.git' \
+            bindings/kotlin/ cdk-kotlin/
+
+          # The binding repo carries artifacts only. Nothing there is built, so
+          # the Rust crate and its toolchain pin are removed rather than synced.
+          rm -rf cdk-kotlin/rust cdk-kotlin/rust-toolchain.toml
+
+      - name: Update versions
+        run: |
+          echo "Setting release version to ${RELEASE_VER}"
+
+          sed -i "s/^VERSION_NAME=.*/VERSION_NAME=${RELEASE_VER}/" cdk-kotlin/gradle.properties
+
+          cat cdk-kotlin/gradle.properties
+
+      - name: Push to cdk-kotlin release branch
+        working-directory: cdk-kotlin
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git show-ref --verify --quiet "refs/remotes/origin/${RELEASE_BRANCH}"; then
+            git checkout -B "${RELEASE_BRANCH}" "origin/${RELEASE_BRANCH}"
+          else
+            git checkout -b "${RELEASE_BRANCH}"
+          fi
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "sync: update sources for ${TAG}"
+          git -c "http.extraheader=$(auth_header)" push origin "${RELEASE_BRANCH}"
+
+  kotlin-build-native:
+    name: "kotlin: Build ${{ matrix.target }}"
+    needs: [validate-release-ref]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Android is the only published target; desktop JVM users build from
+          # source. See bindings/kotlin/README.md.
+          - target: aarch64-linux-android
+            runner: ubuntu-22.04
+            artifact: libcdk_ffi_kotlin.so
+          - target: armv7-linux-androideabi
+            runner: ubuntu-22.04
+            artifact: libcdk_ffi_kotlin.so
+          - target: i686-linux-android
+            runner: ubuntu-22.04
+            artifact: libcdk_ffi_kotlin.so
+          - target: x86_64-linux-android
+            runner: ubuntu-22.04
+            artifact: libcdk_ffi_kotlin.so
+
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@v17
+        with:
+          name: cashudevkit
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+        continue-on-error: true
+
+      - name: Build (Nix)
+        run: |
+          nix develop --fallback -L .#kotlin-build --command \
+            cargo build --locked --profile release-ffi -p cdk-ffi-kotlin \
+              --target ${{ matrix.target }}
+
+      # uniffi 0.30 reads the component interface statically from the library
+      # (it does not load it), so the arm64 Android .so works as the source on
+      # this x86_64 host. This must run before the strip step: llvm-strip
+      # --strip-all removes the ELF symbol table that uniffi extracts the
+      # metadata from, which would silently produce empty bindings.
+      - name: Generate Kotlin bindings
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          mkdir -p generated-bindings
+          nix develop --fallback -L .#kotlin-build --command \
+            cargo run --locked --release -p cdk-ffi-kotlin --bin uniffi-bindgen-kotlin -- generate \
+              --library "target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}" \
+              --language kotlin \
+              --config bindings/kotlin/rust/uniffi.toml \
+              --out-dir generated-bindings \
+              --no-format
+
+      - name: Upload generated bindings
+        if: matrix.target == 'aarch64-linux-android'
+        uses: actions/upload-artifact@v7
+        with:
+          name: kotlin-bindings-generated
+          path: generated-bindings/
+          if-no-files-found: error
+
+      - name: Strip debug symbols
+        shell: bash
+        run: |
+          FILE="target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}"
+          nix develop --fallback -L .#kotlin-build --command \
+            bash -c '"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all '"$FILE"
+
+      - name: Verify Android ELF 16 KB alignment
+        # The 16 KB page size requirement applies to 64-bit ABIs only;
+        # 32-bit Android always uses 4 KB pages
+        if: matrix.target == 'aarch64-linux-android' || matrix.target == 'x86_64-linux-android'
+        shell: bash
+        run: |
+          FILE="target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}"
+          nix develop --fallback -L .#kotlin-build --command \
+            .github/scripts/check-android-elf-alignment.sh "$FILE"
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}" \
+             "dist/${{ matrix.target }}-${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kotlin-native-${{ matrix.target }}
+          path: dist/
+
+  kotlin-publish:
+    name: "kotlin: Publish to cdk-kotlin"
+    runs-on: ubuntu-latest
+    needs: [kotlin-sync-sources, kotlin-build-native]
+    concurrency:
+      # Prevent duplicate publishes of the same immutable version without
+      # cancelling or queueing releases for different stable/RC versions.
+      group: ffi-kotlin-maven-publish-${{ inputs.release_tag }}
+      cancel-in-progress: false
+    steps:
+      - name: Clone cdk-kotlin
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" \
+            clone --branch "${RELEASE_BRANCH}" \
+            https://github.com/${{ vars.CDK_KOTLIN_REPO }}.git cdk-kotlin
+
+      - name: Checkout CDK (for Nix flake)
+        uses: actions/checkout@v5
+        with:
+          path: cdk
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - uses: cachix/cachix-action@v17
+        with:
+          name: cashudevkit
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+        continue-on-error: true
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts
+          pattern: kotlin-native-*
+          merge-multiple: true
+
+      - name: Distribute native libraries to Android jniLibs
+        run: |
+          declare -A ANDROID_ABI=(
+            ["aarch64-linux-android"]="arm64-v8a"
+            ["armv7-linux-androideabi"]="armeabi-v7a"
+            ["i686-linux-android"]="x86"
+            ["x86_64-linux-android"]="x86_64"
+          )
+
+          suffix="libcdk_ffi_kotlin.so"
+          for f in artifacts/*; do
+            filename=$(basename "$f")
+            [[ "$filename" == *"-${suffix}" ]] || continue
+            rust_target="${filename%-${suffix}}"
+            abi="${ANDROID_ABI[$rust_target]+${ANDROID_ABI[$rust_target]}}"
+            [[ -n "$abi" ]] || { echo "no ABI mapping for ${rust_target}, skipping" >&2; continue; }
+            dst="cdk-kotlin/cdk-android/src/main/jniLibs/${abi}"
+            mkdir -p "$dst"
+            cp "$f" "$dst/${suffix}"
+            echo "android: ${rust_target} → ${abi}"
+          done
+
+      - name: Download generated bindings
+        uses: actions/download-artifact@v8
+        with:
+          name: kotlin-bindings-generated
+          path: cdk-kotlin/cdk-jvm/src/main/kotlin
+
+      - name: Commit to release branch
+        working-directory: cdk-kotlin
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "release: ${TAG} — add bindings and prebuilt binaries"
+
+      - name: Push release branch
+        working-directory: cdk-kotlin
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" push origin "${RELEASE_BRANCH}"
+
+      - name: Publish one deployment to Maven Central
+        if: ${{ !inputs.nightly }}
+        working-directory: cdk-kotlin
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          nix develop --fallback -L ../cdk#kotlin-publish --command \
+            env -u ANDROID_SDK_ROOT \
+            ./gradlew --no-parallel publishAndReleaseToMavenCentral
+
+      - name: Create release on cdk-kotlin
+        working-directory: cdk-kotlin
+        env:
+          GH_TOKEN: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          COMMIT_SHA=$(git rev-parse HEAD)
+          RELEASE_OPTIONS=(--generate-notes)
+          if [[ "${{ inputs.nightly }}" == "true" ]]; then
+            RELEASE_OPTIONS+=(
+              --prerelease
+              --latest=false
+              --notes "Nightly bindings built from CDK commit ${CDK_REF}: https://github.com/${GITHUB_REPOSITORY}/commit/${CDK_REF}"
+            )
+          elif [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            RELEASE_OPTIONS+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            --repo ${{ vars.CDK_KOTLIN_REPO }} \
+            --target "${COMMIT_SHA}" \
+            --title "Release ${TAG}" \
+            "${RELEASE_OPTIONS[@]}"
+
+      - name: Merge to default branch
+        if: ${{ !inputs.nightly }}
+        working-directory: cdk-kotlin
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+          echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}" >> "$GITHUB_ENV"
+          git checkout "${DEFAULT_BRANCH}"
+          git merge "${RELEASE_BRANCH}" --squash
+          git commit -m "release: ${TAG}"
+          git -c "http.extraheader=$(auth_header)" push origin "${DEFAULT_BRANCH}"
+
+      - name: Clean up release branch
+        working-directory: cdk-kotlin
+        env:
+          FFI_DEPLOY_KEY: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          auth_header() {
+            printf 'AUTHORIZATION: basic '
+            printf 'x-access-token:%s' "${FFI_DEPLOY_KEY}" | base64 | tr -d '\n'
+          }
+
+          git -c "http.extraheader=$(auth_header)" push origin --delete "${RELEASE_BRANCH}"

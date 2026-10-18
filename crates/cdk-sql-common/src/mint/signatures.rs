@@ -70,6 +70,7 @@ where
             SELECT blinded_message, c, dleq_e, dleq_s
             FROM blind_signature
             WHERE blinded_message IN (:blinded_messages)
+            ORDER BY blinded_message
             FOR UPDATE
             "#,
         )?
@@ -91,21 +92,30 @@ where
         })
         .collect::<Result<HashMap<_, _>, Error>>()?;
 
-        // Iterate over the provided blinded messages and signatures
-        for (message, signature) in blinded_messages.iter().zip(blind_signatures) {
+        let mut ordered_signatures = blinded_messages
+            .iter()
+            .zip(blind_signatures)
+            .enumerate()
+            .collect::<Vec<_>>();
+        ordered_signatures.sort_unstable_by(|(_, (left, _)), (_, (right, _))| {
+            left.to_bytes().cmp(&right.to_bytes())
+        });
+
+        // Mutate rows in blinded-message order while retaining the request order index.
+        for (i, (message, signature)) in ordered_signatures {
             match existing_rows.remove(message) {
                 None => {
                     // Unknown blind message: Insert new row with all columns
                     query(
                         r#"
                         INSERT INTO blind_signature
-                        (blinded_message, amount, keyset_id, c, quote_id, dleq_e, dleq_s, created_time, signed_time)
+                        (blinded_message, amount, keyset_id, c, quote_id, dleq_e, dleq_s, created_time, signed_time, order_index)
                         VALUES
-                        (:blinded_message, :amount, :keyset_id, :c, :quote_id, :dleq_e, :dleq_s, :created_time, :signed_time)
+                        (:blinded_message, :amount, :keyset_id, :c, :quote_id, :dleq_e, :dleq_s, :created_time, :signed_time, :order_index)
                         "#,
                     )?
                     .bind("blinded_message", message.to_bytes().to_vec())
-                    .bind("amount", u64::from(signature.amount) as i64)
+                    .bind("amount", i64::try_from(u64::from(signature.amount))?)
                     .bind("keyset_id", signature.keyset_id.to_string())
                     .bind("c", signature.c.to_bytes().to_vec())
                     .bind("quote_id", quote_id.as_ref().map(|q| q.to_string()))
@@ -117,8 +127,9 @@ where
                         "dleq_s",
                         signature.dleq.as_ref().map(|dleq| dleq.s.to_secret_hex()),
                     )
-                    .bind("created_time", current_time as i64)
-                    .bind("signed_time", current_time as i64)
+                    .bind("created_time", i64::try_from(current_time)?)
+                    .bind("signed_time", i64::try_from(current_time)?)
+                    .bind("order_index", i64::try_from(i)?)
                     .execute(&self.inner)
                     .await?;
 
@@ -130,7 +141,7 @@ where
                         DO UPDATE SET total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued
                         "#,
                     )?
-                    .bind("amount", u64::from(signature.amount) as i64)
+                    .bind("amount", i64::try_from(u64::from(signature.amount))?)
                     .bind("keyset_id", signature.keyset_id.to_string())
                     .execute(&self.inner)
                     .await?;
@@ -157,8 +168,8 @@ where
                                 signature.dleq.as_ref().map(|dleq| dleq.s.to_secret_hex()),
                             )
                             .bind("blinded_message", message.to_bytes().to_vec())
-                            .bind("signed_time", current_time as i64)
-                            .bind("amount", u64::from(signature.amount) as i64)
+                            .bind("signed_time", i64::try_from(current_time)?)
+                            .bind("amount", i64::try_from(u64::from(signature.amount))?)
                             .execute(&self.inner)
                             .await?;
 
@@ -170,7 +181,7 @@ where
                                 DO UPDATE SET total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued
                                 "#,
                             )?
-                            .bind("amount", u64::from(signature.amount) as i64)
+                            .bind("amount", i64::try_from(u64::from(signature.amount))?)
                             .bind("keyset_id", signature.keyset_id.to_string())
                             .execute(&self.inner)
                             .await?;
@@ -359,6 +370,7 @@ where
                 blind_signature
             WHERE
                 quote_id=:quote_id AND c IS NOT NULL
+            ORDER BY order_index ASC
             "#,
         )?
         .bind("quote_id", quote_id.to_string())

@@ -180,11 +180,11 @@ pub async fn get_test_client() -> Box<dyn LightningClient> {
         Ok(val) => {
             let val = val.to_lowercase();
             match val.as_str() {
-                "cln" => Box::new(create_cln_client_with_retry().await),
-                _ => Box::new(_get_lnd_client().await),
+                "cln" => Box::new(create_cln_client_with_retry().await) as Box<dyn LightningClient>,
+                _ => Box::new(_get_lnd_client().await) as Box<dyn LightningClient>,
             }
         }
-        Err(_) => Box::new(_get_lnd_client().await), // Default to LND
+        Err(_) => Box::new(_get_lnd_client().await) as Box<dyn LightningClient>, // Default to LND
     }
 }
 
@@ -231,7 +231,7 @@ pub async fn attempt_manual_mint(
     mint_amount: Amount,
     payment_method: PaymentMethod,
 ) -> Result<MintResponse, cdk::Error> {
-    let active_keyset_id = wallet.fetch_active_keyset().await.unwrap().id;
+    let active_keyset_id = wallet.active_keyset().await.unwrap().id;
     let fee_and_amounts = (0, ((0..32).map(|x| 2u64.pow(x)).collect::<Vec<_>>())).into();
     let http_client = HttpClient::new(mint_url.parse().unwrap(), None);
 
@@ -250,13 +250,7 @@ pub async fn attempt_manual_mint(
     };
 
     request
-        .sign(
-            mint_quote
-                .secret_key
-                .as_ref()
-                .expect("Secret key on quote")
-                .clone(),
-        )
+        .sign(mint_quote.secret_key.as_ref().expect("Secret key on quote"))
         .unwrap();
 
     http_client.post_mint(&payment_method, request).await

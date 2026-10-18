@@ -1,7 +1,9 @@
 use cdk::subscription::Params;
-use cdk::ws::{WsResponseResult, WsSubscribeResponse};
+use cdk::ws::WsResponseResult;
+use cdk_common::pub_sub::Error as PubSubError;
+use cdk_common::terminal::escape_control;
 
-use super::{WsContext, WsError};
+use super::{WsContext, WsError, MAX_FILTERS_PER_SUBSCRIPTION, MAX_SUBSCRIPTIONS_PER_CONNECTION};
 
 /// The `handle` method is called when a client sends a subscription request
 pub(crate) async fn handle(
@@ -15,7 +17,16 @@ pub(crate) async fn handle(
         return Err(WsError::InvalidParams);
     }
 
-    let max_filters = context.state.mint.max_inputs();
+    if context.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+        tracing::warn!(
+            "WebSocket subscription request exceeds per-connection limit: {} >= {}",
+            context.subscriptions.len(),
+            MAX_SUBSCRIPTIONS_PER_CONNECTION
+        );
+        return Err(WsError::InvalidParams);
+    }
+
+    let max_filters = MAX_FILTERS_PER_SUBSCRIPTION;
     if params.filters.len() > max_filters {
         tracing::warn!(
             "WebSocket subscription request exceeds max filters limit: {} > {}",
@@ -30,7 +41,19 @@ pub(crate) async fn handle(
         .mint
         .pubsub_manager()
         .subscribe(params)
-        .map_err(|_| WsError::ParseError)?;
+        .map_err(|err| match err {
+            PubSubError::ParsingError(reason) => {
+                tracing::warn!(
+                    "Invalid WebSocket subscription params: {}",
+                    escape_control(&reason)
+                );
+                WsError::InvalidParams
+            }
+            other => {
+                tracing::error!("Could not subscribe: {other}");
+                WsError::InternalError
+            }
+        })?;
 
     let publisher = context.publisher.clone();
     let sub_id_for_sender = sub_id.clone();
@@ -42,9 +65,8 @@ pub(crate) async fn handle(
             }
         }),
     );
-    Ok(WsSubscribeResponse {
+    Ok(WsResponseResult {
         status: "OK".to_string(),
         sub_id,
-    }
-    .into())
+    })
 }

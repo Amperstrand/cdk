@@ -1,5 +1,6 @@
 //! Proof-related FFI types
 
+use std::fmt;
 use std::str::FromStr;
 
 use cdk::nuts::State as CdkState;
@@ -44,7 +45,7 @@ impl From<ProofState> for CdkState {
 }
 
 /// FFI-compatible Proof
-#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct Proof {
     /// Proof amount
     pub amount: Amount,
@@ -60,6 +61,20 @@ pub struct Proof {
     pub dleq: Option<ProofDleq>,
     /// Optional P2BK Ephemeral Public Key (NUT-28)
     pub p2pk_e: Option<String>,
+}
+
+impl fmt::Debug for Proof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Proof")
+            .field("amount", &self.amount)
+            .field("secret", &"[REDACTED]")
+            .field("c", &self.c)
+            .field("keyset_id", &self.keyset_id)
+            .field("witness", &self.witness)
+            .field("dleq", &self.dleq)
+            .field("p2pk_e", &self.p2pk_e)
+            .finish()
+    }
 }
 
 impl From<cdk::nuts::Proof> for Proof {
@@ -155,6 +170,24 @@ pub fn proof_verify_dleq(
 }
 
 /// Sign a P2PK proof with a secret key, returning a new signed proof
+///
+/// This is a low-level helper: it signs the proof's secret with exactly the key
+/// you pass and appends the signature to the proof's witness. It does not look
+/// at the proof's spending conditions, so a successful call does not mean the
+/// proof is now spendable.
+///
+/// # P2BK (NUT-28) proofs
+///
+/// A proof that carries `p2pk_e` is locked to a blinded public key, so its
+/// spending key is derived from the receiver's key, the ephemeral key and the
+/// key's slot in the conditions. This helper does not do that derivation.
+/// Passing the receiver's base key here signs with the wrong key, and the
+/// signature will not verify against the blinded key. The caller must pass the
+/// already-derived signing key.
+///
+/// To receive P2BK proofs without deriving anything yourself, put the base
+/// key(s) in `ReceiveOptions.p2pk_signing_keys` and receive through the wallet,
+/// which derives the signing key per proof and signs for you.
 #[uniffi::export]
 pub fn proof_sign_p2pk(proof: Proof, secret_key_hex: String) -> Result<Proof, FfiError> {
     let mut cdk_proof: cdk::nuts::Proof = proof.try_into()?;
@@ -172,7 +205,7 @@ pub fn proof_sign_p2pk(proof: Proof, secret_key_hex: String) -> Result<Proof, Ff
 pub type Proofs = Vec<Proof>;
 
 /// FFI-compatible DLEQ proof for proofs
-#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct ProofDleq {
     /// e value (hex-encoded SecretKey)
     pub e: String,
@@ -180,6 +213,16 @@ pub struct ProofDleq {
     pub s: String,
     /// r value - blinding factor (hex-encoded SecretKey)
     pub r: String,
+}
+
+impl fmt::Debug for ProofDleq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProofDleq")
+            .field("e", &"[REDACTED]")
+            .field("s", &"[REDACTED]")
+            .field("r", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// FFI-compatible DLEQ proof for blind signatures
@@ -364,7 +407,7 @@ pub fn encode_conditions(conditions: Conditions) -> Result<String, FfiError> {
 }
 
 /// FFI-compatible Witness
-#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Enum)]
+#[derive(Clone, Serialize, Deserialize, uniffi::Enum)]
 pub enum Witness {
     /// P2PK Witness
     P2PK {
@@ -378,6 +421,25 @@ pub enum Witness {
         /// Optional signatures
         signatures: Option<Vec<String>>,
     },
+}
+
+impl fmt::Debug for Witness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::P2PK { signatures } => f
+                .debug_struct("P2PK")
+                .field("signatures", signatures)
+                .finish(),
+            Self::HTLC {
+                preimage: _,
+                signatures,
+            } => f
+                .debug_struct("HTLC")
+                .field("preimage", &"[REDACTED]")
+                .field("signatures", signatures)
+                .finish(),
+        }
+    }
 }
 
 impl From<cdk::nuts::Witness> for Witness {
@@ -489,6 +551,13 @@ pub struct ProofInfo {
     pub spending_condition: Option<SpendingConditions>,
     /// Currency unit
     pub unit: CurrencyUnit,
+    /// NUT-13 derivation index for deterministic proofs, if known.
+    ///
+    /// Wallet-internal metadata used to prefer older deterministic proofs
+    /// during coin selection. Custom database implementations may persist
+    /// this field; leaving it unset keeps legacy selection behavior.
+    #[uniffi(default)]
+    pub derivation_index: Option<u32>,
     /// Operation ID that is using/spending this proof
     pub used_by_operation: Option<String>,
     /// Operation ID that created this proof
@@ -504,9 +573,36 @@ impl From<cdk::types::ProofInfo> for ProofInfo {
             state: info.state.into(),
             spending_condition: info.spending_condition.map(Into::into),
             unit: info.unit.into(),
+            derivation_index: info.derivation_index,
             used_by_operation: info.used_by_operation.map(|u| u.to_string()),
             created_by_operation: info.created_by_operation.map(|u| u.to_string()),
         }
+    }
+}
+
+impl TryFrom<ProofInfo> for cdk::types::ProofInfo {
+    type Error = FfiError;
+
+    fn try_from(info: ProofInfo) -> Result<Self, Self::Error> {
+        Ok(Self {
+            proof: info.proof.try_into()?,
+            y: info.y.try_into()?,
+            mint_url: info.mint_url.try_into()?,
+            state: info.state.into(),
+            spending_condition: info.spending_condition.map(TryInto::try_into).transpose()?,
+            unit: info.unit.into(),
+            derivation_index: info.derivation_index,
+            used_by_operation: info
+                .used_by_operation
+                .map(|id| uuid::Uuid::parse_str(&id))
+                .transpose()
+                .map_err(FfiError::internal)?,
+            created_by_operation: info
+                .created_by_operation
+                .map(|id| uuid::Uuid::parse_str(&id))
+                .transpose()
+                .map_err(FfiError::internal)?,
+        })
     }
 }
 
@@ -520,26 +616,7 @@ pub fn decode_proof_info(json: String) -> Result<ProofInfo, FfiError> {
 /// Encode ProofInfo to JSON string
 #[uniffi::export]
 pub fn encode_proof_info(info: ProofInfo) -> Result<String, FfiError> {
-    use std::str::FromStr;
-    // Convert to cdk::types::ProofInfo for serialization
-    let cdk_info = cdk::types::ProofInfo {
-        proof: info.proof.try_into()?,
-        y: info.y.try_into()?,
-        mint_url: info.mint_url.try_into()?,
-        state: info.state.into(),
-        spending_condition: info.spending_condition.and_then(|c| c.try_into().ok()),
-        unit: info.unit.into(),
-        used_by_operation: info
-            .used_by_operation
-            .map(|id| uuid::Uuid::from_str(&id))
-            .transpose()
-            .map_err(|e| FfiError::internal(e.to_string()))?,
-        created_by_operation: info
-            .created_by_operation
-            .map(|id| uuid::Uuid::from_str(&id))
-            .transpose()
-            .map_err(|e| FfiError::internal(e.to_string()))?,
-    };
+    let cdk_info: cdk::types::ProofInfo = info.try_into()?;
     Ok(serde_json::to_string(&cdk_info)?)
 }
 
@@ -551,7 +628,7 @@ pub struct ProofStateUpdate {
     /// Current state
     pub state: ProofState,
     /// Optional witness data
-    pub witness: Option<String>,
+    pub witness: Option<Witness>,
 }
 
 impl From<cdk::nuts::nut07::ProofState> for ProofStateUpdate {
@@ -559,7 +636,7 @@ impl From<cdk::nuts::nut07::ProofState> for ProofStateUpdate {
         Self {
             y: proof_state.y.to_string(),
             state: proof_state.state.into(),
-            witness: proof_state.witness.map(|w| format!("{:?}", w)),
+            witness: proof_state.witness.map(Into::into),
         }
     }
 }
@@ -581,4 +658,83 @@ pub fn decode_proof_state_update(json: String) -> Result<ProofStateUpdate, FfiEr
 #[uniffi::export]
 pub fn encode_proof_state_update(update: ProofStateUpdate) -> Result<String, FfiError> {
     Ok(serde_json::to_string(&update)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn htlc_witness_debug_redacts_preimage() {
+        let secret = "htlc-witness-preimage";
+        let witness = Witness::HTLC {
+            preimage: secret.to_string(),
+            signatures: Some(vec!["public-signature".to_string()]),
+        };
+
+        let debug = format!("{witness:?}");
+
+        assert!(debug.contains("public-signature"));
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("preimage: \"[REDACTED]\""));
+    }
+
+    #[test]
+    fn proof_state_update_debug_redacts_htlc_preimage() {
+        let secret = "htlc-preimage-that-authorizes-spending";
+        let proof_state = cdk::nuts::nut07::ProofState {
+            y: cdk::nuts::SecretKey::generate().public_key(),
+            state: CdkState::Spent,
+            witness: Some(cdk::nuts::Witness::HTLCWitness(
+                cdk::nuts::nut14::HTLCWitness {
+                    preimage: secret.to_string(),
+                    signatures: Some(vec!["public-signature".to_string()]),
+                },
+            )),
+        };
+
+        let update: ProofStateUpdate = proof_state.into();
+        match update.witness.as_ref() {
+            Some(Witness::HTLC {
+                preimage,
+                signatures,
+            }) => {
+                assert_eq!(preimage, secret);
+                assert_eq!(signatures, &Some(vec!["public-signature".to_string()]));
+            }
+            witness => panic!("expected HTLC witness, got {witness:?}"),
+        }
+
+        let debug = format!("{update:?}");
+
+        assert!(debug.contains("public-signature"));
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn proof_debug_redacts_spending_secret_and_dleq_scalars() {
+        let proof = Proof {
+            amount: Amount::new(1),
+            secret: "spendable-proof-secret".to_string(),
+            c: "public-signature".to_string(),
+            keyset_id: "public-keyset-id".to_string(),
+            witness: None,
+            dleq: Some(ProofDleq {
+                e: "dleq-e-scalar".to_string(),
+                s: "dleq-s-scalar".to_string(),
+                r: "secret-blinding-factor".to_string(),
+            }),
+            p2pk_e: None,
+        };
+
+        let debug = format!("{proof:?}");
+
+        assert!(debug.contains("public-signature"));
+        assert!(debug.contains("public-keyset-id"));
+        assert!(!debug.contains("spendable-proof-secret"));
+        assert!(!debug.contains("dleq-e-scalar"));
+        assert!(!debug.contains("dleq-s-scalar"));
+        assert!(!debug.contains("secret-blinding-factor"));
+    }
 }

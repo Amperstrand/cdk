@@ -2,7 +2,8 @@
 #![allow(missing_docs)]
 #![allow(clippy::missing_panics_doc)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Write};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +12,7 @@ use cdk_common::database::WalletDatabase;
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::{
-    CurrencyUnit, Id, KeySet, KeySetInfo, KeysetResponse, MeltMethodSettings, MintInfo,
+    CurrencyUnit, Id, KeySet, KeySetInfo, Keys, KeysetResponse, MeltMethodSettings, MintInfo,
     MintMethodSettings, MintVersion, MppMethodSettings, Proof,
 };
 use cdk_common::wallet::{MeltQuote, MintQuote};
@@ -20,15 +21,58 @@ use cdk_common::{
     MeltQuoteResponse, MeltRequest, MintQuoteRequest, MintQuoteResponse, MintRequest, MintResponse,
     RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::fmt::MakeWriter;
 
 use crate::nuts::{
-    nut17, nut19, BatchCheckMintQuoteRequest, BatchMintRequest, MeltQuoteBolt11Response,
-    MeltQuoteState, MintQuoteBolt11Response, NUT04Settings, NUT05Settings, PaymentMethod,
+    nut17, nut19, BatchCheckMintQuoteRequest, BatchMintRequest, BlindSignature, BlindedMessage,
+    MeltQuoteBolt11Response, MeltQuoteState, NUT04Settings, NUT05Settings, PaymentMethod,
     SecretKey, State,
 };
 use crate::secret::Secret;
 use crate::wallet::{MintConnector, Wallet};
 use crate::Error;
+
+/// In-memory writer for asserting on tracing output.
+#[derive(Debug, Clone, Default)]
+pub struct TraceWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl TraceWriter {
+    /// Build a subscriber that records span creation and events.
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_span_events(FmtSpan::NEW)
+            .without_time()
+            .finish()
+    }
+
+    /// Return all tracing output captured so far.
+    pub fn output(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Write for TraceWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for TraceWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 /// Create test database
 pub async fn create_test_db() -> Arc<dyn WalletDatabase<cdk_common::database::Error> + Send + Sync>
@@ -221,6 +265,7 @@ pub fn test_mint_info() -> MintInfo {
                         MintMethodSettings {
                             method: PaymentMethod::Known(KnownMethod::Bolt11),
                             unit: CurrencyUnit::Sat,
+                            method_name: None,
                             min_amount: Some(Amount::from(1_u64)),
                             max_amount: Some(Amount::from(500_000_u64)),
                             options: Some(crate::nuts::nut04::MintMethodOptions::Bolt11 {
@@ -230,6 +275,7 @@ pub fn test_mint_info() -> MintInfo {
                         MintMethodSettings {
                             method: PaymentMethod::Known(KnownMethod::Bolt12),
                             unit: CurrencyUnit::Sat,
+                            method_name: None,
                             min_amount: Some(Amount::from(1_u64)),
                             max_amount: Some(Amount::from(500_000_u64)),
                             options: None,
@@ -242,6 +288,7 @@ pub fn test_mint_info() -> MintInfo {
                         MeltMethodSettings {
                             method: PaymentMethod::Known(KnownMethod::Bolt11),
                             unit: CurrencyUnit::Sat,
+                            method_name: None,
                             min_amount: Some(Amount::from(1_u64)),
                             max_amount: Some(Amount::from(500_000_u64)),
                             options: None,
@@ -249,6 +296,7 @@ pub fn test_mint_info() -> MintInfo {
                         MeltMethodSettings {
                             method: PaymentMethod::Known(KnownMethod::Bolt12),
                             unit: CurrencyUnit::Sat,
+                            method_name: None,
                             min_amount: Some(Amount::from(1_u64)),
                             max_amount: Some(Amount::from(500_000_u64)),
                             options: None,
@@ -337,6 +385,21 @@ pub fn test_proof_info(
     cdk_common::wallet::ProofInfo::new(proof, mint_url, State::Unspent, CurrencyUnit::Sat).unwrap()
 }
 
+/// Create an inactive keyset with different keys and a properly computed ID.
+pub fn make_inactive_keyset() -> KeySet {
+    let mut ks = test_keyset();
+    ks.active = Some(false);
+    // Shift each key amount to produce different keys → different ID
+    let shifted_keys: std::collections::BTreeMap<_, _> = ks
+        .keys
+        .iter()
+        .map(|(amount, pk)| (Amount::from(amount.to_u64() * 2), *pk))
+        .collect();
+    ks.keys = Keys::new(shifted_keys);
+    ks.id = Id::v2_from_data(&ks.keys, &ks.unit, ks.input_fee_ppk, ks.final_expiry);
+    ks
+}
+
 /// Create a test melt quote
 pub fn test_melt_quote() -> MeltQuote {
     MeltQuote {
@@ -349,6 +412,8 @@ pub fn test_melt_quote() -> MeltQuote {
         state: MeltQuoteState::Unpaid,
         expiry: 9999999999,
         payment_proof: None,
+        estimated_blocks: None,
+        fee_index: None,
         payment_method: PaymentMethod::Known(KnownMethod::Bolt11),
         used_by_operation: None,
         version: 0,
@@ -386,6 +451,16 @@ pub async fn create_test_wallet_with_mock(
 ) -> Wallet {
     let seed = Mnemonic::generate(12).unwrap().to_seed_normalized("");
 
+    create_test_wallet_with_mock_seed(db, mock_client, seed).await
+}
+
+/// Create a test wallet with a mock client and a fixed seed, so tests can
+/// simulate reopening a wallet on the same database and seed.
+pub async fn create_test_wallet_with_mock_seed(
+    db: Arc<dyn WalletDatabase<cdk_common::database::Error> + Send + Sync>,
+    mock_client: Arc<MockMintConnector>,
+    seed: [u8; 64],
+) -> Wallet {
     crate::wallet::WalletBuilder::new()
         .mint_url(test_mint_url())
         .unit(CurrencyUnit::Sat)
@@ -396,11 +471,34 @@ pub async fn create_test_wallet_with_mock(
         .unwrap()
 }
 
+/// Create a test wallet with a mock client that uses HTTP polling for
+/// subscriptions instead of WebSocket.
+///
+/// Useful for exercising subscription-driven flows (e.g. `PendingMelt::wait`)
+/// deterministically against the mock connector, which has no WebSocket
+/// endpoint.
+pub async fn create_test_wallet_with_mock_http_subscription(
+    db: Arc<dyn WalletDatabase<cdk_common::database::Error> + Send + Sync>,
+    mock_client: Arc<MockMintConnector>,
+) -> Wallet {
+    let seed = Mnemonic::generate(12).unwrap().to_seed_normalized("");
+
+    crate::wallet::WalletBuilder::new()
+        .mint_url(test_mint_url())
+        .unit(CurrencyUnit::Sat)
+        .localstore(db)
+        .seed(seed)
+        .shared_client(mock_client)
+        .use_http_subscription()
+        .build()
+        .unwrap()
+}
+
 /// Mock MintConnector for testing recovery scenarios
 #[derive(Debug)]
 pub struct MockMintConnector {
     /// Mock mint keyset state
-    pub keyset: Mutex<KeySet>,
+    pub keysets: Mutex<Vec<KeySet>>,
     /// Mock mint info state
     pub mint_info: Mutex<MintInfo>,
     /// Response for post_check_state calls
@@ -409,10 +507,56 @@ pub struct MockMintConnector {
     pub restore_response: Mutex<Option<Result<RestoreResponse, Error>>>,
     /// Response for get_melt_quote_status calls
     pub melt_quote_status_response: Mutex<Option<Result<MeltQuoteBolt11Response<String>, Error>>>,
+    /// Queue of responses for successive get_melt_quote_status calls.
+    ///
+    /// When non-empty, each `get_melt_quote_status` call pops the front entry.
+    /// Takes precedence over `melt_quote_status_response`, letting a single
+    /// test stage a sequence of status responses (e.g. a subscription event
+    /// followed by an authoritative HTTP recheck).
+    pub melt_quote_status_responses:
+        Mutex<std::collections::VecDeque<Result<MeltQuoteResponse<String>, Error>>>,
     /// Response for post_mint calls
     pub post_mint_response: Mutex<Option<Result<MintResponse, Error>>>,
+    /// Queue of responses for successive post_mint_quote calls.
+    pub post_mint_quote_responses:
+        Mutex<std::collections::VecDeque<Result<MintQuoteResponse<String>, Error>>>,
+    /// Captured post_mint_quote requests.
+    pub post_mint_quote_requests: Mutex<Vec<MintQuoteRequest>>,
+    /// Queue of responses for successive post_mint calls.
+    pub post_mint_responses: Mutex<std::collections::VecDeque<Result<MintResponse, Error>>>,
+    /// Captured post_mint requests.
+    pub post_mint_requests: Mutex<Vec<(PaymentMethod, MintRequest<String>)>>,
+    /// Queue of responses for successive post_batch_mint calls.
+    pub post_batch_mint_responses: Mutex<std::collections::VecDeque<Result<MintResponse, Error>>>,
+    /// Captured post_batch_mint requests.
+    pub post_batch_mint_requests: Mutex<Vec<(PaymentMethod, BatchMintRequest<String>)>>,
+    /// Queue of responses for successive post_batch_check_mint_quote_status calls.
+    pub post_batch_check_mint_quote_status_responses:
+        Mutex<std::collections::VecDeque<Result<Vec<MintQuoteResponse<String>>, Error>>>,
+    /// Staged `get_mint_quote_status` responses by quote ID.
+    pub mint_quote_status_responses: Mutex<HashMap<String, MintQuoteResponse<String>>>,
+    /// Secret keys backing the active keyset when mint signing is enabled.
+    /// When set, unstaged `post_mint`/`post_batch_mint` calls are answered
+    /// with valid blind signatures for the requested outputs.
+    pub mint_signing_keys: Mutex<Option<BTreeMap<Amount, SecretKey>>>,
     /// Response for post_swap calls
     pub post_swap_response: Mutex<Option<Result<SwapResponse, Error>>>,
+    /// Queue of responses for successive post_swap calls.
+    ///
+    /// When non-empty, each `post_swap` call pops the front entry.
+    /// Takes precedence over `post_swap_response`.
+    pub post_swap_responses: Mutex<std::collections::VecDeque<Result<SwapResponse, Error>>>,
+    /// Captured post_swap requests for test verification.
+    pub captured_swap_requests: Mutex<Vec<SwapRequest>>,
+    /// Response for post_melt calls
+    pub post_melt_response: Mutex<Option<Result<MeltQuoteResponse<String>, Error>>>,
+    /// Queue of responses for successive post_melt_quote calls.
+    pub post_melt_quote_responses:
+        Mutex<std::collections::VecDeque<Result<MeltQuoteCreateResponse<String>, Error>>>,
+    /// Captured post_melt_quote requests.
+    pub post_melt_quote_requests: Mutex<Vec<MeltQuoteRequest>>,
+    /// Last post_melt method/request captured by the mock
+    pub last_post_melt_request: Mutex<Option<(PaymentMethod, MeltRequest<String>)>>,
     /// Response for LNURL pay request calls
     pub lnurl_pay_request_response:
         Mutex<Option<Result<crate::lightning_address::LnurlPayResponse, Error>>>,
@@ -422,6 +566,24 @@ pub struct MockMintConnector {
     /// Response for DNS TXT resolution calls
     #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
     pub dns_txt_response: Mutex<Option<Result<Vec<String>, Error>>>,
+    /// What the mock answers when asked whether a receiver URL can be paid.
+    ///
+    /// Defaults to [`PaymentRequestDeliverability::Unsupported`] to mirror the
+    /// `MintConnector` default, so a test paying an HTTP-only payment request
+    /// has to opt in.
+    pub payment_request_deliverability: Mutex<PaymentRequestDeliverability>,
+}
+
+/// What a [`MockMintConnector`] reports for a NUT-18 receiver URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentRequestDeliverability {
+    /// The connector cannot deliver payment requests at all.
+    Unsupported,
+    /// Proofs can be handed to the receiver.
+    Deliverable,
+    /// The transport would reach the receiver without verifying its
+    /// certificate.
+    UnverifiedTls,
 }
 
 impl Default for MockMintConnector {
@@ -436,17 +598,36 @@ impl MockMintConnector {
         let mint_info = test_mint_info();
 
         Self {
-            keyset: Mutex::new(keyset),
+            keysets: Mutex::new(vec![keyset]),
             mint_info: Mutex::new(mint_info),
             check_state_response: Mutex::new(None),
             restore_response: Mutex::new(None),
             melt_quote_status_response: Mutex::new(None),
+            melt_quote_status_responses: Mutex::new(std::collections::VecDeque::new()),
             post_mint_response: Mutex::new(None),
+            post_mint_quote_responses: Mutex::new(std::collections::VecDeque::new()),
+            post_mint_quote_requests: Mutex::new(Vec::new()),
+            post_mint_responses: Mutex::new(std::collections::VecDeque::new()),
+            post_mint_requests: Mutex::new(Vec::new()),
+            post_batch_mint_responses: Mutex::new(std::collections::VecDeque::new()),
+            post_batch_mint_requests: Mutex::new(Vec::new()),
+            post_batch_check_mint_quote_status_responses: Mutex::new(
+                std::collections::VecDeque::new(),
+            ),
+            mint_signing_keys: Mutex::new(None),
+            mint_quote_status_responses: Mutex::new(HashMap::new()),
             post_swap_response: Mutex::new(None),
+            post_swap_responses: Mutex::new(std::collections::VecDeque::new()),
+            captured_swap_requests: Mutex::new(Vec::new()),
+            post_melt_response: Mutex::new(None),
+            post_melt_quote_responses: Mutex::new(std::collections::VecDeque::new()),
+            post_melt_quote_requests: Mutex::new(Vec::new()),
+            last_post_melt_request: Mutex::new(None),
             lnurl_pay_request_response: Mutex::new(None),
             lnurl_invoice_response: Mutex::new(None),
             #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
             dns_txt_response: Mutex::new(None),
+            payment_request_deliverability: Mutex::new(PaymentRequestDeliverability::Unsupported),
         }
     }
 
@@ -456,11 +637,8 @@ impl MockMintConnector {
 
     pub fn set_mint_keys_response(&self, response: Result<Vec<KeySet>, Error>) {
         match response {
-            Ok(mut keysets) => {
-                let keyset = keysets
-                    .pop()
-                    .expect("MockMintConnector: empty keyset response");
-                *self.keyset.lock().unwrap() = keyset;
+            Ok(keysets) => {
+                *self.keysets.lock().unwrap() = keysets;
             }
             Err(_) => unimplemented!("error responses for key state are not supported"),
         }
@@ -468,25 +646,30 @@ impl MockMintConnector {
 
     pub fn set_mint_keyset_response(&self, response: Result<KeySet, Error>) {
         match response {
-            Ok(keyset) => *self.keyset.lock().unwrap() = keyset,
+            Ok(keyset) => {
+                let mut keysets = self.keysets.lock().unwrap();
+                if let Some(existing) = keysets.iter_mut().find(|k| k.id == keyset.id) {
+                    *existing = keyset;
+                } else {
+                    keysets.push(keyset);
+                }
+            }
             Err(_) => unimplemented!("error responses for key state are not supported"),
         }
     }
 
     pub fn set_mint_keysets_response(&self, response: Result<KeysetResponse, Error>) {
         match response {
-            Ok(keysets) => {
-                let keyset_info = keysets
-                    .keysets
-                    .into_iter()
-                    .next()
-                    .expect("MockMintConnector: empty keysets response");
-                let mut keyset = self.keyset.lock().unwrap();
-                keyset.id = keyset_info.id;
-                keyset.unit = keyset_info.unit;
-                keyset.active = Some(keyset_info.active);
-                keyset.input_fee_ppk = keyset_info.input_fee_ppk;
-                keyset.final_expiry = keyset_info.final_expiry;
+            Ok(resp) => {
+                let mut keysets = self.keysets.lock().unwrap();
+                for info in resp.keysets {
+                    if let Some(ks) = keysets.iter_mut().find(|k| k.id == info.id) {
+                        ks.unit = info.unit;
+                        ks.active = Some(info.active);
+                        ks.input_fee_ppk = info.input_fee_ppk;
+                        ks.final_expiry = info.final_expiry;
+                    }
+                }
             }
             Err(_) => unimplemented!("error responses for key state are not supported"),
         }
@@ -500,17 +683,7 @@ impl MockMintConnector {
     }
 
     pub fn set_active_keyset(&self, keyset: KeySet) {
-        self.set_mint_keys_response(Ok(vec![keyset.clone()]));
-        self.set_mint_keyset_response(Ok(keyset.clone()));
-        self.set_mint_keysets_response(Ok(KeysetResponse {
-            keysets: vec![KeySetInfo {
-                id: keyset.id,
-                unit: keyset.unit,
-                active: keyset.active.unwrap_or(true),
-                input_fee_ppk: keyset.input_fee_ppk,
-                final_expiry: keyset.final_expiry,
-            }],
-        }));
+        *self.keysets.lock().unwrap() = vec![keyset];
     }
 
     pub fn reset_default_mint_state(&self) {
@@ -529,12 +702,172 @@ impl MockMintConnector {
         *self.melt_quote_status_response.lock().unwrap() = Some(response);
     }
 
+    /// Enqueue a response for the next `get_melt_quote_status` call.
+    ///
+    /// Queued responses are consumed in FIFO order and take precedence over
+    /// any value set via [`set_melt_quote_status_response`](Self::set_melt_quote_status_response).
+    pub fn push_melt_quote_status_response(
+        &self,
+        response: Result<MeltQuoteBolt11Response<String>, Error>,
+    ) {
+        self.melt_quote_status_responses
+            .lock()
+            .unwrap()
+            .push_back(response.map(MeltQuoteResponse::Bolt11));
+    }
+
     pub fn set_post_mint_response(&self, response: Result<MintResponse, Error>) {
         *self.post_mint_response.lock().unwrap() = Some(response);
     }
 
+    /// Enqueue a response for the next `post_mint_quote` call.
+    pub fn push_post_mint_quote_response(
+        &self,
+        response: Result<MintQuoteResponse<String>, Error>,
+    ) {
+        self.post_mint_quote_responses
+            .lock()
+            .unwrap()
+            .push_back(response);
+    }
+
+    /// Return all captured `post_mint_quote` requests.
+    pub fn post_mint_quote_requests(&self) -> Vec<MintQuoteRequest> {
+        self.post_mint_quote_requests.lock().unwrap().clone()
+    }
+
+    /// Enqueue a response for the next `post_mint` call.
+    pub fn push_post_mint_response(&self, response: Result<MintResponse, Error>) {
+        self.post_mint_responses.lock().unwrap().push_back(response);
+    }
+
+    /// Return all captured `post_mint` requests.
+    pub fn post_mint_requests(&self) -> Vec<(PaymentMethod, MintRequest<String>)> {
+        self.post_mint_requests.lock().unwrap().clone()
+    }
+
+    /// Enqueue a response for the next `post_batch_mint` call.
+    pub fn push_post_batch_mint_response(&self, response: Result<MintResponse, Error>) {
+        self.post_batch_mint_responses
+            .lock()
+            .unwrap()
+            .push_back(response);
+    }
+
+    /// Return all captured `post_batch_mint` requests.
+    pub fn post_batch_mint_requests(&self) -> Vec<(PaymentMethod, BatchMintRequest<String>)> {
+        self.post_batch_mint_requests.lock().unwrap().clone()
+    }
+
+    /// Enqueue a response for the next `post_batch_check_mint_quote_status` call.
+    pub fn push_post_batch_check_mint_quote_status_response(
+        &self,
+        response: Result<Vec<MintQuoteResponse<String>>, Error>,
+    ) {
+        self.post_batch_check_mint_quote_status_responses
+            .lock()
+            .unwrap()
+            .push_back(response);
+    }
+
+    /// Stage the `get_mint_quote_status` response for a quote.
+    pub fn set_mint_quote_status_response(
+        &self,
+        quote_id: &str,
+        response: MintQuoteResponse<String>,
+    ) {
+        self.mint_quote_status_responses
+            .lock()
+            .unwrap()
+            .insert(quote_id.to_string(), response);
+    }
+
+    /// Replace the active keyset with one backed by freshly generated secret
+    /// keys, so that unstaged `post_mint`/`post_batch_mint` calls are
+    /// answered with valid blind signatures for the requested outputs.
+    pub fn enable_mint_signing(&self) {
+        let mut signing_keys = BTreeMap::new();
+        let mut public_keys = BTreeMap::new();
+        for power in 0..32u8 {
+            let amount = Amount::from(1u64 << power);
+            let secret_key =
+                SecretKey::from_slice(&[power + 1; 32]).expect("test key is a valid secret");
+            public_keys.insert(amount, secret_key.public_key());
+            signing_keys.insert(amount, secret_key);
+        }
+        let keys = Keys::new(public_keys);
+
+        self.set_active_keyset(KeySet {
+            id: Id::v1_from_keys(&keys),
+            unit: CurrencyUnit::Sat,
+            active: Some(true),
+            keys,
+            input_fee_ppk: 0,
+            final_expiry: None,
+        });
+        *self.mint_signing_keys.lock().unwrap() = Some(signing_keys);
+    }
+
+    /// Sign the requested outputs when mint signing is enabled.
+    fn sign_outputs(
+        &self,
+        outputs: &[BlindedMessage],
+    ) -> Option<Result<Vec<BlindSignature>, Error>> {
+        let signing_keys = self.mint_signing_keys.lock().unwrap();
+        let signing_keys = signing_keys.as_ref()?;
+
+        Some(
+            outputs
+                .iter()
+                .map(|output| {
+                    let secret_key = signing_keys.get(&output.amount).ok_or(Error::AmountKey)?;
+                    Ok(BlindSignature {
+                        amount: output.amount,
+                        keyset_id: output.keyset_id,
+                        c: crate::dhke::sign_message(secret_key, &output.blinded_secret)?,
+                        dleq: None,
+                    })
+                })
+                .collect(),
+        )
+    }
+
     pub fn set_post_swap_response(&self, response: Result<SwapResponse, Error>) {
         *self.post_swap_response.lock().unwrap() = Some(response);
+    }
+
+    /// Enqueue a response for the next `post_swap` call.
+    pub fn push_post_swap_response(&self, response: Result<SwapResponse, Error>) {
+        self.post_swap_responses.lock().unwrap().push_back(response);
+    }
+
+    /// Get all captured swap requests.
+    pub fn captured_swap_requests(&self) -> Vec<SwapRequest> {
+        self.captured_swap_requests.lock().unwrap().clone()
+    }
+
+    pub fn set_post_melt_response(&self, response: Result<MeltQuoteResponse<String>, Error>) {
+        *self.post_melt_response.lock().unwrap() = Some(response);
+    }
+
+    /// Enqueue a response for the next `post_melt_quote` call.
+    pub fn push_post_melt_quote_response(
+        &self,
+        response: Result<MeltQuoteCreateResponse<String>, Error>,
+    ) {
+        self.post_melt_quote_responses
+            .lock()
+            .unwrap()
+            .push_back(response);
+    }
+
+    /// Return all captured `post_melt_quote` requests.
+    pub fn post_melt_quote_requests(&self) -> Vec<MeltQuoteRequest> {
+        self.post_melt_quote_requests.lock().unwrap().clone()
+    }
+
+    pub fn last_post_melt_request(&self) -> Option<(PaymentMethod, MeltRequest<String>)> {
+        self.last_post_melt_request.lock().unwrap().clone()
     }
 
     pub fn set_lnurl_pay_request_response(
@@ -555,11 +888,32 @@ impl MockMintConnector {
     pub fn set_dns_txt_response(&self, response: Result<Vec<String>, Error>) {
         *self.dns_txt_response.lock().unwrap() = Some(response);
     }
+
+    pub fn set_payment_request_deliverability(&self, deliverability: PaymentRequestDeliverability) {
+        *self.payment_request_deliverability.lock().unwrap() = deliverability;
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl MintConnector for MockMintConnector {
+    fn ensure_payment_request_deliverable(&self, url: &str) -> Result<(), Error> {
+        match *self.payment_request_deliverability.lock().unwrap() {
+            PaymentRequestDeliverability::Unsupported => {
+                Err(Error::PaymentRequestDeliveryUnsupported)
+            }
+            PaymentRequestDeliverability::Deliverable => Ok(()),
+            PaymentRequestDeliverability::UnverifiedTls => {
+                let host = url::Url::parse(url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(ToString::to_string))
+                    .unwrap_or_else(|| url.to_string());
+
+                Err(Error::UnverifiedTlsEndpoint { host })
+            }
+        }
+    }
+
     #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
     async fn resolve_dns_txt(&self, _domain: &str) -> Result<Vec<String>, Error> {
         self.dns_txt_response
@@ -592,64 +946,99 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn get_mint_keys(&self) -> Result<Vec<crate::nuts::KeySet>, Error> {
-        Ok(vec![self.keyset.lock().unwrap().clone()])
+        Ok(self.keysets.lock().unwrap().clone())
     }
 
     async fn get_mint_keyset(&self, keyset_id: Id) -> Result<crate::nuts::KeySet, Error> {
-        let keyset = self.keyset.lock().unwrap().clone();
-
-        match keyset.id == keyset_id {
-            true => Ok(keyset),
-            false => Err(Error::UnknownKeySet),
-        }
+        self.keysets
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|ks| ks.id == keyset_id)
+            .cloned()
+            .ok_or(Error::UnknownKeySet)
     }
 
     async fn get_mint_keysets(&self) -> Result<KeysetResponse, Error> {
-        let keyset = self.keyset.lock().unwrap().clone();
+        let keysets = self.keysets.lock().unwrap();
 
         Ok(KeysetResponse {
-            keysets: vec![KeySetInfo {
-                id: keyset.id,
-                unit: keyset.unit,
-                active: keyset.active.unwrap_or(true),
-                input_fee_ppk: keyset.input_fee_ppk,
-                final_expiry: keyset.final_expiry,
-            }],
+            keysets: keysets
+                .iter()
+                .map(|ks| KeySetInfo {
+                    id: ks.id,
+                    unit: ks.unit.clone(),
+                    active: ks.active.unwrap_or(true),
+                    input_fee_ppk: ks.input_fee_ppk,
+                    final_expiry: ks.final_expiry,
+                })
+                .collect(),
         })
     }
 
     async fn post_mint_quote(
         &self,
-        _request: MintQuoteRequest,
+        request: MintQuoteRequest,
     ) -> Result<MintQuoteResponse<String>, Error> {
-        unimplemented!()
+        self.post_mint_quote_requests.lock().unwrap().push(request);
+        self.post_mint_quote_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("MockMintConnector: post_mint_quote called without configured response")
     }
 
     async fn get_mint_quote_status(
         &self,
         _method: PaymentMethod,
-        _quote_id: &str,
+        quote_id: &str,
     ) -> Result<MintQuoteResponse<String>, Error> {
-        unimplemented!()
+        self.mint_quote_status_responses
+            .lock()
+            .unwrap()
+            .get(quote_id)
+            .cloned()
+            .ok_or(Error::UnknownQuote)
     }
 
     async fn post_mint(
         &self,
-        _method: &PaymentMethod,
-        _request: MintRequest<String>,
+        method: &PaymentMethod,
+        request: MintRequest<String>,
     ) -> Result<MintResponse, Error> {
-        self.post_mint_response
+        self.post_mint_requests
             .lock()
             .unwrap()
-            .take()
-            .expect("MockMintConnector: post_mint called without configured response")
+            .push((method.clone(), request.clone()));
+
+        let queued = self.post_mint_responses.lock().unwrap().pop_front();
+        match queued {
+            Some(response) => response,
+            None => {
+                if let Some(signatures) = self.sign_outputs(&request.outputs) {
+                    return Ok(MintResponse {
+                        signatures: signatures?,
+                    });
+                }
+                self.post_mint_response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("MockMintConnector: post_mint called without configured response")
+            }
+        }
     }
 
     async fn post_melt_quote(
         &self,
-        _request: MeltQuoteRequest,
+        request: MeltQuoteRequest,
     ) -> Result<MeltQuoteCreateResponse<String>, Error> {
-        unimplemented!()
+        self.post_melt_quote_requests.lock().unwrap().push(request);
+        self.post_melt_quote_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("MockMintConnector: post_melt_quote called without configured response")
     }
 
     async fn get_melt_quote_status(
@@ -657,23 +1046,33 @@ impl MintConnector for MockMintConnector {
         _method: PaymentMethod,
         _quote_id: &str,
     ) -> Result<MeltQuoteResponse<String>, Error> {
-        let response = self
-            .melt_quote_status_response
-            .lock()
-            .unwrap()
-            .take()
-            .expect(
-                "MockMintConnector: get_melt_quote_status called without configured response",
-            )?;
+        let queued = self.melt_quote_status_responses.lock().unwrap().pop_front();
+        let response = match queued {
+            Some(response) => return response,
+            None => self
+                .melt_quote_status_response
+                .lock()
+                .unwrap()
+                .take()
+                .expect(
+                    "MockMintConnector: get_melt_quote_status called without configured response",
+                ),
+        }?;
         Ok(MeltQuoteResponse::Bolt11(response))
     }
 
-    async fn post_swap(&self, _request: SwapRequest) -> Result<SwapResponse, Error> {
-        self.post_swap_response
-            .lock()
-            .unwrap()
-            .take()
-            .expect("MockMintConnector: post_swap called without configured response")
+    async fn post_swap(&self, request: SwapRequest) -> Result<SwapResponse, Error> {
+        self.captured_swap_requests.lock().unwrap().push(request);
+        let queued = self.post_swap_responses.lock().unwrap().pop_front();
+        match queued {
+            Some(response) => response,
+            None => self
+                .post_swap_response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("MockMintConnector: post_swap called without configured response"),
+        }
     }
 
     async fn get_mint_info(&self) -> Result<crate::nuts::MintInfo, Error> {
@@ -707,25 +1106,52 @@ impl MintConnector for MockMintConnector {
 
     async fn post_melt(
         &self,
-        _method: &PaymentMethod,
-        _request: MeltRequest<String>,
+        method: &PaymentMethod,
+        request: MeltRequest<String>,
     ) -> Result<MeltQuoteResponse<String>, Error> {
-        unimplemented!()
+        *self.last_post_melt_request.lock().unwrap() = Some((method.clone(), request));
+        self.post_melt_response
+            .lock()
+            .unwrap()
+            .take()
+            .expect("MockMintConnector: post_melt called without configured response")
     }
 
     async fn post_batch_check_mint_quote_status(
         &self,
         _method: &PaymentMethod,
         _request: BatchCheckMintQuoteRequest<String>,
-    ) -> Result<Vec<MintQuoteBolt11Response<String>>, Error> {
-        unimplemented!()
+    ) -> Result<Vec<MintQuoteResponse<String>>, Error> {
+        self.post_batch_check_mint_quote_status_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect(
+                "MockMintConnector: post_batch_check_mint_quote_status called without configured response",
+            )
     }
 
     async fn post_batch_mint(
         &self,
-        _method: &PaymentMethod,
-        _request: BatchMintRequest<String>,
+        method: &PaymentMethod,
+        request: BatchMintRequest<String>,
     ) -> Result<MintResponse, Error> {
-        unimplemented!()
+        self.post_batch_mint_requests
+            .lock()
+            .unwrap()
+            .push((method.clone(), request.clone()));
+
+        let queued = self.post_batch_mint_responses.lock().unwrap().pop_front();
+        match queued {
+            Some(response) => response,
+            None => {
+                if let Some(signatures) = self.sign_outputs(&request.outputs) {
+                    return Ok(MintResponse {
+                        signatures: signatures?,
+                    });
+                }
+                panic!("MockMintConnector: post_batch_mint called without configured response")
+            }
+        }
     }
 }

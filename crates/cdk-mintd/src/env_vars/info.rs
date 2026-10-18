@@ -25,14 +25,6 @@ impl Info {
             }
         }
 
-        if let Ok(signatory_url) = env::var(ENV_SIGNATORY_URL) {
-            self.signatory_url = Some(signatory_url);
-        }
-
-        if let Ok(signatory_certs) = env::var(ENV_SIGNATORY_CERTS) {
-            self.signatory_certs = Some(signatory_certs);
-        }
-
         if let Ok(seed) = env::var(ENV_SEED) {
             self.seed = Some(seed);
         }
@@ -56,12 +48,6 @@ impl Info {
         if let Ok(fee_str) = env::var(ENV_INPUT_FEE_PPK) {
             if let Ok(fee) = fee_str.parse() {
                 self.input_fee_ppk = Some(fee);
-            }
-        }
-
-        if let Ok(swagger_str) = env::var(ENV_ENABLE_SWAGGER) {
-            if let Ok(enable) = swagger_str.parse() {
-                self.enable_swagger_ui = Some(enable);
             }
         }
 

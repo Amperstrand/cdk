@@ -1,13 +1,14 @@
-//! CDK Mint Lightning
+//! CDK mint payment backend interface
 
 use std::convert::Infallible;
+use std::fmt;
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use cashu::util::hex;
 use cashu::{Bolt11Invoice, MeltOptions};
 #[cfg(feature = "prometheus")]
-use cdk_prometheus::METRICS;
+use cdk_prometheus::MintMetricGuard;
 use futures::Stream;
 use lightning::offers::offer::Offer;
 use lightning_invoice::ParseOrSemanticError;
@@ -16,7 +17,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::mint::{MeltPaymentRequest, MeltQuote};
-use crate::nuts::{CurrencyUnit, MeltQuoteState};
+use crate::nuts::nut30::MeltQuoteOnchainFeeOption;
+use crate::nuts::{CurrencyUnit, MeltQuoteState, PublicKey};
 use crate::{Amount, QuoteId};
 
 /// CDK Payment Error
@@ -43,9 +45,12 @@ pub enum Error {
     /// Invalid expiry
     #[error("Invalid expiry")]
     InvalidExpiry,
-    /// Lightning Error
+    /// Payment backend error
     #[error(transparent)]
-    Lightning(Box<dyn std::error::Error + Send + Sync>),
+    Backend(Box<dyn std::error::Error + Send + Sync>),
+    /// Onchain Error
+    #[error(transparent)]
+    Onchain(Box<dyn std::error::Error + Send + Sync>),
     /// Serde Error
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
@@ -218,8 +223,8 @@ pub struct CustomIncomingPaymentOptions {
     pub method: String,
     /// Optional description for the payment request
     pub description: Option<String>,
-    /// Amount for the payment request
-    pub amount: Amount<CurrencyUnit>,
+    /// Optional amount for the payment request
+    pub amount: Option<Amount<CurrencyUnit>>,
     /// Optional expiry time as Unix timestamp in seconds
     pub unix_expiry: Option<u64>,
     /// Extra payment-method-specific fields as JSON string
@@ -227,6 +232,27 @@ pub struct CustomIncomingPaymentOptions {
     /// These fields are passed through to the payment processor for
     /// method-specific validation (e.g., ehash share).
     pub extra_json: Option<String>,
+    /// The mint's quote id for this mint quote. Generated before
+    /// `create_incoming_payment_request` is called, so backends whose rail is
+    /// keyed by the quote the wallet displays can register it up front and
+    /// use it as their stable correlation key — mirroring
+    /// [`OnchainIncomingPaymentOptions::quote_id`] and the melt-side
+    /// [`CustomOutgoingPaymentOptions::quote_id`].
+    pub quote_id: QuoteId,
+    /// NUT-20 locking pubkey of the quote, when the wallet supplied one.
+    ///
+    /// Lets backends enforce a locked-quotes-only policy at quote creation
+    /// for rails where the NUT-20 lock is the safety mechanism (the mint
+    /// itself only verifies signatures at mint time and does not require a
+    /// pubkey for custom methods).
+    pub pubkey: Option<PublicKey>,
+}
+
+/// Options for creating an onchain incoming payment request
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OnchainIncomingPaymentOptions {
+    /// Quote ID for the incoming payment
+    pub quote_id: QuoteId,
 }
 
 /// Options for incoming payments
@@ -238,6 +264,8 @@ pub enum IncomingPaymentOptions {
     Bolt12(Box<Bolt12IncomingPaymentOptions>),
     /// Custom payment method options
     Custom(Box<CustomIncomingPaymentOptions>),
+    /// Onchain payment request options
+    Onchain(OnchainIncomingPaymentOptions),
 }
 
 /// Options for BOLT11 outgoing payments
@@ -251,6 +279,11 @@ pub struct Bolt11OutgoingPaymentOptions {
     pub timeout_secs: Option<u64>,
     /// Melt options
     pub melt_options: Option<MeltOptions>,
+    /// The mint's quote id for this melt. Set in both `get_payment_quote`
+    /// and `make_payment` so backends can correlate the two calls. For
+    /// BOLT11 backends the payment_hash already provides correlation, so
+    /// this is informational; it is still required for protocol uniformity.
+    pub quote_id: QuoteId,
 }
 
 /// Options for BOLT12 outgoing payments
@@ -264,6 +297,8 @@ pub struct Bolt12OutgoingPaymentOptions {
     pub timeout_secs: Option<u64>,
     /// Melt options
     pub melt_options: Option<MeltOptions>,
+    /// The mint's quote id for this melt. See [`Bolt11OutgoingPaymentOptions::quote_id`].
+    pub quote_id: QuoteId,
 }
 
 /// Options for custom outgoing payments
@@ -273,6 +308,11 @@ pub struct CustomOutgoingPaymentOptions {
     pub method: String,
     /// Payment request string (method-specific format)
     pub request: String,
+    /// Optional payment amount.
+    ///
+    /// During quoting this is the amount requested by the wallet. During payment
+    /// execution this is the amount selected and persisted in the melt quote.
+    pub amount: Option<Amount<CurrencyUnit>>,
     /// Maximum fee amount allowed for the payment
     pub max_fee_amount: Option<Amount<CurrencyUnit>>,
     /// Optional timeout in seconds
@@ -284,6 +324,40 @@ pub struct CustomOutgoingPaymentOptions {
     /// These fields are passed through to the payment processor for
     /// method-specific validation.
     pub extra_json: Option<String>,
+    /// The mint's quote id for this melt. Custom backends should use this
+    /// as the stable correlation key between `get_payment_quote` and
+    /// `make_payment` (and any later `check_outgoing_payment` polls) — it
+    /// is the only field guaranteed to be unique per melt without relying
+    /// on wallet-supplied uniqueness in `request`.
+    pub quote_id: QuoteId,
+}
+
+/// Options for onchain outgoing payments
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OnchainOutgoingPaymentOptions {
+    /// Bitcoin address to send to
+    pub address: String,
+    /// Payment amount
+    pub amount: Amount<CurrencyUnit>,
+    /// Maximum fee amount allowed for the payment
+    pub max_fee_amount: Option<Amount<CurrencyUnit>>,
+    /// Opaque stable identifier supplied by the mint.
+    ///
+    /// The mint generates this value and uses it to correlate the quote with
+    /// subsequent `make_payment` and `check_outgoing_payment` calls. Backends
+    /// MUST NOT synthesize or modify this value. Backends MUST persist it
+    /// (for example as the send intent id) and echo it verbatim in
+    /// [`PaymentQuoteResponse::request_lookup_id`] and
+    /// [`MakePaymentResponse::payment_lookup_id`] as
+    /// `PaymentIdentifier::QuoteId(..)`. The mint layer validates the echo
+    /// and will reject quotes whose backend response disagrees with the
+    /// supplied `quote_id` (see
+    /// [`Error::OnchainQuoteLookupIdMismatch`](crate::Error::OnchainQuoteLookupIdMismatch)).
+    pub quote_id: QuoteId,
+    /// Selected fee option index (mirrors the quote's chosen `fee_options[i].fee_index`)
+    pub fee_index: Option<u32>,
+    /// Opaque metadata as a JSON string for future extensions
+    pub metadata: Option<String>,
 }
 
 /// Options for outgoing payments
@@ -295,6 +369,8 @@ pub enum OutgoingPaymentOptions {
     Bolt12(Box<Bolt12OutgoingPaymentOptions>),
     /// Custom payment method options
     Custom(Box<CustomOutgoingPaymentOptions>),
+    /// Onchain payment options
+    Onchain(Box<OnchainOutgoingPaymentOptions>),
 }
 
 impl OutgoingPaymentOptions {
@@ -303,6 +379,7 @@ impl OutgoingPaymentOptions {
         melt_quote: MeltQuote,
     ) -> Result<OutgoingPaymentOptions, Error> {
         let fee_reserve = melt_quote.fee_reserve();
+        let quote_id = melt_quote.id.clone();
         match &melt_quote.request {
             MeltPaymentRequest::Bolt11 { bolt11 } => Ok(OutgoingPaymentOptions::Bolt11(Box::new(
                 Bolt11OutgoingPaymentOptions {
@@ -310,6 +387,7 @@ impl OutgoingPaymentOptions {
                     timeout_secs: None,
                     bolt11: bolt11.clone(),
                     melt_options: melt_quote.options,
+                    quote_id,
                 },
             ))),
             MeltPaymentRequest::Bolt12 { offer } => {
@@ -325,6 +403,7 @@ impl OutgoingPaymentOptions {
                         timeout_secs: None,
                         offer: *offer.clone(),
                         melt_options,
+                        quote_id,
                     },
                 )))
             }
@@ -332,10 +411,27 @@ impl OutgoingPaymentOptions {
                 Box::new(CustomOutgoingPaymentOptions {
                     method: method.to_string(),
                     request: request.to_string(),
+                    // Use the amount selected by the backend when the quote was
+                    // created. The original request amount may have differed.
+                    amount: Some(melt_quote.amount()),
                     max_fee_amount: Some(fee_reserve),
                     timeout_secs: None,
                     melt_options: melt_quote.options,
-                    extra_json: None,
+                    extra_json: melt_quote
+                        .extra_json
+                        .as_ref()
+                        .map(serde_json::Value::to_string),
+                    quote_id,
+                }),
+            )),
+            MeltPaymentRequest::Onchain { address } => Ok(OutgoingPaymentOptions::Onchain(
+                Box::new(OnchainOutgoingPaymentOptions {
+                    address: address.clone(),
+                    amount: melt_quote.amount(),
+                    max_fee_amount: Some(fee_reserve),
+                    quote_id: melt_quote.id,
+                    fee_index: melt_quote.selected_fee_index,
+                    metadata: None,
                 }),
             )),
         }
@@ -345,7 +441,7 @@ impl OutgoingPaymentOptions {
 /// Mint payment trait
 #[async_trait]
 pub trait MintPayment {
-    /// Mint Lightning Error
+    /// Payment backend error
     type Err: Into<Error> + From<Error>;
 
     /// Start the payment processor
@@ -405,6 +501,13 @@ pub trait MintPayment {
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err>;
 
     /// Check the status of an outgoing payment
+    ///
+    /// The reported status must be conservative about finality. The mint
+    /// treats `Unpaid` and `Failed` as authoritative terminal outcomes and
+    /// may compensate the melt, returning the reserved proofs to the user.
+    /// A backend that cannot guarantee a not-paid payment will never
+    /// settle — for example because an orchestrator may be between attempts
+    /// of the same payment — MUST report `Pending` or `Unknown` instead.
     async fn check_outgoing_payment(
         &self,
         payment_identifier: &PaymentIdentifier,
@@ -455,7 +558,7 @@ impl WaitPaymentResponse {
 /// Create incoming payment response
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateIncomingPaymentResponse {
-    /// Id that is used to look up the payment from the ln backend
+    /// Id that is used to look up the payment from the payment backend
     pub request_lookup_id: PaymentIdentifier,
     /// Payment request
     pub request: String,
@@ -470,16 +573,47 @@ pub struct CreateIncomingPaymentResponse {
 }
 
 /// Payment response
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 pub struct MakePaymentResponse {
     /// Payment hash
+    ///
+    /// For onchain payments, this MUST be
+    /// `PaymentIdentifier::QuoteId(quote_id)` where `quote_id` is the value
+    /// supplied by the mint in
+    /// [`OnchainOutgoingPaymentOptions::quote_id`]. See that field for the
+    /// full echo contract.
     pub payment_lookup_id: PaymentIdentifier,
     /// Payment proof
     pub payment_proof: Option<String>,
-    /// Status
+    /// Status.
+    ///
+    /// When this response is returned by [`MintPayment::make_payment`],
+    /// [`MeltQuoteState::Failed`] and [`MeltQuoteState::Unpaid`] are treated as
+    /// authoritative terminal outcomes. Backends must return
+    /// [`MeltQuoteState::Pending`], [`MeltQuoteState::Unknown`], or an error if
+    /// they are uncertain whether payment dispatch can still settle.
     pub status: MeltQuoteState,
-    /// Total Amount Spent (typed with unit for compile-time safety)
+    /// Total amount spent, including fees. Only authoritative when `status`
+    /// is [`MeltQuoteState::Paid`]; otherwise backends return `0`.
+    /// Successful [`MintPayment::make_payment`] responses must use the requested
+    /// quote unit, rounding the combined principal and fees up when necessary.
+    /// [`MintPayment::check_outgoing_payment`] may return the backend's native
+    /// unit; the mint converts it conservatively for settlement.
     pub total_spent: Amount<CurrencyUnit>,
+}
+
+impl fmt::Debug for MakePaymentResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MakePaymentResponse")
+            .field("payment_lookup_id", &self.payment_lookup_id)
+            .field(
+                "payment_proof",
+                &self.payment_proof.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("status", &self.status)
+            .field("total_spent", &self.total_spent)
+            .finish()
+    }
 }
 
 impl MakePaymentResponse {
@@ -493,6 +627,13 @@ impl MakePaymentResponse {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct PaymentQuoteResponse {
     /// Request look up id
+    ///
+    /// For onchain quotes, this MUST be
+    /// `Some(PaymentIdentifier::QuoteId(quote_id))` where `quote_id` is the
+    /// value supplied by the mint in
+    /// [`OnchainOutgoingPaymentOptions::quote_id`]. The mint validates this
+    /// echo and rejects mismatches — see
+    /// [`OnchainOutgoingPaymentOptions::quote_id`] for the full contract.
     pub request_lookup_id: Option<PaymentIdentifier>,
     /// Amount (typed with unit for compile-time safety)
     pub amount: Amount<CurrencyUnit>,
@@ -502,6 +643,23 @@ pub struct PaymentQuoteResponse {
     pub state: MeltQuoteState,
     /// Extra payment-method-specific fields
     pub extra_json: Option<serde_json::Value>,
+    /// Estimated confirmation target in blocks for onchain quotes.
+    ///
+    /// Onchain backends must return explicit `fee_options`; this field remains
+    /// a convenience mirror of the quoted or selected confirmation target.
+    pub estimated_blocks: Option<u32>,
+    /// Explicit onchain fee options the backend is willing to honor.
+    ///
+    /// For onchain melt quotes the mint enforces that `fee_options` is
+    /// non-empty.
+    ///
+    /// Backends assign stable `fee_index` values and must be able to honor the
+    /// selected value later in [`OnchainOutgoingPaymentOptions::fee_index`].
+    /// The mint validates, persists, and exposes these values unchanged.
+    /// Onchain backends must return `Some(vec)` here. Empty vectors produce
+    /// [`Error::OnchainFeeOptionsEmpty`](crate::Error::OnchainFeeOptionsEmpty),
+    /// and the quote is not persisted.
+    pub fee_options: Option<Vec<MeltQuoteOnchainFeeOption>>,
 }
 
 impl PaymentQuoteResponse {
@@ -527,9 +685,23 @@ pub struct Bolt11Settings {
 pub struct Bolt12Settings {
     /// Amountless offer support
     pub amountless: bool,
+    /// Offer description supported
+    pub invoice_description: bool,
+}
+
+/// Onchain settings
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OnchainSettings {
+    /// Number of confirmations required
+    pub confirmations: u32,
+    /// Minimum incoming onchain payment amount accepted by the backend
+    pub min_receive_amount_sat: u64,
+    /// Minimum outgoing onchain payment amount accepted by the backend
+    pub min_send_amount_sat: u64,
 }
 
 /// Payment processor settings response
+/// Mirrors the proto SettingsResponse structure
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsResponse {
     /// Base unit of backend
@@ -538,6 +710,8 @@ pub struct SettingsResponse {
     pub bolt11: Option<Bolt11Settings>,
     /// BOLT12 settings (None if not supported)
     pub bolt12: Option<Bolt12Settings>,
+    /// Onchain settings (None if not supported)
+    pub onchain: Option<OnchainSettings>,
     /// Custom payment methods settings (method name -> settings data)
     #[serde(default)]
     pub custom: std::collections::HashMap<String, String>,
@@ -597,39 +771,30 @@ where
     type Err = T::Err;
 
     async fn start(&self) -> Result<(), Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("start");
+        let metrics = MintMetricGuard::new("start");
 
         let result = self.inner.start().await;
 
-        let duration = start.elapsed().as_secs_f64();
-        METRICS.record_mint_operation_histogram("start", result.is_ok(), duration);
-        METRICS.dec_in_flight_requests("start");
+        metrics.record(result.is_ok());
 
         result
     }
 
     async fn stop(&self) -> Result<(), Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("stop");
+        let metrics = MintMetricGuard::new("stop");
 
         let result = self.inner.stop().await;
 
-        let duration = start.elapsed().as_secs_f64();
-        METRICS.record_mint_operation_histogram("stop", result.is_ok(), duration);
-        METRICS.dec_in_flight_requests("stop");
+        metrics.record(result.is_ok());
 
         result
     }
     async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("get_settings");
+        let metrics = MintMetricGuard::new("get_settings");
 
         let result = self.inner.get_settings().await;
 
-        let duration = start.elapsed().as_secs_f64();
-        METRICS.record_mint_operation_histogram("get_settings", result.is_ok(), duration);
-        METRICS.dec_in_flight_requests("get_settings");
+        metrics.record(result.is_ok());
 
         result
     }
@@ -638,18 +803,11 @@ where
         &self,
         options: IncomingPaymentOptions,
     ) -> Result<CreateIncomingPaymentResponse, Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("create_incoming_payment_request");
+        let metrics = MintMetricGuard::new("create_incoming_payment_request");
 
         let result = self.inner.create_incoming_payment_request(options).await;
 
-        let duration = start.elapsed().as_secs_f64();
-        METRICS.record_mint_operation_histogram(
-            "create_incoming_payment_request",
-            result.is_ok(),
-            duration,
-        );
-        METRICS.dec_in_flight_requests("create_incoming_payment_request");
+        metrics.record(result.is_ok());
 
         result
     }
@@ -659,38 +817,24 @@ where
         unit: &CurrencyUnit,
         options: OutgoingPaymentOptions,
     ) -> Result<PaymentQuoteResponse, Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("get_payment_quote");
+        let metrics = MintMetricGuard::new("get_payment_quote");
 
         let result = self.inner.get_payment_quote(unit, options).await;
 
-        let duration = start.elapsed().as_secs_f64();
-        let success = result.is_ok();
-
-        if let Ok(ref quote) = result {
-            let amount: f64 = quote.amount.value() as f64;
-            let fee: f64 = quote.fee.value() as f64;
-            METRICS.record_lightning_payment(amount, fee);
-        }
-
-        METRICS.record_mint_operation_histogram("get_payment_quote", success, duration);
-        METRICS.dec_in_flight_requests("get_payment_quote");
+        metrics.record(result.is_ok());
 
         result
     }
     async fn wait_payment_event(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Event> + Send>>, Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("wait_payment_event");
+        let metrics = MintMetricGuard::new("wait_payment_event");
 
         let result = self.inner.wait_payment_event().await;
 
-        let duration = start.elapsed().as_secs_f64();
         let success = result.is_ok();
 
-        METRICS.record_mint_operation_histogram("wait_payment_event", success, duration);
-        METRICS.dec_in_flight_requests("wait_payment_event");
+        metrics.record(success);
 
         result
     }
@@ -700,16 +844,13 @@ where
         unit: &CurrencyUnit,
         options: OutgoingPaymentOptions,
     ) -> Result<MakePaymentResponse, Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("make_payment");
+        let metrics = MintMetricGuard::new("make_payment");
 
         let result = self.inner.make_payment(unit, options).await;
 
-        let duration = start.elapsed().as_secs_f64();
         let success = result.is_ok();
 
-        METRICS.record_mint_operation_histogram("make_payment", success, duration);
-        METRICS.dec_in_flight_requests("make_payment");
+        metrics.record(success);
 
         result
     }
@@ -726,21 +867,14 @@ where
         &self,
         payment_identifier: &PaymentIdentifier,
     ) -> Result<Vec<WaitPaymentResponse>, Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("check_incoming_payment_status");
+        let metrics = MintMetricGuard::new("check_incoming_payment_status");
 
         let result = self
             .inner
             .check_incoming_payment_status(payment_identifier)
             .await;
 
-        let duration = start.elapsed().as_secs_f64();
-        METRICS.record_mint_operation_histogram(
-            "check_incoming_payment_status",
-            result.is_ok(),
-            duration,
-        );
-        METRICS.dec_in_flight_requests("check_incoming_payment_status");
+        metrics.record(result.is_ok());
 
         result
     }
@@ -749,16 +883,13 @@ where
         &self,
         payment_identifier: &PaymentIdentifier,
     ) -> Result<MakePaymentResponse, Self::Err> {
-        let start = std::time::Instant::now();
-        METRICS.inc_in_flight_requests("check_outgoing_payment");
+        let metrics = MintMetricGuard::new("check_outgoing_payment");
 
         let result = self.inner.check_outgoing_payment(payment_identifier).await;
 
-        let duration = start.elapsed().as_secs_f64();
         let success = result.is_ok();
 
-        METRICS.record_mint_operation_histogram("check_outgoing_payment", success, duration);
-        METRICS.dec_in_flight_requests("check_outgoing_payment");
+        metrics.record(success);
 
         result
     }
@@ -775,8 +906,25 @@ mod tests {
     use crate::QuoteId;
 
     #[test]
+    fn make_payment_response_debug_redacts_payment_proof() {
+        let secret = "backend-payment-preimage-secret";
+        let response = MakePaymentResponse {
+            payment_lookup_id: PaymentIdentifier::CustomId("public-lookup-id".to_string()),
+            payment_proof: Some(secret.to_string()),
+            status: MeltQuoteState::Paid,
+            total_spent: Amount::new(10, CurrencyUnit::Sat),
+        };
+
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("public-lookup-id"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(secret));
+    }
+
+    #[test]
     fn test_payment_identifier_quote_id_roundtrip() {
-        let quote_id = QuoteId::new_uuid();
+        let quote_id = QuoteId::new();
         let identifier = PaymentIdentifier::QuoteId(quote_id.clone());
 
         let kind = identifier.kind();

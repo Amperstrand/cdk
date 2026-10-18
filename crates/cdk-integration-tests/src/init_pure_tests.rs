@@ -16,9 +16,8 @@ use cdk::mint::{MintBuilder, MintMeltLimits};
 use cdk::nuts::nut00::ProofsMethods;
 use cdk::nuts::{
     BatchCheckMintQuoteRequest, BatchMintRequest, CheckStateRequest, CheckStateResponse,
-    CurrencyUnit, Id, KeySet, KeysetResponse, MeltRequest, MintInfo, MintQuoteBolt11Response,
-    MintRequest, MintResponse, PaymentMethod, RestoreRequest, RestoreResponse, SwapRequest,
-    SwapResponse,
+    CurrencyUnit, Id, KeySet, KeysetResponse, MeltRequest, MintInfo, MintRequest, MintResponse,
+    PaymentMethod, RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
 use cdk::types::{FeeReserve, QuoteTTL};
 use cdk::util::unix_time;
@@ -124,12 +123,21 @@ impl MintConnector for DirectMintConnection {
                     _ => Err(Error::InvalidPaymentMethod),
                 }
             }
+            MintQuoteRequest::Onchain(req) => {
+                let response = self.mint.get_mint_quote(req.into()).await?;
+                match response {
+                    cdk_common::MintQuoteResponse::Onchain(r) => {
+                        Ok(MintQuoteResponse::Onchain(r.to_string_id()))
+                    }
+                    _ => Err(Error::InvalidPaymentMethod),
+                }
+            }
         }
     }
 
     async fn get_mint_quote_status(
         &self,
-        _method: PaymentMethod,
+        method: PaymentMethod,
         quote_id: &str,
     ) -> Result<MintQuoteResponse<String>, Error> {
         let response = self
@@ -138,9 +146,37 @@ impl MintConnector for DirectMintConnection {
             .await?
             .first()
             .ok_or(Error::UnknownQuote)?
-            .clone()
-            .into();
-        Ok(MintQuoteResponse::Bolt11(response))
+            .clone();
+
+        match method {
+            PaymentMethod::Known(KnownMethod::Bolt11) => match response {
+                cdk_common::MintQuoteResponse::Bolt11(r) => {
+                    Ok(MintQuoteResponse::Bolt11(r.to_string_id()))
+                }
+                _ => Err(Error::InvalidPaymentMethod),
+            },
+            PaymentMethod::Known(KnownMethod::Bolt12) => match response {
+                cdk_common::MintQuoteResponse::Bolt12(r) => {
+                    Ok(MintQuoteResponse::Bolt12(r.to_string_id()))
+                }
+                _ => Err(Error::InvalidPaymentMethod),
+            },
+            PaymentMethod::Known(KnownMethod::Onchain) => match response {
+                cdk_common::MintQuoteResponse::Onchain(r) => {
+                    Ok(MintQuoteResponse::Onchain(r.to_string_id()))
+                }
+                _ => Err(Error::InvalidPaymentMethod),
+            },
+            PaymentMethod::Custom(_) => match response {
+                cdk_common::MintQuoteResponse::Custom { method, response } => {
+                    Ok(MintQuoteResponse::Custom {
+                        method,
+                        response: response.to_string_id(),
+                    })
+                }
+                _ => Err(Error::InvalidPaymentMethod),
+            },
+        }
     }
 
     async fn post_mint(
@@ -158,7 +194,7 @@ impl MintConnector for DirectMintConnection {
         &self,
         _method: &PaymentMethod,
         request: BatchCheckMintQuoteRequest<String>,
-    ) -> Result<Vec<MintQuoteBolt11Response<String>>, Error> {
+    ) -> Result<Vec<MintQuoteResponse<String>>, Error> {
         let quote_ids: Vec<QuoteId> = request
             .quotes
             .iter()
@@ -225,6 +261,15 @@ impl MintConnector for DirectMintConnection {
                     _ => Err(Error::InvalidPaymentMethod),
                 }
             }
+            MeltQuoteRequest::Onchain(req) => {
+                let response = self.mint.get_melt_quote(req.into()).await?;
+                match response {
+                    cdk_common::MeltQuoteCreateResponse::Onchain(r) => {
+                        Ok(MeltQuoteCreateResponse::Onchain(r.into()))
+                    }
+                    _ => Err(Error::InvalidPaymentMethod),
+                }
+            }
         }
     }
 
@@ -257,6 +302,12 @@ impl MintConnector for DirectMintConnection {
                 }
                 _ => Err(Error::InvalidPaymentMethod),
             },
+            PaymentMethod::Known(KnownMethod::Onchain) => match response {
+                cdk_common::MeltQuoteResponse::Onchain(r) => {
+                    Ok(MeltQuoteResponse::Onchain(r.into()))
+                }
+                _ => Err(Error::InvalidPaymentMethod),
+            },
         }
     }
 
@@ -284,6 +335,12 @@ impl MintConnector for DirectMintConnection {
             PaymentMethod::Custom(_) => match response {
                 cdk_common::MeltQuoteResponse::Custom((quote_method, r)) => {
                     Ok(MeltQuoteResponse::Custom((quote_method, r.to_string_id())))
+                }
+                _ => Err(Error::InvalidPaymentMethod),
+            },
+            PaymentMethod::Known(KnownMethod::Onchain) => match response {
+                cdk_common::MeltQuoteResponse::Onchain(r) => {
+                    Ok(MeltQuoteResponse::Onchain(r.into()))
                 }
                 _ => Err(Error::InvalidPaymentMethod),
             },
@@ -393,7 +450,8 @@ pub async fn create_mint_with_fee(fee_ppk: u64) -> Result<Mint> {
         HashSet::default(),
         2,
         CurrencyUnit::Sat,
-    );
+    )
+    .with_custom_payment_methods(HashMap::from([("paypal".to_string(), "{}".to_string())]));
 
     mint_builder
         .add_payment_processor(
@@ -476,7 +534,8 @@ pub async fn create_mint_with_limits(limits: Option<(usize, usize)>) -> Result<M
         HashSet::default(),
         2,
         CurrencyUnit::Sat,
-    );
+    )
+    .with_custom_payment_methods(HashMap::from([("paypal".to_string(), "{}".to_string())]));
 
     mint_builder
         .add_payment_processor(
@@ -572,6 +631,7 @@ pub async fn create_test_wallet_for_mint_with_seed(mint: Mint, seed: [u8; 64]) -
         .localstore(localstore)
         .seed(seed)
         .client(connector)
+        .use_http_subscription()
         .build()?;
 
     Ok(wallet)

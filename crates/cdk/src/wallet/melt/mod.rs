@@ -34,14 +34,18 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::time::Duration;
 
 use cdk_common::util::unix_time;
-use cdk_common::wallet::{MeltQuote, Transaction, TransactionDirection};
+use cdk_common::wallet::{
+    CrossMintTransferQuote, MeltPrepareOptions, MeltQuote, MeltSagaState, OperationData,
+    Transaction, TransactionDirection, TransactionStatus, WalletSaga, WalletSagaState,
+};
 use cdk_common::{Error, MeltQuoteState, PaymentMethod, ProofsMethods, State};
 use tracing::instrument;
 use uuid::Uuid;
@@ -60,6 +64,7 @@ mod custom;
 mod melt_bip353;
 #[cfg(feature = "wallet")]
 mod melt_lightning_address;
+mod onchain;
 pub(crate) mod saga;
 
 use saga::state::Prepared;
@@ -81,9 +86,18 @@ pub struct PendingMelt<'a> {
     metadata: HashMap<String, String>,
 }
 
+/// Outcome of reconciling a non-`Paid` subscription event against the mint's
+/// authoritative HTTP melt-quote status.
+enum WaitStep<'a> {
+    /// The melt reached a terminal outcome (finalized, failed, or recovered).
+    Terminal(Result<FinalizedMelt, Error>),
+    /// The status is still inconclusive; keep waiting with this pending melt.
+    Continue(PendingMelt<'a>),
+}
+
 impl<'a> PendingMelt<'a> {
     /// Wait for the melt to complete by polling the mint.
-    async fn wait(self) -> Result<FinalizedMelt, Error> {
+    async fn wait(mut self) -> Result<FinalizedMelt, Error> {
         let quote_id = self.saga.quote().id.clone();
         let wallet = self.saga.wallet;
         let operation_id = self.saga.state_data.operation_id;
@@ -99,6 +113,13 @@ impl<'a> PendingMelt<'a> {
             PaymentMethod::Known(KnownMethod::Bolt12) => {
                 wallet
                     .subscribe(WalletSubscription::Bolt12MeltQuoteState(vec![
+                        quote_id.clone()
+                    ]))
+                    .await
+            }
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                wallet
+                    .subscribe(WalletSubscription::MeltQuoteOnchainState(vec![
                         quote_id.clone()
                     ]))
                     .await
@@ -125,6 +146,12 @@ impl<'a> PendingMelt<'a> {
                 Some(event) => {
                     let notification = event.into_inner();
 
+                    // `payment_proof` is the method-specific settlement
+                    // artifact: Lightning preimage for Bolt11/Bolt12/Custom,
+                    // broadcast outpoint (`txid:vout`) for Onchain. Either
+                    // presence signals an irreversible mint-side action and
+                    // is used by the failure path below to block proof
+                    // reversion.
                     let (response_quote_id, state, payment_proof, change) = match notification {
                         NotificationPayload::MeltQuoteBolt11Response(response) => (
                             response.quote,
@@ -144,6 +171,15 @@ impl<'a> PendingMelt<'a> {
                             response.payment_preimage,
                             response.change,
                         ),
+                        NotificationPayload::MeltQuoteOnchainResponse(response) => {
+                            // The outpoint is surfaced as the payment proof.
+                            (
+                                response.quote,
+                                response.state,
+                                response.outpoint,
+                                response.change,
+                            )
+                        }
                         _ => continue,
                     };
 
@@ -169,11 +205,7 @@ impl<'a> PendingMelt<'a> {
                                 tracing::debug!("Received WS with no change checking with HTTP");
 
                                 match self.saga.wallet.internal_check_melt_status(&quote_id).await {
-                                    Ok(response) => match response {
-                                        MeltQuoteStatusResponse::Standard(r) => r.change,
-                                        MeltQuoteStatusResponse::Bolt12(r) => r.change,
-                                        MeltQuoteStatusResponse::Custom(r) => r.change,
-                                    },
+                                    Ok(response) => response.change(),
                                     Err(e) => {
                                         tracing::warn!(
                                             "Failed to check melt status via HTTP: {}",
@@ -211,8 +243,31 @@ impl<'a> PendingMelt<'a> {
                         MeltQuoteState::Failed
                         | MeltQuoteState::Unpaid
                         | MeltQuoteState::Unknown => {
-                            self.saga.handle_failure().await;
-                            return Err(Error::PaymentFailed);
+                            // Safety: if the mint has emitted a payment
+                            // proof (Lightning preimage or Onchain
+                            // outpoint), an irreversible settlement
+                            // artifact exists. Do not revert proofs —
+                            // continue waiting for the next subscription
+                            // event or reconciliation to resolve the
+                            // state.
+                            if payment_proof.is_some() {
+                                tracing::warn!(
+                                    "Melt quote {} reported {:?} via WS but \
+                                     carries a payment proof; continuing to \
+                                     wait to avoid proof loss",
+                                    quote_id,
+                                    state
+                                );
+                                continue;
+                            }
+
+                            match self.reconcile_non_paid_status(state).await {
+                                WaitStep::Terminal(result) => return result,
+                                WaitStep::Continue(pending) => {
+                                    self = pending;
+                                    continue;
+                                }
+                            }
                         }
                         MeltQuoteState::Pending => continue,
                     }
@@ -221,6 +276,98 @@ impl<'a> PendingMelt<'a> {
                     let err = Error::Custom("Subscription closed".to_string());
                     return wallet.recover_failed_melt_confirm(operation_id, err).await;
                 }
+            }
+        }
+    }
+
+    /// Reconcile a non-`Paid` subscription event against the mint's HTTP
+    /// melt-quote status.
+    ///
+    /// A subscription (WebSocket) event can report `Failed`/`Unpaid`/`Unknown`
+    /// before the mint has finished settling the payment. Before treating the
+    /// melt as failed and reverting proofs, this performs an authoritative HTTP
+    /// status check:
+    ///
+    /// - HTTP `Paid` → finalize the melt (recovering on a finalize error).
+    /// - HTTP `Pending`/`Unknown` → inconclusive, keep waiting.
+    /// - HTTP `Failed`/`Unpaid` with a payment proof → keep waiting to avoid
+    ///   reverting proofs the mint has already settled.
+    /// - HTTP `Failed`/`Unpaid` without a payment proof → release proofs and
+    ///   fail.
+    /// - HTTP check error → run melt recovery before surfacing an error.
+    ///
+    /// The caller is expected to have already handled the case where the
+    /// subscription event itself carries a payment proof.
+    async fn reconcile_non_paid_status(self, ws_state: MeltQuoteState) -> WaitStep<'a> {
+        let quote_id = self.saga.quote().id.clone();
+        let wallet = self.saga.wallet;
+        let operation_id = self.saga.state_data.operation_id;
+
+        match wallet.internal_check_melt_status(&quote_id).await {
+            Ok(response) => match response.state() {
+                MeltQuoteState::Paid => {
+                    match self
+                        .saga
+                        .finalize(
+                            response.state(),
+                            response.payment_proof(),
+                            response.change(),
+                            self.metadata,
+                        )
+                        .await
+                    {
+                        Ok(finalized) => WaitStep::Terminal(Ok(FinalizedMelt::new(
+                            finalized.quote_id().to_string(),
+                            finalized.state(),
+                            finalized.payment_proof().map(|s| s.to_string()),
+                            finalized.amount(),
+                            finalized.fee_paid(),
+                            finalized.into_change(),
+                        ))),
+                        Err(err) => WaitStep::Terminal(
+                            wallet.recover_failed_melt_confirm(operation_id, err).await,
+                        ),
+                    }
+                }
+                MeltQuoteState::Pending | MeltQuoteState::Unknown => {
+                    tracing::warn!(
+                        "Melt quote {} reported {:?} via WS but \
+                         HTTP status is {:?}; continuing to wait",
+                        quote_id,
+                        ws_state,
+                        response.state()
+                    );
+                    WaitStep::Continue(self)
+                }
+                MeltQuoteState::Failed | MeltQuoteState::Unpaid => {
+                    if response.payment_proof().is_some() {
+                        tracing::warn!(
+                            "Melt quote {} reported {:?} via WS and \
+                             {:?} via HTTP but carries a payment proof; \
+                             continuing to wait to avoid proof loss",
+                            quote_id,
+                            ws_state,
+                            response.state()
+                        );
+                        return WaitStep::Continue(self);
+                    }
+
+                    match self.saga.handle_failure().await {
+                        Ok(()) => WaitStep::Terminal(Err(Error::PaymentFailed)),
+                        Err(error) => WaitStep::Terminal(Err(error)),
+                    }
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    "Melt quote {} reported {:?} via WS but \
+                     HTTP status check failed: {}. Running recovery \
+                     before returning an error.",
+                    quote_id,
+                    ws_state,
+                    err
+                );
+                WaitStep::Terminal(wallet.recover_failed_melt_confirm(operation_id, err).await)
             }
         }
     }
@@ -250,6 +397,8 @@ pub(crate) enum MeltQuoteStatusResponse {
     Standard(cdk_common::MeltQuoteBolt11Response<String>),
     /// Bolt12 response
     Bolt12(cdk_common::MeltQuoteBolt12Response<String>),
+    /// Onchain response
+    Onchain(cdk_common::MeltQuoteOnchainResponse<String>),
     /// Custom payment method response
     Custom(cdk_common::MeltQuoteCustomResponse<String>),
 }
@@ -260,24 +409,73 @@ impl MeltQuoteStatusResponse {
         match self {
             Self::Standard(r) => r.state,
             Self::Bolt12(r) => r.state,
+            Self::Onchain(r) => r.state,
             Self::Custom(r) => r.state,
         }
     }
 
-    /// Get the payment preimage
+    /// Get the payment proof.
+    ///
+    /// For Bolt11/Bolt12/Custom methods this is the Lightning payment preimage.
+    /// For Onchain, the "proof" is the broadcast outpoint (`txid:vout`) — it
+    /// plays the same role: it is the canonical, method-specific artifact that
+    /// proves the mint executed the payment. Callers that persist
+    /// `payment_proof` on a `MeltQuote` will keep the txid reference alongside
+    /// other methods' preimages.
     pub fn payment_proof(&self) -> Option<String> {
         match self {
             Self::Standard(r) => r.payment_preimage.clone(),
             Self::Bolt12(r) => r.payment_preimage.clone(),
+            Self::Onchain(r) => r.outpoint.clone(),
             Self::Custom(r) => r.payment_preimage.clone(),
         }
     }
 
+    /// Get the change signatures
+    pub fn change(&self) -> Option<Vec<crate::nuts::BlindSignature>> {
+        match self {
+            Self::Standard(r) => r.change.clone(),
+            Self::Bolt12(r) => r.change.clone(),
+            Self::Onchain(r) => r.change.clone(),
+            Self::Custom(r) => r.change.clone(),
+        }
+    }
+
     /// Convert to standard response (for Bolt11).
-    /// Returns error for Custom payment methods and Bolt12 (since types differ).
+    ///
+    /// Also supports the Onchain variant by synthesizing a standard-shaped
+    /// response: the broadcast outpoint (`txid:vout`) is used as the
+    /// `payment_preimage` because onchain treats the outpoint as its
+    /// payment proof (the on-wire artifact proving the mint executed the
+    /// payment), analogous to the Lightning preimage. Returns error for
+    /// Custom payment methods and Bolt12 (since their types differ
+    /// meaningfully).
     pub fn into_standard(self) -> Result<cdk_common::MeltQuoteBolt11Response<String>, Error> {
         match self {
             Self::Standard(r) => Ok(r),
+            Self::Onchain(r) => Ok(cdk_common::MeltQuoteBolt11Response {
+                quote: r.quote,
+                amount: r.amount,
+                fee_reserve: r
+                    .selected_fee_index
+                    .and_then(|selected| {
+                        r.fee_options
+                            .iter()
+                            .find(|option| option.fee_index == selected)
+                    })
+                    .or_else(|| r.fee_options.first())
+                    .map(|option| option.fee_reserve)
+                    .unwrap_or(Amount::ZERO),
+                state: r.state,
+                expiry: r.expiry,
+                // Onchain uses `outpoint` as payment proof; surface it here
+                // via the `payment_preimage` slot for parity with Bolt11/Bolt12.
+                payment_preimage: r.outpoint,
+                change: r.change,
+                request: Some(r.request),
+                unit: Some(r.unit),
+                method: PaymentMethod::Known(KnownMethod::Onchain),
+            }),
             _ => Err(Error::Custom(
                 "Cannot convert response to standard bolt11 response".to_string(),
             )),
@@ -334,6 +532,11 @@ impl<'a> PreparedMelt<'a> {
         self.saga.proofs()
     }
 
+    /// Get the transaction metadata for this melt.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
+    }
+
     /// Get the proofs that need to be swapped
     pub fn proofs_to_swap(&self) -> &Proofs {
         self.saga.proofs_to_swap()
@@ -385,8 +588,13 @@ impl<'a> PreparedMelt<'a> {
                 .total_amount()
                 .unwrap_or(Amount::ZERO);
         let quote = self.saga.quote();
-        let needed = quote.amount + quote.fee_reserve + self.input_fee_without_swap();
-        all_proofs_total.checked_sub(needed).unwrap_or(Amount::ZERO)
+        let needed = quote
+            .amount
+            .checked_add(quote.fee_reserve)
+            .and_then(|a| a.checked_add(self.input_fee_without_swap()));
+        needed
+            .and_then(|n| all_proofs_total.checked_sub(n))
+            .unwrap_or(Amount::ZERO)
     }
 
     /// Confirm the prepared melt and execute the payment.
@@ -543,11 +751,20 @@ impl<'a> PreparedMelt<'a> {
         self,
         options: MeltConfirmOptions,
     ) -> Result<MeltOutcome<'a>, Error> {
-        let operation_id = self.saga.operation_id();
-        let wallet = self.saga.wallet;
+        let mut saga = self.saga;
+        let operation_id = saga.operation_id();
+        let wallet = saga.wallet;
         let metadata = self.metadata;
+        let db_saga = wallet
+            .localstore
+            .get_saga(&operation_id)
+            .await?
+            .ok_or(Error::Custom("Saga not found".to_string()))?;
+        wallet.ensure_melt_saga_state(&db_saga, MeltSagaState::ProofsReserved)?;
+        let metadata = wallet.melt_saga_metadata(&db_saga, metadata)?;
+        saga.state_data.saga = db_saga;
 
-        let melt_requested = match self.saga.request_melt_with_options(options).await {
+        let melt_requested = match saga.request_melt_with_options(options).await {
             Ok(melt_requested) => melt_requested,
             Err(err) => {
                 let finalized = wallet
@@ -601,6 +818,269 @@ impl Debug for PreparedMelt<'_> {
 }
 
 impl Wallet {
+    async fn persist_cross_mint_transfer_quote(
+        &self,
+        target_wallet: &Wallet,
+        quote: CrossMintTransferQuote,
+    ) -> Result<CrossMintTransferQuote, Error> {
+        target_wallet
+            .localstore
+            .add_mint_quote(quote.mint_quote.clone())
+            .await?;
+
+        if let Err(error) = self
+            .localstore
+            .add_melt_quote(quote.melt_quote.clone())
+            .await
+        {
+            if let Err(cleanup_error) = target_wallet
+                .localstore
+                .remove_mint_quote(&quote.mint_quote.id)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to remove mint quote {} after melt quote persistence failed: {}",
+                    quote.mint_quote.id,
+                    cleanup_error
+                );
+            }
+
+            return Err(Error::Database(error));
+        }
+
+        Ok(quote)
+    }
+
+    /// Create quotes for transferring the maximum amount allowed by the source
+    /// balance and both mints' advertised BOLT11 limits.
+    ///
+    /// The destination wallet creates a BOLT11 mint quote and this wallet asks
+    /// its mint for the corresponding melt quote. Because the melt fee reserve
+    /// can depend on the invoice amount, the method repeats this process until
+    /// the destination amount fits the source balance after both the melt fee
+    /// reserve and the input fee for all unspent source proofs.
+    ///
+    /// The returned plan assumes all currently unspent source proofs are used.
+    /// To preserve that accounting, prepare the melt with
+    /// [`Wallet::prepare_melt_proofs`] and confirm it with
+    /// [`MeltConfirmOptions::skip_swap`].
+    ///
+    /// The melt fee is a reserve. If the actual Lightning fee is lower, the
+    /// source mint can return the difference as change, so a successful melt
+    /// may leave a small source balance.
+    ///
+    /// The returned plan covers one Lightning payment. If an advertised quote
+    /// maximum is below the source balance, complete the plan and call this
+    /// method again to transfer the remaining balance.
+    ///
+    /// # Remote side effects
+    ///
+    /// Finding the maximum can require several probes because the source mint's
+    /// fee reserve is only known after the destination mint creates an invoice.
+    /// Every probe creates a mint quote at the destination and a melt quote at
+    /// the source. Only the returned pair is persisted locally; the other remote
+    /// quotes cannot be cancelled and remain at their mints until they expire.
+    /// Avoid calling this method speculatively or in an unbounded loop.
+    #[instrument(skip_all)]
+    pub async fn cross_mint_transfer_quote_max(
+        &self,
+        target_wallet: &Wallet,
+    ) -> Result<CrossMintTransferQuote, Error> {
+        const MAX_QUOTE_ATTEMPTS: usize = u64::BITS as usize;
+
+        ensure_cdk!(self.unit == target_wallet.unit, Error::UnsupportedUnit);
+
+        let proofs = self.get_unspent_proofs().await?;
+        let balance = proofs.total_amount()?;
+        ensure_cdk!(balance > Amount::ZERO, Error::InsufficientFunds);
+
+        let input_fee = self.get_proofs_fee(&proofs).await?.total;
+        let available_for_payment = balance
+            .checked_sub(input_fee)
+            .ok_or(Error::InsufficientFunds)?;
+        ensure_cdk!(
+            available_for_payment > Amount::ZERO,
+            Error::InsufficientFunds
+        );
+
+        let method = PaymentMethod::Known(KnownMethod::Bolt11);
+        let source_mint_info = self.load_mint_info().await?;
+        let target_mint_info = target_wallet.load_mint_info().await?;
+        let source_settings = source_mint_info
+            .nuts
+            .nut05
+            .get_settings(&self.unit, &method);
+        let target_settings = target_mint_info
+            .nuts
+            .nut04
+            .get_settings(&target_wallet.unit, &method);
+        let minimum_amount = source_settings
+            .as_ref()
+            .and_then(|settings| settings.min_amount)
+            .into_iter()
+            .chain(
+                target_settings
+                    .as_ref()
+                    .and_then(|settings| settings.min_amount),
+            )
+            .max()
+            .unwrap_or(Amount::ONE)
+            .max(Amount::ONE);
+        let maximum_amount = source_settings
+            .as_ref()
+            .and_then(|settings| settings.max_amount)
+            .into_iter()
+            .chain(
+                target_settings
+                    .as_ref()
+                    .and_then(|settings| settings.max_amount),
+            )
+            .fold(available_for_payment, Amount::min);
+        ensure_cdk!(maximum_amount >= minimum_amount, Error::InsufficientFunds);
+
+        let mut amount = maximum_amount;
+        let mut attempted_amounts = HashSet::new();
+        let mut best_feasible: Option<CrossMintTransferQuote> = None;
+        let mut lowest_infeasible: Option<Amount> = None;
+
+        for _ in 0..MAX_QUOTE_ATTEMPTS {
+            attempted_amounts.insert(amount);
+
+            let mint_quote = target_wallet
+                .request_mint_quote(method.clone(), Some(amount), None, None)
+                .await?;
+            let melt_quote = self
+                .request_melt_bolt11_quote(mint_quote.request.clone(), None)
+                .await?;
+
+            tracing::debug!(
+                attempt = attempted_amounts.len(),
+                amount = %amount,
+                destination_mint_quote_id = %mint_quote.id,
+                source_melt_quote_id = %melt_quote.id,
+                "Created remote quote pair while searching for maximum cross-mint transfer"
+            );
+
+            let total_required = melt_quote
+                .amount
+                .checked_add(melt_quote.fee_reserve)
+                .and_then(|required| required.checked_add(input_fee))
+                .ok_or(Error::AmountOverflow)?;
+            let plan = CrossMintTransferQuote {
+                mint_quote,
+                melt_quote,
+                input_fee,
+            };
+
+            match total_required.cmp(&balance) {
+                std::cmp::Ordering::Equal => {
+                    return self
+                        .persist_cross_mint_transfer_quote(target_wallet, plan)
+                        .await;
+                }
+                std::cmp::Ordering::Less => {
+                    if best_feasible
+                        .as_ref()
+                        .is_none_or(|best| plan.melt_quote.amount > best.melt_quote.amount)
+                    {
+                        best_feasible = Some(plan.clone());
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    lowest_infeasible = Some(
+                        lowest_infeasible
+                            .map(|current| current.min(amount))
+                            .unwrap_or(amount),
+                    );
+                }
+            }
+
+            if total_required <= balance && amount == maximum_amount {
+                return self
+                    .persist_cross_mint_transfer_quote(target_wallet, plan)
+                    .await;
+            }
+
+            let estimated_amount = available_for_payment.checked_sub(plan.melt_quote.fee_reserve);
+            let mut next_amount = estimated_amount
+                .unwrap_or_else(|| Amount::from(amount.to_u64() / 2))
+                .clamp(minimum_amount, maximum_amount);
+            if let (Some(best), Some(upper)) = (&best_feasible, lowest_infeasible) {
+                let lower = best.melt_quote.amount;
+                let lower_value = lower.to_u64();
+                let upper_value = upper.to_u64();
+                if upper_value.saturating_sub(lower_value) <= 1 {
+                    return self
+                        .persist_cross_mint_transfer_quote(target_wallet, best.clone())
+                        .await;
+                }
+
+                if next_amount <= lower
+                    || next_amount >= upper
+                    || attempted_amounts.contains(&next_amount)
+                {
+                    next_amount = Amount::from(lower_value + (upper_value - lower_value) / 2);
+                }
+            }
+
+            ensure_cdk!(next_amount > Amount::ZERO, Error::InsufficientFunds);
+
+            if attempted_amounts.contains(&next_amount) {
+                return match best_feasible {
+                    Some(best) => {
+                        self.persist_cross_mint_transfer_quote(target_wallet, best)
+                            .await
+                    }
+                    None => Err(Error::InsufficientFunds),
+                };
+            }
+
+            amount = next_amount;
+        }
+
+        match best_feasible {
+            Some(best) => {
+                self.persist_cross_mint_transfer_quote(target_wallet, best)
+                    .await
+            }
+            None => Err(Error::InsufficientFunds),
+        }
+    }
+
+    fn melt_saga_metadata(
+        &self,
+        saga: &WalletSaga,
+        fallback: HashMap<String, String>,
+    ) -> Result<HashMap<String, String>, Error> {
+        let OperationData::Melt(data) = &saga.data else {
+            return Err(Error::InvalidOperationState);
+        };
+
+        if data.metadata.is_empty() {
+            Ok(fallback)
+        } else {
+            Ok(data.metadata.clone())
+        }
+    }
+
+    fn ensure_melt_saga_state(
+        &self,
+        saga: &WalletSaga,
+        expected: MeltSagaState,
+    ) -> Result<(), Error> {
+        ensure_cdk!(
+            saga.mint_url == self.mint_url && saga.unit == self.unit,
+            Error::InvalidOperationState
+        );
+
+        let WalletSagaState::Melt(state) = saga.state else {
+            return Err(Error::InvalidOperationState);
+        };
+
+        ensure_cdk!(state == expected, Error::InvalidOperationState);
+        Ok(())
+    }
+
     /// Prepare a melt operation without executing it.
     #[instrument(skip(self, metadata))]
     pub async fn prepare_melt(
@@ -625,10 +1105,35 @@ impl Wallet {
         proofs: crate::nuts::Proofs,
         metadata: HashMap<String, String>,
     ) -> Result<PreparedMelt<'_>, Error> {
+        self.prepare_melt_proofs_with_options(
+            quote_id,
+            proofs,
+            MeltPrepareOptions {
+                metadata,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Prepare a melt operation with specific proofs and additional options.
+    ///
+    /// P2PK/HTLC-locked proofs are signed before being reserved, using
+    /// `options.p2pk_signing_keys` plus any signing keys known to the wallet,
+    /// mirroring how [`receive_proofs`](Wallet::receive_proofs) resolves keys.
+    /// HTLC preimages from `options.preimages` are attached to matching
+    /// proofs. SIG_ALL-locked proofs are rejected: their witness must commit
+    /// to the melt request's change outputs, which only exist at confirmation.
+    #[instrument(skip(self, proofs, options))]
+    pub async fn prepare_melt_proofs_with_options(
+        &self,
+        quote_id: &str,
+        proofs: crate::nuts::Proofs,
+        options: MeltPrepareOptions,
+    ) -> Result<PreparedMelt<'_>, Error> {
+        let metadata = options.metadata.clone();
         let saga = MeltSaga::new(self);
-        let prepared_saga = saga
-            .prepare_with_proofs(quote_id, proofs, metadata.clone())
-            .await?;
+        let prepared_saga = saga.prepare_with_proofs(quote_id, proofs, options).await?;
 
         Ok(PreparedMelt {
             saga: prepared_saga,
@@ -647,17 +1152,39 @@ impl Wallet {
         encoded_token: &str,
         metadata: HashMap<String, String>,
     ) -> Result<PreparedMelt<'_>, Error> {
+        self.prepare_melt_token_with_options(
+            quote_id,
+            encoded_token,
+            MeltPrepareOptions {
+                metadata,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Prepare a melt operation from an encoded token with additional options.
+    ///
+    /// Same as [`prepare_melt_token`](Wallet::prepare_melt_token), with locked
+    /// inputs handled as described in
+    /// [`prepare_melt_proofs_with_options`](Wallet::prepare_melt_proofs_with_options).
+    #[instrument(skip(self, encoded_token, options))]
+    pub async fn prepare_melt_token_with_options(
+        &self,
+        quote_id: &str,
+        encoded_token: &str,
+        options: MeltPrepareOptions,
+    ) -> Result<PreparedMelt<'_>, Error> {
         let token = Token::from_str(encoded_token)?;
 
         let unit = token.unit().unwrap_or_default();
         ensure_cdk!(unit == self.unit, Error::UnsupportedUnit);
         ensure_cdk!(self.mint_url == token.mint_url()?, Error::IncorrectMint);
 
-        let keysets_info = self.load_mint_keysets().await?;
-        println!("{:?}", keysets_info);
-        let proofs = token.proofs(&keysets_info)?;
+        let proofs = self.token_proofs(&token).await?;
 
-        self.prepare_melt_proofs(quote_id, proofs, metadata).await
+        self.prepare_melt_proofs_with_options(quote_id, proofs, options)
+            .await
     }
 
     /// Finalize pending melt operations.
@@ -761,6 +1288,8 @@ impl Wallet {
             .get_saga(&operation_id)
             .await?
             .ok_or(Error::Custom("Saga not found".to_string()))?;
+        self.ensure_melt_saga_state(&db_saga, MeltSagaState::ProofsReserved)?;
+        let metadata = self.melt_saga_metadata(&db_saga, metadata)?;
 
         let saga = MeltSaga::from_prepared(
             self,
@@ -798,6 +1327,151 @@ impl Wallet {
                     metadata,
                 };
                 pending.wait().await
+            }
+        }
+    }
+
+    /// Internal method called by `PreparedMelt::confirm_prefer_async_with_options`
+    /// with cached data.
+    ///
+    /// Not intended for direct use - use
+    /// [`PreparedMelt::confirm_prefer_async_with_options`] instead.
+    #[doc(hidden)]
+    #[instrument(skip(self, proofs, proofs_to_swap, metadata, options))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn confirm_prepared_melt_prefer_async_with_options(
+        &self,
+        operation_id: Uuid,
+        quote: MeltQuote,
+        proofs: Proofs,
+        proofs_to_swap: Proofs,
+        input_fee: Amount,
+        input_fee_without_swap: Amount,
+        metadata: HashMap<String, String>,
+        options: MeltConfirmOptions,
+    ) -> Result<MeltOutcome<'_>, Error> {
+        let db_saga = self
+            .localstore
+            .get_saga(&operation_id)
+            .await?
+            .ok_or(Error::Custom("Saga not found".to_string()))?;
+        self.ensure_melt_saga_state(&db_saga, MeltSagaState::ProofsReserved)?;
+        let metadata = self.melt_saga_metadata(&db_saga, metadata)?;
+
+        let saga = MeltSaga::from_prepared(
+            self,
+            operation_id,
+            quote,
+            proofs,
+            proofs_to_swap,
+            input_fee,
+            input_fee_without_swap,
+            db_saga,
+        );
+
+        let melt_requested = match saga.request_melt_with_options(options).await {
+            Ok(melt_requested) => melt_requested,
+            Err(err) => {
+                let finalized = self.recover_failed_melt_confirm(operation_id, err).await?;
+                return Ok(MeltOutcome::Paid(finalized));
+            }
+        };
+
+        let result = match melt_requested.execute_async(metadata.clone()).await {
+            Ok(result) => result,
+            Err(err) => {
+                let finalized = self.recover_failed_melt_confirm(operation_id, err).await?;
+                return Ok(MeltOutcome::Paid(finalized));
+            }
+        };
+
+        match result {
+            MeltSagaResult::Finalized(finalized) => Ok(MeltOutcome::Paid(FinalizedMelt::new(
+                finalized.quote_id().to_string(),
+                finalized.state(),
+                finalized.payment_proof().map(|s| s.to_string()),
+                finalized.amount(),
+                finalized.fee_paid(),
+                finalized.into_change(),
+            ))),
+            MeltSagaResult::Pending(pending_saga) => Ok(MeltOutcome::Pending(PendingMelt {
+                saga: pending_saga,
+                metadata,
+            })),
+        }
+    }
+
+    /// Wait for a pending melt identified by persisted saga details.
+    ///
+    /// This patch-compatible FFI helper polls the existing saga recovery path
+    /// until the mint reports a terminal state. The richer restart-safe
+    /// reconstruction path lives in the 0.18 melt recovery changes.
+    #[doc(hidden)]
+    #[instrument(skip(self))]
+    pub async fn wait_pending_melt(
+        &self,
+        operation_id: Uuid,
+        quote_id: &str,
+        payment_method: PaymentMethod,
+    ) -> Result<FinalizedMelt, Error> {
+        use cdk_common::wallet::{MeltSagaState, OperationData, WalletSagaState};
+
+        loop {
+            let db_saga = self
+                .localstore
+                .get_saga(&operation_id)
+                .await?
+                .ok_or(Error::Custom("Saga not found".to_string()))?;
+
+            ensure_cdk!(
+                db_saga.mint_url == self.mint_url && db_saga.unit == self.unit,
+                Error::Custom("Saga belongs to a different wallet".to_string())
+            );
+
+            let WalletSagaState::Melt(state) = &db_saga.state else {
+                return Err(Error::Custom(format!(
+                    "Invalid saga state type for melt saga {}",
+                    operation_id
+                )));
+            };
+
+            ensure_cdk!(
+                matches!(
+                    state,
+                    MeltSagaState::MeltRequested | MeltSagaState::PaymentPending
+                ),
+                Error::InvalidOperationState
+            );
+
+            let OperationData::Melt(data) = &db_saga.data else {
+                return Err(Error::Custom(format!(
+                    "Invalid operation data type for melt saga {}",
+                    operation_id
+                )));
+            };
+
+            ensure_cdk!(
+                data.quote_id == quote_id,
+                Error::Custom("Pending melt quote ID does not match saga".to_string())
+            );
+
+            let quote = self
+                .localstore
+                .get_melt_quote(quote_id)
+                .await?
+                .ok_or(Error::UnknownQuote)?;
+
+            ensure_cdk!(
+                quote.payment_method == payment_method,
+                Error::Custom("Pending melt payment method does not match quote".to_string())
+            );
+
+            match self.resume_melt_saga(&db_saga).await? {
+                Some(finalized) if finalized.state() == MeltQuoteState::Paid => {
+                    return Ok(finalized);
+                }
+                Some(_) => return Err(Error::PaymentFailed),
+                None => tokio::time::sleep(Duration::from_secs(1)).await,
             }
         }
     }
@@ -845,20 +1519,34 @@ impl Wallet {
     ) -> Result<(), Error> {
         tracing::info!("Cancelling prepared melt for operation {}", operation_id);
 
+        let db_saga = self
+            .localstore
+            .get_saga(&operation_id)
+            .await?
+            .ok_or(Error::InvalidOperationState)?;
+        self.ensure_melt_saga_state(&db_saga, MeltSagaState::ProofsReserved)?;
+
         let mut all_ys = proofs.ys()?;
         all_ys.extend(proofs_to_swap.ys()?);
 
         if !all_ys.is_empty() {
             let current = self.localstore.get_proofs_by_ys(all_ys).await?;
-            let ys_to_revert: Vec<_> = current
+            let mut proofs_to_revert: Vec<_> = current
                 .into_iter()
-                .filter(|proof| proof.state == State::Reserved || proof.state == State::Pending)
-                .map(|proof| proof.y)
+                .filter(|proof| {
+                    proof.used_by_operation == Some(operation_id)
+                        && matches!(proof.state, State::Reserved | State::Pending)
+                })
                 .collect();
 
-            if !ys_to_revert.is_empty() {
+            for proof in proofs_to_revert.iter_mut() {
+                proof.state = State::Unspent;
+                proof.used_by_operation = None;
+            }
+
+            if !proofs_to_revert.is_empty() {
                 self.localstore
-                    .update_proofs_state(ys_to_revert, State::Unspent)
+                    .update_proofs(proofs_to_revert, vec![])
                     .await?;
             }
         }
@@ -878,7 +1566,6 @@ impl Wallet {
                 e
             );
         }
-
         Ok(())
     }
 
@@ -920,36 +1607,79 @@ impl Wallet {
                 new_state
             );
             if new_state == MeltQuoteState::Paid {
-                let pending_proofs = self
-                    .get_proofs_with(Some(vec![State::Pending]), None)
-                    .await?;
-                let proofs_total = pending_proofs.total_amount().unwrap_or_default();
+                let Some(operation_id_str) = quote.used_by_operation.as_deref() else {
+                    tracing::warn!(
+                        "Skipping transaction for paid melt quote {} without operation id",
+                        quote.id
+                    );
+                    return Ok(());
+                };
+                let operation_id = match Uuid::parse_str(operation_id_str) {
+                    Ok(operation_id) => operation_id,
+                    Err(err) => {
+                        tracing::warn!(
+                            "Skipping transaction for paid melt quote {} with invalid operation id {}: {}",
+                            quote.id,
+                            operation_id_str,
+                            err
+                        );
+                        return Ok(());
+                    }
+                };
+                let metadata = match self.localstore.get_saga(&operation_id).await? {
+                    Some(saga) => match saga.data {
+                        OperationData::Melt(data) => data.metadata,
+                        _ => {
+                            tracing::warn!(
+                                "Skipping transaction metadata for paid melt quote {} with non-melt saga {}",
+                                quote.id,
+                                operation_id
+                            );
+                            HashMap::new()
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            "Recording transaction for paid melt quote {} without saga metadata; saga {} not found",
+                            quote.id,
+                            operation_id
+                        );
+                        HashMap::new()
+                    }
+                };
+                let pending_proofs: Proofs = self
+                    .localstore
+                    .get_reserved_proofs(&operation_id)
+                    .await?
+                    .into_iter()
+                    .filter(|proof| proof.state == State::Pending)
+                    .map(|proof| proof.proof)
+                    .collect();
+                let proofs_total = pending_proofs.total_amount()?;
                 let change_total = change_amount.unwrap_or_default();
+                let fee = proofs_total
+                    .checked_sub(amount)
+                    .and_then(|amount| amount.checked_sub(change_total))
+                    .ok_or(Error::AmountOverflow)?;
 
-                self.localstore
-                    .add_transaction(Transaction {
-                        mint_url: self.mint_url.clone(),
-                        direction: TransactionDirection::Outgoing,
-                        amount,
-                        fee: proofs_total
-                            .checked_sub(amount)
-                            .and_then(|amt| amt.checked_sub(change_total))
-                            .unwrap_or_default(),
-                        unit: quote.unit.clone(),
-                        ys: pending_proofs.ys()?,
-                        timestamp: unix_time(),
-                        memo: None,
-                        metadata: HashMap::new(),
-                        quote_id: Some(quote.id.clone()),
-                        payment_request: Some(quote.request.clone()),
-                        payment_proof,
-                        payment_method: Some(quote.payment_method.clone()),
-                        saga_id: quote
-                            .used_by_operation
-                            .as_ref()
-                            .and_then(|id| Uuid::parse_str(id).ok()),
-                    })
-                    .await?;
+                self.upsert_transaction(Transaction {
+                    mint_url: self.mint_url.clone(),
+                    direction: TransactionDirection::Outgoing,
+                    amount,
+                    fee,
+                    unit: quote.unit.clone(),
+                    ys: pending_proofs.ys()?,
+                    timestamp: unix_time(),
+                    memo: None,
+                    metadata,
+                    quote_id: Some(quote.id.clone()),
+                    payment_request: Some(quote.request.clone()),
+                    payment_proof,
+                    payment_method: Some(quote.payment_method.clone()),
+                    saga_id: Some(operation_id),
+                    status: TransactionStatus::Completed,
+                })
+                .await?;
             }
         }
         Ok(())
@@ -981,10 +1711,7 @@ impl Wallet {
         // Get mint info from cache to check bolt12 support (no network call)
         let mint_info = &self
             .metadata_cache
-            .load(&self.localstore, &self.client, {
-                let ttl = self.metadata_cache_ttl.read();
-                *ttl
-            })
+            .load(&self.localstore, &self.client)
             .await?
             .mint_info;
 
@@ -1035,6 +1762,17 @@ impl Wallet {
     /// Melt quote for all payment methods
     ///
     /// Accepts `Bolt11Invoice`, `Offer`, `String`, or `&str` for the request parameter.
+    ///
+    /// # Onchain
+    ///
+    /// The onchain payment method is **not** reachable through this generic
+    /// entry point: onchain melt quotes require a payout `amount` (the address
+    /// alone is insufficient) and the mint returns an array of candidate fee
+    /// tiers that must be selected explicitly. Callers needing onchain should
+    /// use [`Wallet::quote_onchain_melt_options`] to fetch the candidate quotes
+    /// and [`Wallet::select_onchain_melt_quote`] to persist the chosen one.
+    /// Invoking `melt_quote` with [`KnownMethod::Onchain`] returns
+    /// [`Error::UnsupportedPaymentMethod`].
     #[instrument(skip(self, request, options, extra))]
     pub async fn melt_quote<T, R>(
         &self,
@@ -1062,6 +1800,17 @@ impl Wallet {
                     extra.map(|s| serde_json::from_str(&s).unwrap_or(serde_json::Value::Null));
                 self.melt_quote_custom(&custom_method, request_str, options, extra_json)
                     .await
+            }
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                // Onchain cannot be dispatched generically: the generic
+                // signature lacks an explicit `amount` and the protocol
+                // returns an array of candidate quotes that must be selected
+                // by the caller. See the doc-comment above.
+                tracing::debug!(
+                    "melt_quote called with onchain method; callers must use \
+                     quote_onchain_melt_options + select_onchain_melt_quote"
+                );
+                Err(Error::UnsupportedPaymentMethod)
             }
         }
     }
@@ -1124,10 +1873,18 @@ impl Wallet {
                     Err(Error::Database(e))
                 }
             }
-        }
+        }?;
+
+        // The write may advance the version and preserve database-owned fields.
+        *quote = self
+            .localstore
+            .get_melt_quote(&quote.id)
+            .await?
+            .ok_or(Error::UnknownQuote)?;
+        Ok(())
     }
 
-    /// Check melt quote status
+    /// Check melt quote status and return the persisted version and ownership.
     #[instrument(skip(self, quote_id))]
     pub async fn check_melt_quote_status(&self, quote_id: &str) -> Result<MeltQuote, Error> {
         let mut quote = self
@@ -1161,7 +1918,11 @@ impl Wallet {
                                 // Saga still pending (payment in progress or mint unreachable)
                                 // Return current quote state - no need to query mint again
                                 // since resume_melt_saga already checked
-                                return Ok(quote);
+                                return self
+                                    .localstore
+                                    .get_melt_quote(quote_id)
+                                    .await?
+                                    .ok_or(Error::UnknownQuote);
                             }
                         }
                     }
@@ -1175,6 +1936,11 @@ impl Wallet {
                         if let Err(e) = self.localstore.release_melt_quote(&operation_id).await {
                             tracing::warn!("Failed to release orphaned melt quote: {}", e);
                         }
+                        quote = self
+                            .localstore
+                            .get_melt_quote(quote_id)
+                            .await?
+                            .ok_or(Error::UnknownQuote)?;
                     }
                     Err(e) => {
                         tracing::warn!("Failed to check saga for melt quote {}: {}", quote_id, e);
@@ -1243,6 +2009,47 @@ impl Wallet {
                 )
                 .await?;
             }
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                let response = self
+                    .client
+                    .get_melt_quote_status(quote.payment_method.clone(), quote_id)
+                    .await?;
+                let response = match response {
+                    cdk_common::MeltQuoteResponse::Onchain(response) => response,
+                    _ => return Err(Error::InvalidPaymentMethod),
+                };
+                let change_amount = response
+                    .change
+                    .as_ref()
+                    .and_then(|change| Amount::try_sum(change.iter().map(|sig| sig.amount)).ok());
+                self.update_melt_quote_state(
+                    &mut quote,
+                    response.state,
+                    response.amount,
+                    change_amount,
+                    response.outpoint.clone(),
+                )
+                .await?;
+                quote.fee_index = response
+                    .selected_fee_index
+                    .or_else(|| response.fee_options.first().map(|option| option.fee_index));
+                quote.estimated_blocks = response
+                    .selected_fee_index
+                    .and_then(|selected| {
+                        response
+                            .fee_options
+                            .iter()
+                            .find(|option| option.fee_index == selected)
+                    })
+                    .or_else(|| response.fee_options.first())
+                    .map(|option| option.estimated_blocks);
+                self.localstore.add_melt_quote(quote.clone()).await?;
+                quote = self
+                    .localstore
+                    .get_melt_quote(quote_id)
+                    .await?
+                    .ok_or(Error::UnknownQuote)?;
+            }
         };
 
         Ok(quote)
@@ -1273,6 +2080,7 @@ impl Wallet {
         let response = match response {
             cdk_common::MeltQuoteResponse::Bolt11(r) => MeltQuoteStatusResponse::Standard(r),
             cdk_common::MeltQuoteResponse::Bolt12(r) => MeltQuoteStatusResponse::Bolt12(r),
+            cdk_common::MeltQuoteResponse::Onchain(r) => MeltQuoteStatusResponse::Onchain(r),
             cdk_common::MeltQuoteResponse::Custom((_, r)) => MeltQuoteStatusResponse::Custom(r),
         };
 
@@ -1286,34 +2094,710 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use cdk_common::nuts::{CurrencyUnit, State};
-    use cdk_common::Id;
+    use bitcoin::hashes::sha256::Hash as Sha256Hash;
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use cdk_common::nut23::QuoteState;
+    use cdk_common::nuts::{CurrencyUnit, KeySet, MintQuoteBolt11Response, RestoreResponse, State};
+    use cdk_common::wallet::{
+        MeltOperationData, MeltSagaState, OperationData, WalletSaga, WalletSagaState,
+    };
+    use cdk_common::{
+        Id, MeltQuoteBolt11Response, MeltQuoteCreateResponse, MeltQuoteResponse, MintQuoteRequest,
+        MintQuoteResponse,
+    };
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 
     use super::*;
     use crate::wallet::saga::test_utils::{
         create_test_db, test_keyset_id, test_mint_url, test_proof_info,
     };
     use crate::wallet::test_utils::{
-        create_test_wallet_with_mock, test_melt_quote, test_proof, MockMintConnector,
+        create_test_wallet_with_mock, create_test_wallet_with_mock_http_subscription,
+        make_inactive_keyset, test_keyset, test_melt_quote, test_mint_info, test_proof,
+        MockMintConnector,
     };
+
+    #[tokio::test]
+    async fn quote_status_returns_persisted_melt_quote() {
+        for onchain in [false, true] {
+            let db = create_test_db().await;
+            let client = Arc::new(MockMintConnector::new());
+            let wallet = create_test_wallet_with_mock(db.clone(), client.clone()).await;
+            let mut quote = test_melt_quote();
+            if onchain {
+                quote.payment_method = PaymentMethod::Known(KnownMethod::Onchain);
+            }
+            // SQLite preserves a known payment proof when an update omits it.
+            // Returning the input snapshot would incorrectly lose this field.
+            quote.payment_proof = Some("stored-payment-proof".to_string());
+            db.add_melt_quote(quote.clone()).await.unwrap();
+            let operation_id = uuid::Uuid::new_v4();
+            db.reserve_melt_quote(&quote.id, &operation_id)
+                .await
+                .unwrap();
+
+            for check in 1..=3 {
+                let response = match onchain {
+                    false => MeltQuoteResponse::Bolt11(bolt11_status(
+                        &quote.id,
+                        MeltQuoteState::Unpaid,
+                        None,
+                    )),
+                    true => {
+                        MeltQuoteResponse::Onchain(cdk_common::nut30::MeltQuoteOnchainResponse {
+                            quote: quote.id.clone(),
+                            amount: quote.amount,
+                            unit: quote.unit.clone(),
+                            method: quote.payment_method.clone(),
+                            state: MeltQuoteState::Unpaid,
+                            expiry: quote.expiry,
+                            request: quote.request.clone(),
+                            fee_options: vec![cdk_common::nut30::MeltQuoteOnchainFeeOption {
+                                fee_index: 2,
+                                fee_reserve: quote.fee_reserve,
+                                estimated_blocks: 6,
+                            }],
+                            selected_fee_index: Some(2),
+                            outpoint: None,
+                            change: None,
+                        })
+                    }
+                };
+                client
+                    .melt_quote_status_responses
+                    .lock()
+                    .unwrap()
+                    .push_back(Ok(response));
+                let returned = wallet.check_melt_quote_status(&quote.id).await.unwrap();
+                let stored = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+                assert_eq!(returned, stored);
+                assert_eq!(returned.version, check * if onchain { 2 } else { 1 });
+                assert_eq!(returned.used_by_operation, None);
+                assert_eq!(returned.payment_proof, quote.payment_proof);
+                if onchain {
+                    assert_eq!(returned.fee_index, Some(2));
+                    assert_eq!(returned.estimated_blocks, Some(6));
+                }
+            }
+        }
+    }
+
+    type TestWalletDatabase =
+        Arc<dyn cdk_common::database::WalletDatabase<cdk_common::database::Error> + Send + Sync>;
+
+    struct CrossMintTransferTestFixture {
+        source_db: TestWalletDatabase,
+        target_db: TestWalletDatabase,
+        source_wallet: Wallet,
+        target_wallet: Wallet,
+        source_connector: Arc<MockMintConnector>,
+        target_connector: Arc<MockMintConnector>,
+        source_url: crate::mint_url::MintUrl,
+    }
+
+    impl CrossMintTransferTestFixture {
+        async fn new(source_unit: CurrencyUnit, target_unit: CurrencyUnit) -> Self {
+            let source_db = create_test_db().await;
+            let target_db = create_test_db().await;
+            let source_connector = Arc::new(MockMintConnector::new());
+            let target_connector = Arc::new(MockMintConnector::new());
+            let source_url = crate::mint_url::MintUrl::from_str("https://source.example.com")
+                .expect("valid source URL");
+            let target_url = crate::mint_url::MintUrl::from_str("https://target.example.com")
+                .expect("valid target URL");
+            let seed = [42; 64];
+
+            let source_wallet = crate::wallet::WalletBuilder::new()
+                .mint_url(source_url.clone())
+                .unit(source_unit)
+                .localstore(source_db.clone())
+                .seed(seed)
+                .shared_client(source_connector.clone())
+                .build()
+                .expect("source wallet");
+            let target_wallet = crate::wallet::WalletBuilder::new()
+                .mint_url(target_url)
+                .unit(target_unit)
+                .localstore(target_db.clone())
+                .seed(seed)
+                .shared_client(target_connector.clone())
+                .build()
+                .expect("target wallet");
+
+            Self {
+                source_db,
+                target_db,
+                source_wallet,
+                target_wallet,
+                source_connector,
+                target_connector,
+                source_url,
+            }
+        }
+
+        async fn set_source_proofs(&self, proofs: &[(Id, u64)]) {
+            let proof_infos = proofs
+                .iter()
+                .map(|(keyset_id, amount)| {
+                    test_proof_info(*keyset_id, *amount, self.source_url.clone(), State::Unspent)
+                })
+                .collect();
+            self.source_db
+                .update_proofs(proof_infos, vec![])
+                .await
+                .expect("store source proofs");
+        }
+
+        fn set_source_keysets(&self, keysets: Vec<KeySet>) {
+            self.source_connector.set_mint_keys_response(Ok(keysets));
+        }
+
+        fn set_source_melt_limits(&self, min_amount: u64, max_amount: u64) {
+            let mut mint_info = test_mint_info();
+            let settings = mint_info
+                .nuts
+                .nut05
+                .methods
+                .iter_mut()
+                .find(|settings| {
+                    settings.method == PaymentMethod::Known(KnownMethod::Bolt11)
+                        && settings.unit == CurrencyUnit::Sat
+                })
+                .expect("test mint info has BOLT11 sat melt settings");
+            settings.min_amount = Some(Amount::from(min_amount));
+            settings.max_amount = Some(Amount::from(max_amount));
+            self.source_connector.set_mint_info_response(Ok(mint_info));
+        }
+
+        fn set_target_mint_limits(&self, min_amount: u64, max_amount: u64) {
+            let mut mint_info = test_mint_info();
+            let settings = mint_info
+                .nuts
+                .nut04
+                .methods
+                .iter_mut()
+                .find(|settings| {
+                    settings.method == PaymentMethod::Known(KnownMethod::Bolt11)
+                        && settings.unit == CurrencyUnit::Sat
+                })
+                .expect("test mint info has BOLT11 sat mint settings");
+            settings.min_amount = Some(Amount::from(min_amount));
+            settings.max_amount = Some(Amount::from(max_amount));
+            self.target_connector.set_mint_info_response(Ok(mint_info));
+        }
+
+        fn queue_quotes(&self, quotes: &[(u64, u64)]) {
+            for (amount, fee_reserve) in quotes {
+                self.target_connector
+                    .push_post_mint_quote_response(Ok(mint_quote_response(Amount::from(*amount))));
+                self.source_connector
+                    .push_post_melt_quote_response(Ok(melt_quote_response(
+                        Amount::from(*amount),
+                        Amount::from(*fee_reserve),
+                    )));
+            }
+        }
+    }
+
+    fn invoice_for_amount(amount: Amount) -> String {
+        let private_key =
+            SecretKey::from_slice(&[42; 32]).expect("valid fixed private key for test invoice");
+        let payment_hash = Sha256Hash::hash(&amount.to_u64().to_be_bytes());
+        let payment_secret = PaymentSecret([21; 32]);
+
+        InvoiceBuilder::new(Currency::Bitcoin)
+            .description("cross-mint transfer test".to_string())
+            .payment_hash(payment_hash)
+            .payment_secret(payment_secret)
+            .amount_milli_satoshis(amount.to_u64() * 1_000)
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144)
+            .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
+            .expect("test invoice should build")
+            .to_string()
+    }
+
+    fn mint_quote_response(amount: Amount) -> MintQuoteResponse<String> {
+        MintQuoteResponse::Bolt11(MintQuoteBolt11Response {
+            quote: format!("mint-quote-{}", amount),
+            request: invoice_for_amount(amount),
+            amount: Some(amount),
+            unit: Some(CurrencyUnit::Sat),
+            method: PaymentMethod::Known(KnownMethod::Bolt11),
+            amount_paid: Amount::ZERO,
+            amount_issued: Amount::ZERO,
+            updated_at: 0,
+            state: QuoteState::Unpaid,
+            expiry: Some(2_000_000_000),
+            pubkey: None,
+        })
+    }
+
+    fn melt_quote_response(amount: Amount, fee_reserve: Amount) -> MeltQuoteCreateResponse<String> {
+        MeltQuoteCreateResponse::Bolt11(MeltQuoteBolt11Response {
+            quote: format!("melt-quote-{}", amount),
+            amount,
+            fee_reserve,
+            state: MeltQuoteState::Unpaid,
+            expiry: 2_000_000_000,
+            payment_preimage: None,
+            change: None,
+            request: None,
+            unit: Some(CurrencyUnit::Sat),
+            method: PaymentMethod::Known(KnownMethod::Bolt11),
+        })
+    }
+
+    #[tokio::test]
+    async fn lightning_melt_quotes_validate_rounded_up_principals() {
+        let invoice = cdk_fake_wallet::create_fake_invoice(1_999, "rounding".to_owned());
+        let offer = lightning::offers::offer::OfferBuilder::new(invoice.recover_payee_pub_key())
+            .amount_msats(1_999)
+            .build()
+            .unwrap();
+
+        for (unit, expected) in [(CurrencyUnit::Sat, 2), (CurrencyUnit::Msat, 1_999)] {
+            let connector = Arc::new(MockMintConnector::new());
+            let wallet = crate::wallet::WalletBuilder::new()
+                .mint_url(test_mint_url())
+                .unit(unit.clone())
+                .localstore(create_test_db().await)
+                .seed([42; 64])
+                .shared_client(connector.clone())
+                .build()
+                .unwrap();
+
+            for method in [KnownMethod::Bolt11, KnownMethod::Bolt12] {
+                for options in [
+                    None,
+                    Some(MeltOptions::new_amountless(1_999)),
+                    Some(MeltOptions::new_mpp(1_999)),
+                ] {
+                    if method == KnownMethod::Bolt12
+                        && matches!(options, Some(MeltOptions::Mpp { .. }))
+                    {
+                        continue;
+                    }
+                    for reported in [expected - 1, expected, expected + 1] {
+                        let response = serde_json::json!({
+                            "quote": cdk_common::QuoteId::new().to_string(),
+                            "amount": reported,
+                            "fee_reserve": 1,
+                            "state": "UNPAID",
+                            "expiry": 2_000_000_000,
+                            "unit": unit,
+                            "method": PaymentMethod::Known(method),
+                        });
+                        let result = match method {
+                            KnownMethod::Bolt11 => {
+                                connector.push_post_melt_quote_response(Ok(
+                                    MeltQuoteCreateResponse::Bolt11(
+                                        serde_json::from_value(response).unwrap(),
+                                    ),
+                                ));
+                                wallet
+                                    .request_melt_bolt11_quote(invoice.to_string(), options)
+                                    .await
+                            }
+                            KnownMethod::Bolt12 => {
+                                connector.push_post_melt_quote_response(Ok(
+                                    MeltQuoteCreateResponse::Bolt12(
+                                        serde_json::from_value(response).unwrap(),
+                                    ),
+                                ));
+                                wallet.melt_bolt12_quote(offer.to_string(), options).await
+                            }
+                            _ => unreachable!(),
+                        };
+                        if reported == expected {
+                            assert_eq!(result.unwrap().amount, Amount::from(expected));
+                        } else {
+                            assert!(matches!(result, Err(Error::IncorrectQuoteAmount)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_converges_with_melt_and_input_fees() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+        fixture
+            .set_source_proofs(&[(crate::wallet::test_utils::test_keyset_id(), 1_000)])
+            .await;
+        fixture.queue_quotes(&[(999, 1_200), (499, 9), (990, 9)]);
+
+        let quote = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect("maximum cross-mint transfer quote");
+
+        assert_eq!(quote.mint_quote.amount, Some(Amount::from(990)));
+        assert_eq!(quote.melt_quote.amount, Amount::from(990));
+        assert_eq!(quote.melt_quote.fee_reserve, Amount::from(9));
+        assert_eq!(quote.input_fee, Amount::ONE);
+        assert!(quote.mint_quote.secret_key.is_some());
+
+        let stored_mint_quotes = fixture
+            .target_db
+            .get_mint_quotes()
+            .await
+            .expect("stored target mint quotes");
+        assert_eq!(stored_mint_quotes, vec![quote.mint_quote.clone()]);
+        let stored_melt_quotes = fixture
+            .source_db
+            .get_melt_quotes()
+            .await
+            .expect("stored source melt quotes");
+        assert_eq!(stored_melt_quotes, vec![quote.melt_quote.clone()]);
+
+        let requested_amounts = fixture
+            .target_connector
+            .post_mint_quote_requests()
+            .into_iter()
+            .map(|request| match request {
+                MintQuoteRequest::Bolt11(request) => request.amount,
+                _ => panic!("expected bolt11 mint quote"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requested_amounts,
+            vec![Amount::from(999), Amount::from(499), Amount::from(990)]
+        );
+        assert_eq!(fixture.source_connector.post_melt_quote_requests().len(), 3);
+
+        let prepared = fixture
+            .source_wallet
+            .prepare_melt_proofs(
+                &quote.melt_quote.id,
+                fixture
+                    .source_wallet
+                    .get_unspent_proofs()
+                    .await
+                    .expect("source proofs"),
+                HashMap::new(),
+            )
+            .await
+            .expect("prepare maximum cross-mint transfer");
+        assert_eq!(prepared.input_fee_without_swap(), Amount::ONE);
+        assert_eq!(prepared.change_amount_without_swap(), Amount::ZERO);
+        prepared
+            .cancel()
+            .await
+            .expect("cancel prepared cross-mint transfer");
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_respects_source_melt_maximum() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+        fixture.set_source_melt_limits(1, 600);
+        fixture
+            .set_source_proofs(&[(crate::wallet::test_utils::test_keyset_id(), 1_000)])
+            .await;
+        fixture.queue_quotes(&[(600, 5)]);
+
+        let quote = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect("quote capped by source melt maximum");
+
+        assert_eq!(quote.melt_quote.amount, Amount::from(600));
+        assert!(matches!(
+            &fixture.target_connector.post_mint_quote_requests()[..],
+            [MintQuoteRequest::Bolt11(request)] if request.amount == Amount::from(600)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_respects_target_mint_maximum() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+        fixture.set_target_mint_limits(1, 600);
+        fixture
+            .set_source_proofs(&[(crate::wallet::test_utils::test_keyset_id(), 1_000)])
+            .await;
+        fixture.queue_quotes(&[(600, 5)]);
+
+        let quote = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect("quote capped by target mint maximum");
+
+        assert_eq!(quote.mint_quote.amount, Some(Amount::from(600)));
+        assert!(matches!(
+            &fixture.target_connector.post_mint_quote_requests()[..],
+            [MintQuoteRequest::Bolt11(request)] if request.amount == Amount::from(600)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_rejects_balance_below_quote_minimum() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+        fixture.set_source_melt_limits(40, 500_000);
+        fixture.set_target_mint_limits(100, 500_000);
+        fixture
+            .set_source_proofs(&[(crate::wallet::test_utils::test_keyset_id(), 90)])
+            .await;
+
+        let error = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect_err("balance below quote minimum should be rejected");
+
+        assert!(matches!(error, Error::InsufficientFunds));
+        assert!(fixture
+            .target_connector
+            .post_mint_quote_requests()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_does_not_persist_failed_search_probes() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+        fixture
+            .set_source_proofs(&[(crate::wallet::test_utils::test_keyset_id(), 1_000)])
+            .await;
+        fixture
+            .target_connector
+            .push_post_mint_quote_response(Ok(mint_quote_response(Amount::from(999))));
+        fixture
+            .source_connector
+            .push_post_melt_quote_response(Ok(melt_quote_response(
+                Amount::from(999),
+                Amount::from(1_200),
+            )));
+        fixture
+            .target_connector
+            .push_post_mint_quote_response(Ok(mint_quote_response(Amount::from(499))));
+        fixture
+            .source_connector
+            .push_post_melt_quote_response(Err(Error::Custom("test quote failure".to_string())));
+
+        let error = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect_err("quote search should fail");
+
+        assert!(matches!(error, Error::Custom(message) if message == "test quote failure"));
+        assert!(fixture
+            .target_db
+            .get_mint_quotes()
+            .await
+            .expect("stored target mint quotes")
+            .is_empty());
+        assert!(fixture
+            .source_db
+            .get_melt_quotes()
+            .await
+            .expect("stored source melt quotes")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_rolls_back_partial_persistence() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+        fixture
+            .set_source_proofs(&[(crate::wallet::test_utils::test_keyset_id(), 100)])
+            .await;
+        fixture.queue_quotes(&[(99, 0)]);
+
+        let mut conflicting_quote = test_melt_quote();
+        conflicting_quote.id = "melt-quote-99".to_string();
+        conflicting_quote.mint_url = Some(fixture.source_url.clone());
+        fixture
+            .source_db
+            .add_melt_quote(conflicting_quote.clone())
+            .await
+            .expect("store conflicting melt quote");
+        fixture
+            .source_db
+            .add_melt_quote(conflicting_quote)
+            .await
+            .expect("advance conflicting melt quote version");
+
+        let error = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect_err("selected melt quote persistence should conflict");
+
+        assert!(matches!(
+            error,
+            Error::Database(cdk_common::database::Error::ConcurrentUpdate)
+        ));
+        assert!(fixture
+            .target_db
+            .get_mint_quotes()
+            .await
+            .expect("stored target mint quotes")
+            .is_empty());
+        assert_eq!(
+            fixture
+                .source_db
+                .get_melt_quotes()
+                .await
+                .expect("stored source melt quotes")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_returns_best_feasible_amount() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+        fixture
+            .set_source_proofs(&[(crate::wallet::test_utils::test_keyset_id(), 100)])
+            .await;
+        fixture.queue_quotes(&[(99, 2), (97, 1), (98, 2)]);
+
+        let quote = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect("best feasible cross-mint transfer quote");
+
+        assert_eq!(quote.melt_quote.amount, Amount::from(97));
+        assert_eq!(quote.melt_quote.fee_reserve, Amount::ONE);
+        assert_eq!(quote.input_fee, Amount::ONE);
+
+        let prepared = fixture
+            .source_wallet
+            .prepare_melt_proofs(
+                &quote.melt_quote.id,
+                fixture
+                    .source_wallet
+                    .get_unspent_proofs()
+                    .await
+                    .expect("source proofs"),
+                HashMap::new(),
+            )
+            .await
+            .expect("prepare best feasible cross-mint transfer");
+        assert_eq!(prepared.change_amount_without_swap(), Amount::ONE);
+        prepared
+            .cancel()
+            .await
+            .expect("cancel best feasible cross-mint transfer");
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_rejects_empty_balance() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+
+        let error = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect_err("empty balance should be rejected");
+
+        assert!(matches!(error, Error::InsufficientFunds));
+        assert!(fixture
+            .target_connector
+            .post_mint_quote_requests()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_rejects_currency_unit_mismatch() {
+        let fixture =
+            CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Msat).await;
+
+        let error = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect_err("currency unit mismatch should be rejected");
+
+        assert!(matches!(error, Error::UnsupportedUnit));
+        assert!(fixture
+            .target_connector
+            .post_mint_quote_requests()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_mint_transfer_quote_max_accounts_for_fees_across_keysets() {
+        let fixture = CrossMintTransferTestFixture::new(CurrencyUnit::Sat, CurrencyUnit::Sat).await;
+        let default_keyset = test_keyset();
+        let mut expensive_keyset = make_inactive_keyset();
+        expensive_keyset.input_fee_ppk = 900;
+        expensive_keyset.id = Id::v2_from_data(
+            &expensive_keyset.keys,
+            &expensive_keyset.unit,
+            expensive_keyset.input_fee_ppk,
+            expensive_keyset.final_expiry,
+        );
+        fixture.set_source_keysets(vec![default_keyset.clone(), expensive_keyset.clone()]);
+        fixture
+            .set_source_proofs(&[(default_keyset.id, 600), (expensive_keyset.id, 400)])
+            .await;
+        fixture.queue_quotes(&[(998, 8), (990, 8)]);
+
+        let quote = fixture
+            .source_wallet
+            .cross_mint_transfer_quote_max(&fixture.target_wallet)
+            .await
+            .expect("maximum cross-mint transfer quote across keysets");
+
+        assert_eq!(quote.melt_quote.amount, Amount::from(990));
+        assert_eq!(quote.melt_quote.fee_reserve, Amount::from(8));
+        assert_eq!(quote.input_fee, Amount::from(2));
+
+        let prepared = fixture
+            .source_wallet
+            .prepare_melt_proofs(
+                &quote.melt_quote.id,
+                fixture
+                    .source_wallet
+                    .get_unspent_proofs()
+                    .await
+                    .expect("source proofs"),
+                HashMap::new(),
+            )
+            .await
+            .expect("prepare maximum cross-mint transfer across keysets");
+        assert_eq!(prepared.input_fee_without_swap(), Amount::from(2));
+        assert_eq!(prepared.change_amount_without_swap(), Amount::ZERO);
+        prepared
+            .cancel()
+            .await
+            .expect("cancel maximum cross-mint transfer across keysets");
+    }
 
     #[tokio::test]
     async fn test_cancel_prepared_melt_reverts_reserved_proofs() {
         let db = create_test_db().await;
         let mint_url = test_mint_url();
-        let keyset_id = test_keyset_id();
-        let operation_id = uuid::Uuid::new_v4();
+        let keyset_id = crate::wallet::test_utils::test_keyset_id();
 
-        let proof_info = test_proof_info(keyset_id, 100, mint_url.clone(), State::Reserved);
+        let proof_info = test_proof_info(keyset_id, 1200, mint_url.clone(), State::Unspent);
         let proof_y = proof_info.y;
         let proof = proof_info.proof.clone();
         db.update_proofs(vec![proof_info], vec![]).await.unwrap();
 
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
         let mock_client = Arc::new(MockMintConnector::new());
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![proof], HashMap::new())
+            .await
+            .unwrap();
 
         wallet
-            .cancel_prepared_melt(operation_id, vec![proof], vec![])
+            .cancel_prepared_melt(
+                prepared.operation_id(),
+                prepared.proofs().clone(),
+                prepared.proofs_to_swap().clone(),
+            )
             .await
             .unwrap();
 
@@ -1323,7 +2807,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_prepared_melt_reverts_pending_proofs() {
+    async fn test_cancel_prepared_melt_rejects_pending_saga() {
+        let (db, proof_y, operation_id, _mock_client, pending) = pending_bolt11_melt(false).await;
+
+        let result = pending
+            .saga
+            .wallet
+            .cancel_prepared_melt(
+                operation_id,
+                pending.saga.state_data.final_proofs.clone(),
+                vec![],
+            )
+            .await;
+
+        assert!(matches!(result, Err(Error::InvalidOperationState)));
+
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state, State::Pending);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_prepared_melt_reverts_operation_pending_proofs() {
+        let db = create_test_db().await;
+        let mint_url = test_mint_url();
+        let keyset_id = crate::wallet::test_utils::test_keyset_id();
+
+        let proof_info = test_proof_info(keyset_id, 1200, mint_url.clone(), State::Unspent);
+        let proof_y = proof_info.y;
+        let proof = proof_info.proof.clone();
+        db.update_proofs(vec![proof_info], vec![]).await.unwrap();
+
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![proof], HashMap::new())
+            .await
+            .unwrap();
+        let operation_id = prepared.operation_id();
+
+        db.update_proofs_state(vec![proof_y], State::Pending)
+            .await
+            .unwrap();
+
+        wallet
+            .cancel_prepared_melt(
+                operation_id,
+                prepared.proofs().clone(),
+                prepared.proofs_to_swap().clone(),
+            )
+            .await
+            .unwrap();
+
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state, State::Unspent);
+        assert_eq!(stored[0].used_by_operation, None);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_prepared_melt_rejects_melt_requested_saga() {
         let db = create_test_db().await;
         let mint_url = test_mint_url();
         let keyset_id = test_keyset_id();
@@ -1334,36 +2883,73 @@ mod tests {
         let proof = proof_info.proof.clone();
         db.update_proofs(vec![proof_info], vec![]).await.unwrap();
 
+        let quote = test_melt_quote();
+        let saga = WalletSaga::new(
+            operation_id,
+            WalletSagaState::Melt(MeltSagaState::MeltRequested),
+            quote.amount,
+            mint_url,
+            CurrencyUnit::Sat,
+            OperationData::Melt(MeltOperationData {
+                quote_id: quote.id,
+                amount: quote.amount,
+                fee_reserve: quote.fee_reserve,
+                counter_start: None,
+                counter_end: None,
+                change_amount: None,
+                metadata: HashMap::new(),
+                final_proof_ys: None,
+                change_blinded_messages: None,
+            }),
+        );
+        db.add_saga(saga).await.unwrap();
+
         let mock_client = Arc::new(MockMintConnector::new());
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
 
-        wallet
+        let err = wallet
             .cancel_prepared_melt(operation_id, vec![proof], vec![])
             .await
-            .unwrap();
+            .expect_err("cancel should reject a melt that was already requested");
 
+        assert!(matches!(err, Error::InvalidOperationState));
         let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].state, State::Unspent);
+        assert_eq!(stored[0].state, State::Pending);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn test_cancel_prepared_melt_preserves_spent_proofs() {
         let db = create_test_db().await;
         let mint_url = test_mint_url();
-        let keyset_id = test_keyset_id();
-        let operation_id = uuid::Uuid::new_v4();
+        let keyset_id = crate::wallet::test_utils::test_keyset_id();
 
-        let proof_info = test_proof_info(keyset_id, 100, mint_url.clone(), State::Spent);
+        let proof_info = test_proof_info(keyset_id, 1200, mint_url.clone(), State::Unspent);
         let proof_y = proof_info.y;
         let proof = proof_info.proof.clone();
         db.update_proofs(vec![proof_info], vec![]).await.unwrap();
 
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
         let mock_client = Arc::new(MockMintConnector::new());
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![proof], HashMap::new())
+            .await
+            .unwrap();
+        db.update_proofs_state(vec![proof_y], State::Spent)
+            .await
+            .unwrap();
 
         wallet
-            .cancel_prepared_melt(operation_id, vec![], vec![proof])
+            .cancel_prepared_melt(
+                prepared.operation_id(),
+                prepared.proofs().clone(),
+                prepared.proofs_to_swap().clone(),
+            )
             .await
             .unwrap();
 
@@ -1373,13 +2959,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancel_prepared_melt_mixed_states_only_reverts_reserved_and_pending() {
+    async fn test_cancel_prepared_melt_only_reverts_reserved_proofs() {
         let db = create_test_db().await;
         let mint_url = test_mint_url();
-        let keyset_id = test_keyset_id();
-        let operation_id = uuid::Uuid::new_v4();
+        let keyset_id = crate::wallet::test_utils::test_keyset_id();
 
-        let reserved = test_proof_info(keyset_id, 100, mint_url.clone(), State::Reserved);
+        let reserved = test_proof_info(keyset_id, 1200, mint_url.clone(), State::Unspent);
         let pending = test_proof_info(keyset_id, 200, mint_url.clone(), State::Pending);
         let spent = test_proof_info(keyset_id, 300, mint_url.clone(), State::Spent);
 
@@ -1395,14 +2980,22 @@ mod tests {
             .await
             .unwrap();
 
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
         let mock_client = Arc::new(MockMintConnector::new());
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![reserved_proof], HashMap::new())
+            .await
+            .unwrap();
 
         wallet
             .cancel_prepared_melt(
-                operation_id,
-                vec![reserved_proof, pending_proof],
-                vec![spent_proof],
+                prepared.operation_id(),
+                prepared.proofs().clone(),
+                vec![pending_proof, spent_proof],
             )
             .await
             .unwrap();
@@ -1418,8 +3011,160 @@ mod tests {
                 .map(|proof| proof.state)
         };
         assert_eq!(state_for(reserved_y), Some(State::Unspent));
-        assert_eq!(state_for(pending_y), Some(State::Unspent));
+        assert_eq!(state_for(pending_y), Some(State::Pending));
         assert_eq!(state_for(spent_y), Some(State::Spent));
+    }
+
+    #[tokio::test]
+    async fn test_add_transaction_for_pending_melt_uses_only_operation_pending_proofs() {
+        let db = create_test_db().await;
+        let mint_url = test_mint_url();
+        let keyset_id = test_keyset_id();
+        let operation_a_id = uuid::Uuid::new_v4();
+        let operation_b_id = uuid::Uuid::new_v4();
+
+        let mut operation_a_pending =
+            test_proof_info(keyset_id, 1200, mint_url.clone(), State::Pending);
+        operation_a_pending.used_by_operation = Some(operation_a_id);
+        let operation_a_pending_y = operation_a_pending.y;
+
+        let mut operation_b_pending =
+            test_proof_info(keyset_id, 700, mint_url.clone(), State::Pending);
+        operation_b_pending.used_by_operation = Some(operation_b_id);
+        let operation_b_pending_y = operation_b_pending.y;
+
+        let mut operation_a_spent = test_proof_info(keyset_id, 300, mint_url.clone(), State::Spent);
+        operation_a_spent.used_by_operation = Some(operation_a_id);
+        let operation_a_spent_y = operation_a_spent.y;
+
+        db.update_proofs(
+            vec![operation_a_pending, operation_b_pending, operation_a_spent],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let mut quote = test_melt_quote();
+        quote.used_by_operation = Some(operation_a_id.to_string());
+
+        wallet
+            .add_transaction_for_pending_melt(
+                &quote,
+                MeltQuoteState::Paid,
+                Amount::from(1000),
+                Some(Amount::from(150)),
+                Some("payment-proof".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert_eq!(transactions.len(), 1);
+
+        let tx = &transactions[0];
+        assert_eq!(tx.ys, vec![operation_a_pending_y]);
+        assert!(!tx.ys.contains(&operation_b_pending_y));
+        assert!(!tx.ys.contains(&operation_a_spent_y));
+        assert_eq!(tx.fee, Amount::from(50));
+        assert_eq!(tx.saga_id, Some(operation_a_id));
+    }
+
+    #[tokio::test]
+    async fn test_add_transaction_for_pending_melt_uses_saga_metadata() {
+        let db = create_test_db().await;
+        let mint_url = test_mint_url();
+        let keyset_id = test_keyset_id();
+        let operation_id = uuid::Uuid::new_v4();
+
+        let mut pending = test_proof_info(keyset_id, 1200, mint_url.clone(), State::Pending);
+        pending.used_by_operation = Some(operation_id);
+        db.update_proofs(vec![pending], vec![]).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let mut quote = test_melt_quote();
+        quote.used_by_operation = Some(operation_id.to_string());
+        let quote_id = quote.id.clone();
+
+        let mut metadata = HashMap::new();
+        metadata.insert("memo".to_string(), "pending metadata".to_string());
+
+        let saga = WalletSaga::new(
+            operation_id,
+            WalletSagaState::Melt(MeltSagaState::PaymentPending),
+            quote.amount,
+            mint_url,
+            CurrencyUnit::Sat,
+            OperationData::Melt(MeltOperationData {
+                quote_id: quote_id.clone(),
+                amount: quote.amount,
+                fee_reserve: quote.fee_reserve,
+                counter_start: None,
+                counter_end: None,
+                change_amount: None,
+                metadata: metadata.clone(),
+                final_proof_ys: None,
+                change_blinded_messages: None,
+            }),
+        );
+        db.add_saga(saga).await.unwrap();
+
+        wallet
+            .add_transaction_for_pending_melt(
+                &quote,
+                MeltQuoteState::Paid,
+                quote.amount,
+                Some(Amount::from(150)),
+                Some("payment-proof".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].metadata, metadata);
+    }
+
+    #[tokio::test]
+    async fn test_add_transaction_for_pending_melt_skips_missing_or_invalid_operation_id() {
+        let db = create_test_db().await;
+        let mock_client = Arc::new(MockMintConnector::new());
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let quote_without_operation = test_melt_quote();
+        wallet
+            .add_transaction_for_pending_melt(
+                &quote_without_operation,
+                MeltQuoteState::Paid,
+                Amount::from(1000),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert!(transactions.is_empty());
+
+        let mut quote_with_invalid_operation = test_melt_quote();
+        quote_with_invalid_operation.used_by_operation = Some("invalid-operation-id".to_string());
+        wallet
+            .add_transaction_for_pending_melt(
+                &quote_with_invalid_operation,
+                MeltQuoteState::Paid,
+                Amount::from(1000),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert!(transactions.is_empty());
     }
 
     async fn create_test_wallet_with_quote() -> (Wallet, String) {
@@ -1495,5 +3240,572 @@ mod tests {
         assert_eq!(reserved.len(), 1);
         assert_eq!(reserved[0].state, State::Reserved);
         assert_eq!(reserved[0].proof.amount, Amount::from(1010_u64));
+    }
+
+    #[tokio::test]
+    async fn test_prepared_melt_exposes_metadata() {
+        let db = create_test_db().await;
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        let wallet = create_test_wallet_with_mock(db, mock_client).await;
+
+        let mut metadata = HashMap::new();
+        metadata.insert("memo".to_string(), "ffi metadata".to_string());
+
+        let proof = test_proof(crate::wallet::test_utils::test_keyset_id(), 1200);
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![proof], metadata.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.metadata(), &metadata);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_prepared_melt_prefers_persisted_saga_metadata() {
+        let db = create_test_db().await;
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        mock_client.set_post_melt_response(Ok(MeltQuoteResponse::Bolt11(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Paid,
+            Some("preimage123".to_string()),
+        ))));
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let mut saga_metadata = HashMap::new();
+        saga_metadata.insert("memo".to_string(), "persisted saga metadata".to_string());
+        let mut stale_metadata = HashMap::new();
+        stale_metadata.insert("memo".to_string(), "stale handle metadata".to_string());
+
+        let proof = test_proof(crate::wallet::test_utils::test_keyset_id(), 1200);
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![proof], saga_metadata.clone())
+            .await
+            .unwrap();
+
+        wallet
+            .confirm_prepared_melt_with_options(
+                prepared.operation_id(),
+                prepared.quote().clone(),
+                prepared.proofs().clone(),
+                prepared.proofs_to_swap().clone(),
+                prepared.input_fee(),
+                prepared.input_fee_without_swap(),
+                stale_metadata,
+                MeltConfirmOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].metadata, saga_metadata);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_prefer_async_prefers_persisted_saga_metadata() {
+        let db = create_test_db().await;
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        mock_client.set_post_melt_response(Ok(MeltQuoteResponse::Bolt11(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Paid,
+            Some("preimage123".to_string()),
+        ))));
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let mut stale_metadata = HashMap::new();
+        stale_metadata.insert("memo".to_string(), "stale handle metadata".to_string());
+        let mut saga_metadata = HashMap::new();
+        saga_metadata.insert("memo".to_string(), "persisted saga metadata".to_string());
+
+        let proof = test_proof(crate::wallet::test_utils::test_keyset_id(), 1200);
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![proof], stale_metadata)
+            .await
+            .unwrap();
+
+        let mut stored_saga = db
+            .get_saga(&prepared.operation_id())
+            .await
+            .unwrap()
+            .unwrap();
+        match &mut stored_saga.data {
+            OperationData::Melt(data) => {
+                data.metadata = saga_metadata.clone();
+            }
+            _ => panic!("expected melt saga"),
+        }
+        stored_saga.update_state(stored_saga.state);
+        assert!(db.update_saga(stored_saga).await.unwrap());
+
+        let outcome = prepared
+            .confirm_prefer_async_with_options(MeltConfirmOptions::new())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MeltOutcome::Paid(_)));
+
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].metadata, saga_metadata);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_prepared_melt_prefer_async_prefers_persisted_saga_metadata() {
+        let db = create_test_db().await;
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        mock_client.set_post_melt_response(Ok(MeltQuoteResponse::Bolt11(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Paid,
+            Some("preimage123".to_string()),
+        ))));
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let mut saga_metadata = HashMap::new();
+        saga_metadata.insert("memo".to_string(), "persisted saga metadata".to_string());
+        let mut stale_metadata = HashMap::new();
+        stale_metadata.insert("memo".to_string(), "stale handle metadata".to_string());
+
+        let proof = test_proof(crate::wallet::test_utils::test_keyset_id(), 1200);
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![proof], saga_metadata.clone())
+            .await
+            .unwrap();
+
+        wallet
+            .confirm_prepared_melt_prefer_async_with_options(
+                prepared.operation_id(),
+                prepared.quote().clone(),
+                prepared.proofs().clone(),
+                prepared.proofs_to_swap().clone(),
+                prepared.input_fee(),
+                prepared.input_fee_without_swap(),
+                stale_metadata,
+                MeltConfirmOptions::new(),
+            )
+            .await
+            .unwrap();
+
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].metadata, saga_metadata);
+    }
+
+    /// Build a bolt11 melt-quote status response with the given state/preimage.
+    fn bolt11_status(
+        quote_id: &str,
+        state: MeltQuoteState,
+        payment_preimage: Option<String>,
+    ) -> MeltQuoteBolt11Response<String> {
+        MeltQuoteBolt11Response {
+            quote: quote_id.to_string(),
+            state,
+            expiry: 9999999999,
+            fee_reserve: Amount::from(10),
+            amount: Amount::from(1000),
+            request: Some("lnbc1000...".to_string()),
+            payment_preimage,
+            change: None,
+            unit: Some(CurrencyUnit::Sat),
+            method: PaymentMethod::Known(KnownMethod::Bolt11),
+        }
+    }
+
+    /// Drive a bolt11 melt to a `PendingMelt` (PaymentPending) using a mock
+    /// mint that accepts the async request and reports `Pending`.
+    ///
+    /// The returned wallet is leaked for `'static` so the `PendingMelt` can be
+    /// awaited independently. When `http_subscription` is set the wallet polls
+    /// over HTTP, which lets `PendingMelt::wait` run deterministically against
+    /// the mock (which has no WebSocket endpoint).
+    async fn pending_bolt11_melt(
+        http_subscription: bool,
+    ) -> (
+        Arc<dyn cdk_common::database::WalletDatabase<cdk_common::database::Error> + Send + Sync>,
+        crate::nuts::PublicKey,
+        uuid::Uuid,
+        Arc<MockMintConnector>,
+        PendingMelt<'static>,
+    ) {
+        pending_bolt11_melt_with_metadata(http_subscription, HashMap::new()).await
+    }
+
+    async fn pending_bolt11_melt_with_metadata(
+        http_subscription: bool,
+        metadata: HashMap<String, String>,
+    ) -> (
+        Arc<dyn cdk_common::database::WalletDatabase<cdk_common::database::Error> + Send + Sync>,
+        crate::nuts::PublicKey,
+        uuid::Uuid,
+        Arc<MockMintConnector>,
+        PendingMelt<'static>,
+    ) {
+        let db = create_test_db().await;
+        let mint_url = test_mint_url();
+        // Use the keyset the MockMintConnector serves so fee lookups resolve.
+        let keyset_id = crate::wallet::test_utils::test_keyset_id();
+        // 1,000 sats plus the 10-sat payment reserve and 1-sat input fee.
+        let proof_info = crate::wallet::test_utils::test_proof_info(keyset_id, 1011, mint_url);
+        let proof_y = proof_info.y;
+        let proof = proof_info.proof.clone();
+        db.update_proofs(vec![proof_info], vec![]).await.unwrap();
+
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote.clone()).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        // Mint accepts the async melt and reports Pending, so confirm yields a
+        // PendingMelt we can drive through reconciliation.
+        mock_client.set_post_melt_response(Ok(MeltQuoteResponse::Bolt11(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Pending,
+            None,
+        ))));
+
+        let wallet: &'static Wallet = if http_subscription {
+            Box::leak(Box::new(
+                create_test_wallet_with_mock_http_subscription(db.clone(), mock_client.clone())
+                    .await,
+            ))
+        } else {
+            Box::leak(Box::new(
+                create_test_wallet_with_mock(db.clone(), mock_client.clone()).await,
+            ))
+        };
+
+        let prepared = wallet
+            .prepare_melt_proofs(&quote_id, vec![proof], metadata)
+            .await
+            .unwrap();
+        let operation_id = prepared.operation_id();
+
+        let pending = match prepared.confirm_prefer_async().await.unwrap() {
+            MeltOutcome::Pending(pending) => pending,
+            MeltOutcome::Paid(_) => panic!("expected pending melt outcome"),
+        };
+
+        (db, proof_y, operation_id, mock_client, pending)
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_non_paid_status_http_paid_finalizes() {
+        let (db, proof_y, operation_id, mock_client, pending) = pending_bolt11_melt(false).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        mock_client.set_melt_quote_status_response(Ok(MeltQuoteBolt11Response {
+            payment_preimage: Some("preimage123".to_string()),
+            ..bolt11_status(&quote_id, MeltQuoteState::Paid, None)
+        }));
+
+        let result = match pending
+            .reconcile_non_paid_status(MeltQuoteState::Unpaid)
+            .await
+        {
+            WaitStep::Terminal(result) => result,
+            WaitStep::Continue(_) => panic!("expected terminal outcome"),
+        };
+
+        let finalized = result.expect("melt should finalize");
+        assert_eq!(finalized.state(), MeltQuoteState::Paid);
+        assert_eq!(finalized.payment_proof(), Some("preimage123"));
+
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state, State::Spent);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wait_pending_melt_polls_saga_and_finalizes() {
+        let (db, proof_y, operation_id, mock_client, pending) = pending_bolt11_melt(true).await;
+        let wallet = pending.saga.wallet;
+        let quote_id = pending.saga.quote().id.clone();
+        let payment_method = pending.saga.quote().payment_method.clone();
+
+        let paid_status = MeltQuoteBolt11Response {
+            payment_preimage: Some("preimage123".to_string()),
+            ..bolt11_status(&quote_id, MeltQuoteState::Paid, None)
+        };
+        mock_client._set_restore_response(Ok(RestoreResponse {
+            outputs: vec![],
+            signatures: vec![],
+        }));
+        mock_client.push_melt_quote_status_response(Ok(paid_status.clone()));
+        mock_client.push_melt_quote_status_response(Ok(paid_status));
+
+        let finalized = tokio::time::timeout(
+            Duration::from_secs(5),
+            wallet.wait_pending_melt(operation_id, &quote_id, payment_method),
+        )
+        .await
+        .expect("wait timed out")
+        .expect("pending melt should finalize");
+
+        assert_eq!(finalized.state(), MeltQuoteState::Paid);
+        assert_eq!(finalized.payment_proof(), Some("preimage123"));
+
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state, State::Spent);
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].ys, vec![proof_y]);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_non_paid_status_http_pending_keeps_waiting() {
+        let (db, proof_y, operation_id, mock_client, pending) = pending_bolt11_melt(false).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        mock_client.set_melt_quote_status_response(Ok(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Pending,
+            None,
+        )));
+
+        assert!(matches!(
+            pending
+                .reconcile_non_paid_status(MeltQuoteState::Unknown)
+                .await,
+            WaitStep::Continue(_)
+        ));
+
+        // Proofs stay pending and the saga is retained for a later check.
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored[0].state, State::Pending);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_non_paid_status_http_unknown_keeps_waiting() {
+        let (_db, _proof_y, _operation_id, mock_client, pending) = pending_bolt11_melt(false).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        mock_client.set_melt_quote_status_response(Ok(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Unknown,
+            None,
+        )));
+
+        assert!(matches!(
+            pending
+                .reconcile_non_paid_status(MeltQuoteState::Failed)
+                .await,
+            WaitStep::Continue(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_non_paid_status_http_unpaid_without_proof_fails() {
+        let (db, proof_y, operation_id, mock_client, pending) = pending_bolt11_melt(false).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        mock_client.set_melt_quote_status_response(Ok(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Unpaid,
+            None,
+        )));
+
+        match pending
+            .reconcile_non_paid_status(MeltQuoteState::Failed)
+            .await
+        {
+            WaitStep::Terminal(result) => {
+                assert!(matches!(result, Err(Error::PaymentFailed)));
+            }
+            WaitStep::Continue(_) => panic!("expected terminal failure"),
+        }
+
+        // Proofs released back to Unspent and the saga cleaned up.
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored[0].state, State::Unspent);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stale_failure_preserves_spent_proof() {
+        let (db, proof_y, operation_id, mock_client, pending) = pending_bolt11_melt(false).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        db.update_proofs_state(vec![proof_y], State::Spent)
+            .await
+            .unwrap();
+        mock_client.set_melt_quote_status_response(Ok(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Failed,
+            None,
+        )));
+
+        assert!(matches!(
+            pending
+                .reconcile_non_paid_status(MeltQuoteState::Failed)
+                .await,
+            WaitStep::Terminal(Err(Error::PaymentFailed))
+        ));
+
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored[0].state, State::Spent);
+        assert_eq!(stored[0].used_by_operation, Some(operation_id));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stale_failure_preserves_newer_proof_owner() {
+        let (db, proof_y, _operation_id, mock_client, pending) = pending_bolt11_melt(false).await;
+        let quote_id = pending.saga.quote().id.clone();
+        let newer_operation_id = uuid::Uuid::new_v4();
+
+        let mut stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        stored[0].state = State::Reserved;
+        stored[0].used_by_operation = Some(newer_operation_id);
+        db.update_proofs(stored, vec![]).await.unwrap();
+
+        mock_client.set_melt_quote_status_response(Ok(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Failed,
+            None,
+        )));
+
+        assert!(matches!(
+            pending
+                .reconcile_non_paid_status(MeltQuoteState::Failed)
+                .await,
+            WaitStep::Terminal(Err(Error::PaymentFailed))
+        ));
+
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored[0].state, State::Reserved);
+        assert_eq!(stored[0].used_by_operation, Some(newer_operation_id));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_non_paid_status_http_failed_with_proof_keeps_waiting() {
+        let (db, proof_y, operation_id, mock_client, pending) = pending_bolt11_melt(false).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        // HTTP reports Failed but carries a payment proof: never revert proofs.
+        mock_client.set_melt_quote_status_response(Ok(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Failed,
+            Some("preimage123".to_string()),
+        )));
+
+        assert!(matches!(
+            pending
+                .reconcile_non_paid_status(MeltQuoteState::Failed)
+                .await,
+            WaitStep::Continue(_)
+        ));
+
+        // Proofs remain pending and the saga is retained.
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored[0].state, State::Pending);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_non_paid_status_http_error_runs_recovery() {
+        let (db, proof_y, operation_id, mock_client, pending) = pending_bolt11_melt(false).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        // First HTTP check (inside reconcile) errors; recovery then re-checks
+        // and sees Pending, so the original error is surfaced and proofs are
+        // left untouched for a later recovery pass.
+        mock_client.push_melt_quote_status_response(Err(Error::Custom("mint offline".to_string())));
+        mock_client.push_melt_quote_status_response(Ok(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Pending,
+            None,
+        )));
+
+        match pending
+            .reconcile_non_paid_status(MeltQuoteState::Unpaid)
+            .await
+        {
+            WaitStep::Terminal(result) => assert!(result.is_err()),
+            WaitStep::Continue(_) => panic!("expected terminal outcome"),
+        }
+
+        // Recovery kept the melt pending: proofs and saga are preserved.
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored[0].state, State::Pending);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_wait_reconciles_non_paid_subscription_event_with_http_paid() {
+        let (db, proof_y, operation_id, mock_client, pending) = pending_bolt11_melt(true).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        // First get_melt_quote_status call answers the subscription poll with a
+        // non-paid state (no proof), which triggers reconciliation; the second
+        // answers the authoritative HTTP recheck with Paid.
+        mock_client.push_melt_quote_status_response(Ok(bolt11_status(
+            &quote_id,
+            MeltQuoteState::Unpaid,
+            None,
+        )));
+        mock_client.push_melt_quote_status_response(Ok(MeltQuoteBolt11Response {
+            payment_preimage: Some("preimage123".to_string()),
+            ..bolt11_status(&quote_id, MeltQuoteState::Paid, None)
+        }));
+
+        let finalized =
+            tokio::time::timeout(std::time::Duration::from_secs(5), pending.into_future())
+                .await
+                .expect("wait timed out")
+                .expect("melt should finalize");
+        assert_eq!(finalized.state(), MeltQuoteState::Paid);
+
+        let stored = db.get_proofs_by_ys(vec![proof_y]).await.unwrap();
+        assert_eq!(stored[0].state, State::Spent);
+        assert!(db.get_saga(&operation_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wait_pending_melt_records_persisted_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("label".to_string(), "ffi wait".to_string());
+        let (db, _proof_y, _operation_id, mock_client, pending) =
+            pending_bolt11_melt_with_metadata(true, metadata.clone()).await;
+        let quote_id = pending.saga.quote().id.clone();
+
+        mock_client.push_melt_quote_status_response(Ok(MeltQuoteBolt11Response {
+            payment_preimage: Some("preimage123".to_string()),
+            ..bolt11_status(&quote_id, MeltQuoteState::Paid, None)
+        }));
+        mock_client.push_melt_quote_status_response(Ok(MeltQuoteBolt11Response {
+            payment_preimage: Some("preimage123".to_string()),
+            ..bolt11_status(&quote_id, MeltQuoteState::Paid, None)
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), pending.into_future())
+            .await
+            .expect("wait timed out")
+            .expect("melt should finalize");
+
+        let transactions = db.list_transactions(None, None, None).await.unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].metadata, metadata);
     }
 }

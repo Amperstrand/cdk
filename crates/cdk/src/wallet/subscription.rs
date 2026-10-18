@@ -10,44 +10,27 @@ use std::fmt::Debug;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use cdk_common::nut00::KnownMethod;
 use cdk_common::nut17::ws::{
-    WsErrorResponse, WsMethodRequest, WsNotification, WsRequest, WsResponse, WsUnsubscribeRequest,
+    RawNotificationInner, RawWsMessageOrResponse, WsMethodRequest, WsRequest, WsUnsubscribeRequest,
+    JSON_RPC_VERSION,
 };
-use cdk_common::nut17::{Kind, NotificationId};
+use cdk_common::nut17::{deserialize_payload_for_kind, Kind, NotificationId};
 use cdk_common::parking_lot::RwLock;
 use cdk_common::pub_sub::remote_consumer::{
     Consumer, InternalRelay, RemoteActiveConsumer, StreamCtrl, SubscribeMessage, Transport,
 };
 use cdk_common::pub_sub::{Error as PubsubError, Spec, Subscriber};
 use cdk_common::subscription::WalletParams;
-use cdk_common::ws_client::{connect as ws_connect, WsError};
-use cdk_common::{
-    CheckStateRequest, MeltQuoteBolt11Response, MeltQuoteBolt12Response, MeltQuoteCustomResponse,
-    Method, MintQuoteBolt11Response, MintQuoteBolt12Response, MintQuoteCustomResponse,
-    PaymentMethod, ProofState, RoutePath,
-};
+use cdk_common::ws_client::WsError;
+use cdk_common::{CheckStateRequest, Method, PaymentMethod, RoutePath};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::event::MintEvent;
 use crate::mint_url::MintUrl;
+use crate::wallet::util::escape_log_value;
 use crate::wallet::MintConnector;
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct RawNotificationInner<I> {
-    #[serde(rename = "subId")]
-    sub_id: I,
-    payload: serde_json::Value,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(bound = "I: serde::Serialize + serde::de::DeserializeOwned")]
-#[serde(untagged)]
-enum RawWsMessageOrResponse<I> {
-    Response(WsResponse<I>),
-    ErrorResponse(WsErrorResponse),
-    Notification(Box<WsNotification<RawNotificationInner<I>>>),
-}
 
 /// Notification Payload
 pub type NotificationPayload = crate::nuts::NotificationPayload<String>;
@@ -173,6 +156,8 @@ impl SubscriptionClient {
             NotificationId::MeltQuoteBolt12(_) => Kind::Bolt12MeltQuote,
             NotificationId::MintQuoteBolt11(_) => Kind::Bolt11MintQuote,
             NotificationId::MintQuoteBolt12(_) => Kind::Bolt12MintQuote,
+            NotificationId::MintQuoteOnchain(_) => Kind::OnchainMintQuote,
+            NotificationId::MeltQuoteOnchain(_) => Kind::OnchainMeltQuote,
             NotificationId::MintQuoteCustom(method, _) => {
                 Kind::Custom(format!("{}_mint_quote", method))
             }
@@ -194,6 +179,8 @@ impl SubscriptionClient {
             | NotificationId::MeltQuoteBolt12(q)
             | NotificationId::MintQuoteBolt11(q)
             | NotificationId::MintQuoteBolt12(q)
+            | NotificationId::MintQuoteOnchain(q)
+            | NotificationId::MeltQuoteOnchain(q)
             | NotificationId::MintQuoteCustom(_, q)
             | NotificationId::MeltQuoteCustom(_, q) => q,
         };
@@ -217,7 +204,7 @@ impl SubscriptionClient {
             .ok()
     }
 
-    fn get_unsub_request(&self, sub_id: String) -> Option<String> {
+    fn get_unsub_request(&self, sub_id: String) -> Option<(usize, String)> {
         let request: WsRequest<_> = (
             WsMethodRequest::Unsubscribe(WsUnsubscribeRequest { sub_id }),
             self.req_id
@@ -225,49 +212,12 @@ impl SubscriptionClient {
         )
             .into();
 
-        match serde_json::to_string(&request) {
-            Ok(json) => Some(json),
-            Err(err) => {
+        serde_json::to_string(&request)
+            .inspect_err(|err| {
                 tracing::error!("Could not serialize unsubscribe message: {:?}", err);
-                None
-            }
-        }
-    }
-}
-
-fn decode_notification_payload(
-    kind: &Kind,
-    payload: serde_json::Value,
-) -> Result<NotificationPayload, PubsubError> {
-    match kind {
-        Kind::ProofState => serde_json::from_value::<ProofState>(payload)
-            .map(NotificationPayload::ProofState)
-            .map_err(|err| PubsubError::ParsingError(err.to_string())),
-        Kind::Bolt11MintQuote => serde_json::from_value::<MintQuoteBolt11Response<String>>(payload)
-            .map(NotificationPayload::MintQuoteBolt11Response)
-            .map_err(|err| PubsubError::ParsingError(err.to_string())),
-        Kind::Bolt11MeltQuote => serde_json::from_value::<MeltQuoteBolt11Response<String>>(payload)
-            .map(NotificationPayload::MeltQuoteBolt11Response)
-            .map_err(|err| PubsubError::ParsingError(err.to_string())),
-        Kind::Bolt12MintQuote => serde_json::from_value::<MintQuoteBolt12Response<String>>(payload)
-            .map(NotificationPayload::MintQuoteBolt12Response)
-            .map_err(|err| PubsubError::ParsingError(err.to_string())),
-        Kind::Bolt12MeltQuote => serde_json::from_value::<MeltQuoteBolt12Response<String>>(payload)
-            .map(NotificationPayload::MeltQuoteBolt12Response)
-            .map_err(|err| PubsubError::ParsingError(err.to_string())),
-        Kind::Custom(method) if method.ends_with("_mint_quote") => serde_json::from_value::<
-            MintQuoteCustomResponse<String>,
-        >(payload)
-        .map(|response| NotificationPayload::CustomMintQuoteResponse(method.clone(), response))
-        .map_err(|err| PubsubError::ParsingError(err.to_string())),
-        Kind::Custom(method) if method.ends_with("_melt_quote") => serde_json::from_value::<
-            MeltQuoteCustomResponse<String>,
-        >(payload)
-        .map(|response| NotificationPayload::CustomMeltQuoteResponse(method.clone(), response))
-        .map_err(|err| PubsubError::ParsingError(err.to_string())),
-        Kind::Custom(method) => Err(PubsubError::ParsingError(format!(
-            "Unsupported custom websocket notification kind: {method}"
-        ))),
+            })
+            .map(|json| (request.id, json))
+            .ok()
     }
 }
 
@@ -277,7 +227,7 @@ impl Transport for SubscriptionClient {
     type Spec = MintSubTopics;
 
     fn new_name(&self) -> <Self::Spec as Spec>::SubscriptionId {
-        Uuid::new_v4().to_string()
+        new_subscription_id()
     }
 
     async fn stream(
@@ -413,6 +363,52 @@ impl Transport for SubscriptionClient {
                         NotificationPayload::MeltQuoteBolt12Response(response),
                     ));
                 }
+                NotificationId::MintQuoteOnchain(id) => {
+                    let response = match self
+                        .http_client
+                        .get_mint_quote_status(PaymentMethod::Known(KnownMethod::Onchain), &id)
+                        .await
+                    {
+                        Ok(success) => match success {
+                            cdk_common::MintQuoteResponse::Onchain(r) => r,
+                            _ => {
+                                tracing::error!("Unexpected response type for MintOnchain {}", id);
+                                continue;
+                            }
+                        },
+                        Err(err) => {
+                            tracing::error!("Error with MintOnchain {} with {:?}", id, err);
+                            continue;
+                        }
+                    };
+
+                    reply_to.send(MintEvent::new(
+                        NotificationPayload::MintQuoteOnchainResponse(response),
+                    ));
+                }
+                NotificationId::MeltQuoteOnchain(id) => {
+                    let response = match self
+                        .http_client
+                        .get_melt_quote_status(PaymentMethod::Known(KnownMethod::Onchain), &id)
+                        .await
+                    {
+                        Ok(success) => match success {
+                            cdk_common::MeltQuoteResponse::Onchain(r) => r,
+                            _ => {
+                                tracing::error!("Unexpected response type for MeltOnchain {}", id);
+                                continue;
+                            }
+                        },
+                        Err(err) => {
+                            tracing::error!("Error with MeltOnchain {} with {:?}", id, err);
+                            continue;
+                        }
+                    };
+
+                    reply_to.send(MintEvent::new(
+                        NotificationPayload::MeltQuoteOnchainResponse(response),
+                    ));
+                }
                 NotificationId::MintQuoteCustom(method, id) => {
                     let response = match self
                         .http_client
@@ -473,6 +469,10 @@ impl Transport for SubscriptionClient {
     }
 }
 
+fn new_subscription_id() -> String {
+    Uuid::now_v7().to_string()
+}
+
 async fn stream_client(
     client: &SubscriptionClient,
     mut ctrl: mpsc::Receiver<StreamCtrl<MintSubTopics>>,
@@ -480,6 +480,7 @@ async fn stream_client(
     reply_to: InternalRelay<MintSubTopics>,
 ) -> Result<(), PubsubError> {
     let mut sub_id_to_kind = HashMap::new();
+    let mut pending_requests = HashMap::new();
 
     let mut url = client
         .mint_url
@@ -525,23 +526,28 @@ async fn stream_client(
     let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
     tracing::debug!("Connecting to {}", url);
-    let (mut sender, mut receiver) = ws_connect(&url_str, &header_refs).await.map_err(|err| {
-        tracing::error!("Error connecting: {err:?}");
-        map_ws_error(err)
-    })?;
+    let (mut sender, mut receiver) = client
+        .http_client
+        .connect_websocket(&url_str, &header_refs)
+        .await
+        .map_err(|err| {
+            tracing::error!("Error connecting: {err:?}");
+            map_ws_error(err)
+        })?;
 
     tracing::debug!("Connected to {}", url);
 
     for (name, index) in topics {
         let kind = SubscriptionClient::subscription_kind(&index);
-        let (_, req) = if let Some(req) = client.get_sub_request(name.clone(), index) {
+        let (request_id, req) = if let Some(req) = client.get_sub_request(name.clone(), index) {
             req
         } else {
             continue;
         };
 
-        sub_id_to_kind.insert(name, kind);
-        let _ = sender.send(req).await;
+        sub_id_to_kind.insert(name.clone(), kind);
+        sender.send(req).await.map_err(map_ws_error)?;
+        pending_requests.insert(request_id, PendingRequest::Subscribe { sub_id: name });
     }
 
     loop {
@@ -550,86 +556,212 @@ async fn stream_client(
                 match msg {
                     StreamCtrl::Subscribe(msg) => {
                         let kind = SubscriptionClient::subscription_kind(&msg.1);
-                        let (_, req) = if let Some(req) = client.get_sub_request(msg.0.clone(), msg.1) {
+                        let (request_id, req) = if let Some(req) = client.get_sub_request(msg.0.clone(), msg.1) {
                             req
                         } else {
                             continue;
                         };
-                        sub_id_to_kind.insert(msg.0, kind);
-                        let _ = sender.send(req).await;
+                        sub_id_to_kind.insert(msg.0.clone(), kind);
+                        sender.send(req).await.map_err(map_ws_error)?;
+                        pending_requests.insert(
+                            request_id,
+                            PendingRequest::Subscribe { sub_id: msg.0 },
+                        );
                     }
                     StreamCtrl::Unsubscribe(msg) => {
                         sub_id_to_kind.remove(&msg);
-                        let req = if let Some(req) = client.get_unsub_request(msg) {
+                        let (request_id, req) = if let Some(req) = client.get_unsub_request(msg.clone()) {
                             req
                         } else {
                             continue;
                         };
-                        let _ = sender.send(req).await;
+                        sender.send(req).await.map_err(map_ws_error)?;
+                        pending_requests.insert(
+                            request_id,
+                            PendingRequest::Unsubscribe { sub_id: msg },
+                        );
                     }
                     StreamCtrl::Stop => {
                         if let Err(err) = sender.close().await {
                             tracing::error!("Closing error {err:?}");
                         }
-                        break;
+                        return Ok(());
                     }
                 };
             }
             msg = receiver.recv() => {
                 let msg = match msg {
                     Some(Ok(msg)) => msg,
-                    Some(Err(_)) => {
+                    Some(Err(err)) => {
                         if let Err(err) = sender.close().await {
                             tracing::error!("Closing error {err:?}");
                         }
-                        sub_id_to_kind.clear();
-                        break;
+                        return Err(map_ws_error(err));
                     }
                     None => {
-                        sub_id_to_kind.clear();
-                        break;
+                        return Err(PubsubError::InternalStr(
+                            "WebSocket stream closed unexpectedly".to_string(),
+                        ));
                     }
                 };
-                let msg = match serde_json::from_str::<RawWsMessageOrResponse<String>>(&msg) {
-                    Ok(msg) => msg,
-                    Err(_) => continue,
-                };
-
-                match msg {
-                    RawWsMessageOrResponse::Notification(ref payload) => {
-                        let Some(kind) = sub_id_to_kind.get(&payload.params.sub_id) else {
-                            tracing::warn!(
-                                "Received websocket notification for unknown subId {}",
-                                payload.params.sub_id
-                            );
-                            continue;
-                        };
-
-                        let payload = decode_notification_payload(
-                            kind,
-                            payload.params.payload.clone(),
-                        )?;
-                        reply_to.send(payload);
-                    }
-                    RawWsMessageOrResponse::Response(response) => {
-                        tracing::debug!("Received response from server: {:?}", response);
-                    }
-                    RawWsMessageOrResponse::ErrorResponse(error) => {
-                        tracing::debug!("Received an error from server: {:?}", error);
-                        return Err(PubsubError::InternalStr(error.error.message));
-                    }
+                match handle_server_message(&msg, &sub_id_to_kind, &mut pending_requests) {
+                    ServerMessageAction::Ignore => continue,
+                    ServerMessageAction::Deliver(payload) => reply_to.send(*payload),
+                    ServerMessageAction::Fail(err) => return Err(err),
                 }
             }
         }
     }
+}
 
-    Ok(())
+enum ServerMessageAction {
+    Deliver(Box<NotificationPayload>),
+    Ignore,
+    Fail(PubsubError),
+}
+
+/// Decide what a frame from the server means for the websocket loop.
+///
+/// Only an error answering a request this client is still waiting on ends the
+/// stream. An error carrying a `null` or unknown id says nothing about the
+/// running subscriptions, and ending the stream over one would interrupt every
+/// subscription sharing the connection until the consumer's backoff elapses.
+fn handle_server_message(
+    raw: &str,
+    sub_id_to_kind: &HashMap<String, Kind>,
+    pending_requests: &mut HashMap<usize, PendingRequest>,
+) -> ServerMessageAction {
+    let msg = match serde_json::from_str::<RawWsMessageOrResponse<String>>(raw) {
+        Ok(msg) => msg,
+        Err(err) => {
+            tracing::debug!("Dropping an unparsable websocket frame: {}", err);
+            return ServerMessageAction::Ignore;
+        }
+    };
+
+    if msg.jsonrpc() != JSON_RPC_VERSION {
+        tracing::warn!(
+            "Ending the stream, the mint sent JSON-RPC version {}",
+            escape_log_value(msg.jsonrpc())
+        );
+        return ServerMessageAction::Fail(PubsubError::InternalStr(
+            "unsupported JSON-RPC version".to_string(),
+        ));
+    }
+
+    match msg {
+        RawWsMessageOrResponse::Notification(notification) => {
+            let RawNotificationInner { sub_id, payload } = notification.params;
+
+            let Some(kind) = sub_id_to_kind.get(&sub_id) else {
+                tracing::warn!(
+                    "Received websocket notification for unknown subId {}",
+                    sub_id
+                );
+                return ServerMessageAction::Ignore;
+            };
+
+            match decode_notification_payload_for_stream(kind, &sub_id, payload) {
+                Some(payload) => ServerMessageAction::Deliver(Box::new(payload)),
+                None => ServerMessageAction::Ignore,
+            }
+        }
+        RawWsMessageOrResponse::Response(response) => {
+            let Some(request) = pending_requests.remove(&response.id) else {
+                tracing::warn!(
+                    "Received websocket response for unknown request id {}",
+                    response.id
+                );
+                return ServerMessageAction::Ignore;
+            };
+
+            if response.result.sub_id != request.sub_id() {
+                tracing::warn!(
+                    "Received {} response for subId {}, expected {}",
+                    request.method(),
+                    response.result.sub_id,
+                    request.sub_id()
+                );
+                return ServerMessageAction::Ignore;
+            }
+
+            tracing::debug!(
+                "Received {} response from server for subId {} with status {}",
+                request.method(),
+                response.result.sub_id,
+                response.result.status
+            );
+
+            ServerMessageAction::Ignore
+        }
+        RawWsMessageOrResponse::ErrorResponse(error) => {
+            match error.id.and_then(|id| pending_requests.remove(&id)) {
+                Some(request) => {
+                    tracing::debug!(
+                        "Received an error from server for {} request and subId {}: {}",
+                        request.method(),
+                        request.sub_id(),
+                        error.error.message
+                    );
+                    ServerMessageAction::Fail(PubsubError::InternalStr(error.error.message))
+                }
+                None => {
+                    tracing::debug!(
+                        "Ignoring a server error that answers no pending request, id {:?}: {}",
+                        error.id,
+                        error.error.message
+                    );
+                    ServerMessageAction::Ignore
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingRequest {
+    Subscribe { sub_id: String },
+    Unsubscribe { sub_id: String },
+}
+
+impl PendingRequest {
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Subscribe { .. } => "subscribe",
+            Self::Unsubscribe { .. } => "unsubscribe",
+        }
+    }
+
+    fn sub_id(&self) -> &str {
+        match self {
+            Self::Subscribe { sub_id } | Self::Unsubscribe { sub_id } => sub_id,
+        }
+    }
+}
+
+fn decode_notification_payload_for_stream(
+    kind: &Kind,
+    sub_id: &str,
+    payload: serde_json::Value,
+) -> Option<NotificationPayload> {
+    match deserialize_payload_for_kind::<String, serde_json::Error>(kind, payload) {
+        Ok(payload) => Some(payload),
+        Err(err) => {
+            tracing::warn!(
+                "Dropping unsupported websocket notification for subId {}: {}",
+                sub_id,
+                err
+            );
+            None
+        }
+    }
 }
 
 fn map_ws_error(err: WsError) -> PubsubError {
     match err {
-        WsError::Connection(_) => PubsubError::NotSupported,
-        other => PubsubError::InternalStr(other.to_string()),
+        WsError::Transient(message) => PubsubError::InternalStr(message),
+        WsError::NotSupported(_) => PubsubError::NotSupported,
+        WsError::Terminal(message) => PubsubError::Terminal(message),
     }
 }
 
@@ -640,6 +772,221 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nut17_subscription_ids_use_uuid_v7() {
+        let id = Uuid::parse_str(&new_subscription_id()).expect("valid subscription UUID");
+
+        assert_eq!(id.get_version_num(), 7);
+    }
+
+    #[test]
+    fn unsupported_notification_does_not_block_the_next_notification() {
+        let unsupported = json!({
+            "Y": "02194603ffa062682c4f10e2dfe8f53e17d5d0329db51c8d3935cc74a4c0e0d4cb",
+            "state": "FUTURE_STATE",
+            "witness": null
+        });
+        let supported = json!({
+            "Y": "02194603ffa062682c4f10e2dfe8f53e17d5d0329db51c8d3935cc74a4c0e0d4cb",
+            "state": "UNSPENT",
+            "witness": null
+        });
+
+        assert!(
+            decode_notification_payload_for_stream(&Kind::ProofState, "sub-id", unsupported)
+                .is_none()
+        );
+        assert!(matches!(
+            decode_notification_payload_for_stream(&Kind::ProofState, "sub-id", supported),
+            Some(NotificationPayload::ProofState(_))
+        ));
+    }
+
+    fn proof_state_notification(sub_id: &str) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "subscribe",
+            "params": {
+                "subId": sub_id,
+                "payload": {
+                    "Y": "02194603ffa062682c4f10e2dfe8f53e17d5d0329db51c8d3935cc74a4c0e0d4cb",
+                    "state": "UNSPENT",
+                    "witness": null
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn subscribe_response(id: usize, sub_id: &str) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "result": { "status": "OK", "subId": sub_id },
+            "id": id
+        })
+        .to_string()
+    }
+
+    fn with_version(frame: &str, version: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(frame).expect("a json frame");
+        value["jsonrpc"] = json!(version);
+        value.to_string()
+    }
+
+    fn error_frame(id: serde_json::Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32700, "message": "Parse error" },
+            "id": id
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn error_without_an_id_does_not_stop_the_stream() {
+        let sub_id_to_kind = HashMap::from([("sub-id".to_string(), Kind::ProofState)]);
+        let mut pending_requests = HashMap::from([(
+            1,
+            PendingRequest::Subscribe {
+                sub_id: "sub-id".to_string(),
+            },
+        )]);
+
+        assert!(matches!(
+            handle_server_message(
+                &error_frame(json!(null)),
+                &sub_id_to_kind,
+                &mut pending_requests
+            ),
+            ServerMessageAction::Ignore
+        ));
+        assert!(pending_requests.contains_key(&1));
+
+        match handle_server_message(
+            &proof_state_notification("sub-id"),
+            &sub_id_to_kind,
+            &mut pending_requests,
+        ) {
+            ServerMessageAction::Deliver(payload) => {
+                assert!(matches!(*payload, NotificationPayload::ProofState(_)));
+            }
+            _ => panic!("expected the notification to be delivered"),
+        }
+    }
+
+    #[test]
+    fn error_for_an_unknown_request_does_not_stop_the_stream() {
+        let sub_id_to_kind = HashMap::new();
+        let mut pending_requests = HashMap::new();
+
+        assert!(matches!(
+            handle_server_message(
+                &error_frame(json!(42)),
+                &sub_id_to_kind,
+                &mut pending_requests
+            ),
+            ServerMessageAction::Ignore
+        ));
+    }
+
+    #[test]
+    fn error_for_a_pending_request_stops_the_stream() {
+        let sub_id_to_kind = HashMap::new();
+        let mut pending_requests = HashMap::from([(
+            1,
+            PendingRequest::Subscribe {
+                sub_id: "sub-id".to_string(),
+            },
+        )]);
+
+        assert!(matches!(
+            handle_server_message(
+                &error_frame(json!(1)),
+                &sub_id_to_kind,
+                &mut pending_requests
+            ),
+            ServerMessageAction::Fail(PubsubError::InternalStr(_))
+        ));
+        assert!(pending_requests.is_empty());
+    }
+
+    #[test]
+    fn notification_for_an_unknown_sub_id_is_ignored() {
+        let sub_id_to_kind = HashMap::new();
+        let mut pending_requests = HashMap::new();
+
+        assert!(matches!(
+            handle_server_message(
+                &proof_state_notification("sub-id"),
+                &sub_id_to_kind,
+                &mut pending_requests
+            ),
+            ServerMessageAction::Ignore
+        ));
+    }
+
+    #[test]
+    fn unsupported_jsonrpc_version_stops_the_stream() {
+        let sub_id_to_kind = HashMap::from([("sub-id".to_string(), Kind::ProofState)]);
+
+        for frame in [
+            proof_state_notification("sub-id"),
+            subscribe_response(1, "sub-id"),
+            error_frame(json!(1)),
+        ] {
+            let mut pending_requests = HashMap::from([(
+                1,
+                PendingRequest::Subscribe {
+                    sub_id: "sub-id".to_string(),
+                },
+            )]);
+
+            assert!(
+                matches!(
+                    handle_server_message(
+                        &with_version(&frame, "1.0"),
+                        &sub_id_to_kind,
+                        &mut pending_requests
+                    ),
+                    ServerMessageAction::Fail(PubsubError::InternalStr(_))
+                ),
+                "{frame} should end the stream at version 1.0"
+            );
+        }
+    }
+
+    #[test]
+    fn unparsable_frame_is_ignored() {
+        let sub_id_to_kind = HashMap::new();
+        let mut pending_requests = HashMap::new();
+
+        assert!(matches!(
+            handle_server_message("not json", &sub_id_to_kind, &mut pending_requests),
+            ServerMessageAction::Ignore
+        ));
+    }
+
+    #[test]
+    fn transient_websocket_failure_keeps_streaming_enabled() {
+        let error = map_ws_error(WsError::Transient("temporary disconnect".to_string()));
+
+        assert!(matches!(error, PubsubError::InternalStr(_)));
+    }
+
+    #[test]
+    fn unsupported_websocket_failure_disables_streaming() {
+        let error = map_ws_error(WsError::NotSupported("404".to_string()));
+
+        assert!(matches!(error, PubsubError::NotSupported));
+    }
+
+    #[test]
+    fn terminal_websocket_failure_disables_streaming() {
+        let error = map_ws_error(WsError::Terminal("attestation failed".to_string()));
+
+        assert!(matches!(error, PubsubError::Terminal(_)));
+    }
+
+    #[test]
     fn decode_proof_state_notification() {
         let payload = json!({
             "Y": "02194603ffa062682c4f10e2dfe8f53e17d5d0329db51c8d3935cc74a4c0e0d4cb",
@@ -647,7 +994,9 @@ mod tests {
             "witness": null
         });
 
-        let decoded = decode_notification_payload(&Kind::ProofState, payload).unwrap();
+        let decoded =
+            deserialize_payload_for_kind::<String, serde_json::Error>(&Kind::ProofState, payload)
+                .unwrap();
 
         assert!(matches!(decoded, NotificationPayload::ProofState(_)));
     }
@@ -657,6 +1006,7 @@ mod tests {
         let mint_payload = json!({
             "quote": "mint-quote",
             "request": "lnbc1...",
+            "method": "bolt11",
             "state": "PAID",
             "expiry": 1234,
             "paid": true
@@ -665,15 +1015,22 @@ mod tests {
             "quote": "melt-quote",
             "amount": 21,
             "fee_reserve": 1,
+            "method": "bolt11",
             "state": "PAID",
             "expiry": 1234,
             "payment_proof": "abc"
         });
 
-        let mint_decoded =
-            decode_notification_payload(&Kind::Bolt11MintQuote, mint_payload).unwrap();
-        let melt_decoded =
-            decode_notification_payload(&Kind::Bolt11MeltQuote, melt_payload).unwrap();
+        let mint_decoded = deserialize_payload_for_kind::<String, serde_json::Error>(
+            &Kind::Bolt11MintQuote,
+            mint_payload,
+        )
+        .unwrap();
+        let melt_decoded = deserialize_payload_for_kind::<String, serde_json::Error>(
+            &Kind::Bolt11MeltQuote,
+            melt_payload,
+        )
+        .unwrap();
 
         assert!(matches!(
             mint_decoded,
@@ -687,36 +1044,88 @@ mod tests {
 
     #[test]
     fn decode_bolt12_notification() {
-        let payload = json!({
+        let mint_payload = json!({
             "quote": "quote-id",
             "request": "lni1...",
             "amount": null,
             "unit": "sat",
-            "state": "UNPAID",
+            "method": "bolt12",
             "expiry": 1234,
             "pubkey": "02194603ffa062682c4f10e2dfe8f53e17d5d0329db51c8d3935cc74a4c0e0d4cb",
             "amount_paid": 0,
             "amount_issued": 0
         });
+        let melt_payload = json!({
+            "quote": "melt-quote",
+            "amount": 21,
+            "fee_reserve": 1,
+            "state": "PAID",
+            "expiry": 1234,
+            "request": "lni1...",
+            "unit": "sat"
+        });
 
-        let decoded = decode_notification_payload(&Kind::Bolt12MintQuote, payload).unwrap();
+        let mint_decoded = deserialize_payload_for_kind::<String, serde_json::Error>(
+            &Kind::Bolt12MintQuote,
+            mint_payload,
+        )
+        .unwrap();
+        let melt_decoded = deserialize_payload_for_kind::<String, serde_json::Error>(
+            &Kind::Bolt12MeltQuote,
+            melt_payload,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            mint_decoded,
+            NotificationPayload::MintQuoteBolt12Response(_)
+        ));
+        match melt_decoded {
+            NotificationPayload::MeltQuoteBolt12Response(response) => {
+                assert_eq!(response.method, PaymentMethod::BOLT12);
+            }
+            _ => panic!("expected bolt12 melt response"),
+        }
+    }
+
+    #[test]
+    fn decode_onchain_mint_notification_uses_subscription_kind() {
+        let payload = json!({
+            "quote": "onchain-quote",
+            "request": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            "unit": "sat",
+            "expiry": 1234,
+            "pubkey": "02194603ffa062682c4f10e2dfe8f53e17d5d0329db51c8d3935cc74a4c0e0d4cb",
+            "amount_paid": 0,
+            "amount_issued": 0,
+            "state": "future-extension"
+        });
+
+        let decoded = deserialize_payload_for_kind::<String, serde_json::Error>(
+            &Kind::OnchainMintQuote,
+            payload,
+        )
+        .unwrap();
 
         assert!(matches!(
             decoded,
-            NotificationPayload::MintQuoteBolt12Response(_)
+            NotificationPayload::MintQuoteOnchainResponse(_)
         ));
     }
 
     #[test]
     fn decode_custom_notifications() {
-        let mint_method = "foo_mint_quote".to_string();
-        let melt_method = "foo_melt_quote".to_string();
+        let mint_method = "foo".to_string();
+        let melt_method = "foo".to_string();
+        let mint_kind = Kind::Custom(format!("{}_mint_quote", mint_method));
+        let melt_kind = Kind::Custom(format!("{}_melt_quote", melt_method));
         let mint_payload = json!({
             "quote": "mint-custom",
             "request": "custom-request",
             "amount": 42,
             "unit": "sat",
-            "state": "UNPAID",
+            "amount_paid": 0,
+            "amount_issued": 0,
             "expiry": 1234,
             "pubkey": null,
             "extra_field": "value"
@@ -734,26 +1143,31 @@ mod tests {
         });
 
         let mint_decoded =
-            decode_notification_payload(&Kind::Custom(mint_method.clone()), mint_payload).unwrap();
+            deserialize_payload_for_kind::<String, serde_json::Error>(&mint_kind, mint_payload)
+                .unwrap();
         let melt_decoded =
-            decode_notification_payload(&Kind::Custom(melt_method.clone()), melt_payload).unwrap();
+            deserialize_payload_for_kind::<String, serde_json::Error>(&melt_kind, melt_payload)
+                .unwrap();
 
         assert!(matches!(
             mint_decoded,
-            NotificationPayload::CustomMintQuoteResponse(method, _) if method == mint_method
+            NotificationPayload::CustomMintQuoteResponse(method, response)
+                if method == mint_method && response.method == "foo"
         ));
         assert!(matches!(
             melt_decoded,
-            NotificationPayload::CustomMeltQuoteResponse(method, _) if method == melt_method
+            NotificationPayload::CustomMeltQuoteResponse(method, response)
+                if method == melt_method && response.method == "foo"
         ));
     }
 
     #[test]
     fn decode_unknown_custom_kind_errors() {
-        let err = decode_notification_payload(&Kind::Custom("foo_status".to_string()), json!({}))
-            .unwrap_err();
-
-        assert!(matches!(err, PubsubError::ParsingError(_)));
+        assert!(deserialize_payload_for_kind::<String, serde_json::Error>(
+            &Kind::Custom("foo_status".to_string()),
+            json!({}),
+        )
+        .is_err());
     }
 
     #[test]
@@ -764,8 +1178,10 @@ mod tests {
             "witness": null
         });
 
-        let err = decode_notification_payload(&Kind::Bolt12MintQuote, payload).unwrap_err();
-
-        assert!(matches!(err, PubsubError::ParsingError(_)));
+        assert!(deserialize_payload_for_kind::<String, serde_json::Error>(
+            &Kind::Bolt12MintQuote,
+            payload,
+        )
+        .is_err());
     }
 }

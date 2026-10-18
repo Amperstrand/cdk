@@ -22,6 +22,12 @@ pub enum HttpError {
     /// Serialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
+    /// The endpoint answered with a redirect that was not followed.
+    ///
+    /// Wallet transports run without redirects because a redirected POST can
+    /// lose its body, so the caller has to reach the final URL itself.
+    #[error("Redirect not followed: {0}")]
+    Redirect(String),
     /// Proxy error
     #[error("Proxy error: {0}")]
     Proxy(String),
@@ -33,24 +39,51 @@ pub enum HttpError {
     Other(String),
 }
 
-impl From<reqwest::Error> for HttpError {
-    fn from(err: reqwest::Error) -> Self {
-        if err.is_timeout() {
-            HttpError::Timeout
-        } else if err.is_builder() {
-            HttpError::Build(err.to_string())
-        } else if let Some(status) = err.status() {
-            HttpError::Status {
-                status: status.as_u16(),
-                message: err.to_string(),
+impl HttpError {
+    /// Return whether this error is eligible for NUT-19 request replay.
+    ///
+    /// Only ambiguous transport failures are eligible. HTTP status responses
+    /// are never eligible because NUT-19 caches successful responses only; a
+    /// failed status therefore does not prove that replaying a side-effecting
+    /// request is safe.
+    pub fn is_replay_safe(&self) -> bool {
+        matches!(self, Self::Connection(_) | Self::Timeout)
+    }
+}
+
+#[cfg(all(
+    feature = "bitreq",
+    not(feature = "reqwest"),
+    not(target_arch = "wasm32")
+))]
+impl From<bitreq::Error> for HttpError {
+    fn from(err: bitreq::Error) -> Self {
+        use std::io;
+
+        use bitreq::Error;
+
+        match err {
+            Error::SerdeJsonError(_) => HttpError::Serialization(err.to_string()),
+            Error::InvalidUtf8InBody(_) => HttpError::Serialization(err.to_string()),
+            Error::InvalidUtf8InResponse => HttpError::Serialization(err.to_string()),
+            Error::IoError(io_err) => {
+                if io_err.kind() == io::ErrorKind::TimedOut {
+                    HttpError::Timeout
+                } else if io_err.kind() == io::ErrorKind::ConnectionRefused
+                    || io_err.kind() == io::ErrorKind::ConnectionReset
+                    || io_err.kind() == io::ErrorKind::ConnectionAborted
+                    || io_err.kind() == io::ErrorKind::NotConnected
+                {
+                    HttpError::Connection(io_err.to_string())
+                } else {
+                    HttpError::Other(io_err.to_string())
+                }
             }
-        } else {
-            // is_connect() is not available on wasm32
-            #[cfg(not(target_arch = "wasm32"))]
-            if err.is_connect() {
-                return HttpError::Connection(err.to_string());
-            }
-            HttpError::Other(err.to_string())
+            Error::AddressNotFound => HttpError::Connection(err.to_string()),
+            Error::TooManyRedirections
+            | Error::RedirectLocationMissing
+            | Error::InfiniteRedirectionLoop => HttpError::Redirect(err.to_string()),
+            _ => HttpError::Other(err.to_string()),
         }
     }
 }
@@ -126,5 +159,22 @@ mod tests {
             }
             _ => panic!("Expected HttpError::Serialization"),
         }
+    }
+
+    #[test]
+    fn test_replay_safe_error_classification() {
+        assert!(HttpError::Connection("reset".to_string()).is_replay_safe());
+        assert!(HttpError::Timeout.is_replay_safe());
+
+        for status in [400, 408, 429, 500, 503] {
+            assert!(!HttpError::Status {
+                status,
+                message: "request failed".to_string(),
+            }
+            .is_replay_safe());
+        }
+
+        assert!(!HttpError::Serialization("bad JSON".to_string()).is_replay_safe());
+        assert!(!HttpError::Other("attestation failed".to_string()).is_replay_safe());
     }
 }

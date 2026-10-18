@@ -1,6 +1,8 @@
 //! Wallet-related FFI types
 
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
 
 use cdk_common::bitcoin;
 use serde::{Deserialize, Serialize};
@@ -142,6 +144,78 @@ impl From<cdk::wallet::SendKind> for SendKind {
     }
 }
 
+/// Policy controlling how keysets are loaded
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, uniffi::Enum, Default,
+)]
+pub enum KeysetLoadPolicy {
+    /// Use in-memory cache and local database only. Never contacts the network.
+    CacheOnly,
+    /// Check cache first (respects TTL). Falls back to database, then network.
+    #[default]
+    CacheThenNetwork,
+    /// Always fetch fresh data from the mint over the network.
+    Refresh,
+}
+
+impl From<KeysetLoadPolicy> for cdk_common::wallet::KeysetLoadPolicy {
+    fn from(policy: KeysetLoadPolicy) -> Self {
+        match policy {
+            KeysetLoadPolicy::CacheOnly => cdk_common::wallet::KeysetLoadPolicy::CacheOnly,
+            KeysetLoadPolicy::CacheThenNetwork => {
+                cdk_common::wallet::KeysetLoadPolicy::CacheThenNetwork
+            }
+            KeysetLoadPolicy::Refresh => cdk_common::wallet::KeysetLoadPolicy::Refresh,
+        }
+    }
+}
+
+impl From<cdk_common::wallet::KeysetLoadPolicy> for KeysetLoadPolicy {
+    fn from(policy: cdk_common::wallet::KeysetLoadPolicy) -> Self {
+        match policy {
+            cdk_common::wallet::KeysetLoadPolicy::CacheOnly => KeysetLoadPolicy::CacheOnly,
+            cdk_common::wallet::KeysetLoadPolicy::CacheThenNetwork => {
+                KeysetLoadPolicy::CacheThenNetwork
+            }
+            cdk_common::wallet::KeysetLoadPolicy::Refresh => KeysetLoadPolicy::Refresh,
+        }
+    }
+}
+
+/// FFI-compatible P2PK locked proof send mode
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, uniffi::Enum, Default,
+)]
+pub enum P2PKLockedProofSendMode {
+    /// Swap locked proofs into fresh proofs before creating the token
+    #[default]
+    Swap,
+    /// Sign locked proofs and include them directly in the token
+    SignAndSend,
+}
+
+impl From<P2PKLockedProofSendMode> for cdk::wallet::P2PKLockedProofSendMode {
+    fn from(mode: P2PKLockedProofSendMode) -> Self {
+        match mode {
+            P2PKLockedProofSendMode::Swap => cdk::wallet::P2PKLockedProofSendMode::Swap,
+            P2PKLockedProofSendMode::SignAndSend => {
+                cdk::wallet::P2PKLockedProofSendMode::SignAndSend
+            }
+        }
+    }
+}
+
+impl From<cdk::wallet::P2PKLockedProofSendMode> for P2PKLockedProofSendMode {
+    fn from(mode: cdk::wallet::P2PKLockedProofSendMode) -> Self {
+        match mode {
+            cdk::wallet::P2PKLockedProofSendMode::Swap => P2PKLockedProofSendMode::Swap,
+            cdk::wallet::P2PKLockedProofSendMode::SignAndSend => {
+                P2PKLockedProofSendMode::SignAndSend
+            }
+        }
+    }
+}
+
 /// FFI-compatible Send options
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct SendOptions {
@@ -160,35 +234,42 @@ pub struct SendOptions {
     pub max_proofs: Option<u32>,
     /// Metadata
     pub metadata: HashMap<String, String>,
+    /// Signing keys for P2PK-locked input proofs
+    #[serde(default)]
+    pub p2pk_signing_keys: Vec<SecretKey>,
+    /// How P2PK-locked input proofs should be handled during send
+    #[serde(default)]
+    pub p2pk_locked_proof_send_mode: P2PKLockedProofSendMode,
 }
 
 impl Default for SendOptions {
     fn default() -> Self {
-        Self {
-            memo: None,
-            conditions: None,
-            amount_split_target: SplitTarget::None,
-            send_kind: SendKind::OnlineExact,
-            include_fee: false,
-            max_proofs: None,
-            metadata: HashMap::new(),
-            use_p2bk: false,
-        }
+        cdk::wallet::SendOptions::default().into()
     }
 }
 
-impl From<SendOptions> for cdk::wallet::SendOptions {
-    fn from(opts: SendOptions) -> Self {
-        cdk::wallet::SendOptions {
+impl TryFrom<SendOptions> for cdk::wallet::SendOptions {
+    type Error = FfiError;
+
+    fn try_from(opts: SendOptions) -> Result<Self, Self::Error> {
+        let p2pk_signing_keys = opts
+            .p2pk_signing_keys
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(cdk::wallet::SendOptions {
             memo: opts.memo.map(Into::into),
-            conditions: opts.conditions.and_then(|c| c.try_into().ok()),
+            conditions: opts.conditions.map(TryInto::try_into).transpose()?,
             amount_split_target: opts.amount_split_target.into(),
             send_kind: opts.send_kind.into(),
             include_fee: opts.include_fee,
             max_proofs: opts.max_proofs.map(|p| p as usize),
             metadata: opts.metadata,
             use_p2bk: opts.use_p2bk,
-        }
+            p2pk_signing_keys,
+            p2pk_locked_proof_send_mode: opts.p2pk_locked_proof_send_mode.into(),
+        })
     }
 }
 
@@ -203,6 +284,8 @@ impl From<cdk::wallet::SendOptions> for SendOptions {
             max_proofs: opts.max_proofs.map(|p| p as u32),
             metadata: opts.metadata,
             use_p2bk: opts.use_p2bk,
+            p2pk_signing_keys: opts.p2pk_signing_keys.into_iter().map(Into::into).collect(),
+            p2pk_locked_proof_send_mode: opts.p2pk_locked_proof_send_mode.into(),
         }
     }
 }
@@ -227,11 +310,19 @@ pub fn encode_send_options(options: SendOptions) -> Result<String, FfiError> {
 }
 
 /// FFI-compatible SecretKey
-#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Serialize, Deserialize, uniffi::Record)]
 #[serde(transparent)]
 pub struct SecretKey {
     /// Hex-encoded secret key (64 characters)
     pub hex: String,
+}
+
+impl fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretKey")
+            .field("hex", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl SecretKey {
@@ -282,11 +373,12 @@ impl From<cdk::nuts::SecretKey> for SecretKey {
 }
 
 /// FFI-compatible Receive options
-#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
+#[derive(Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct ReceiveOptions {
     /// Amount split target
     pub amount_split_target: SplitTarget,
     /// P2PK signing keys
+    #[serde(default)]
     pub p2pk_signing_keys: Vec<SecretKey>,
     /// Preimages for HTLC conditions
     pub preimages: Vec<String>,
@@ -294,14 +386,20 @@ pub struct ReceiveOptions {
     pub metadata: HashMap<String, String>,
 }
 
+impl fmt::Debug for ReceiveOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReceiveOptions")
+            .field("amount_split_target", &self.amount_split_target)
+            .field("p2pk_signing_keys", &"[REDACTED]")
+            .field("preimages", &"[REDACTED]")
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
 impl Default for ReceiveOptions {
     fn default() -> Self {
-        Self {
-            amount_split_target: SplitTarget::None,
-            p2pk_signing_keys: Vec::new(),
-            preimages: Vec::new(),
-            metadata: HashMap::new(),
-        }
+        cdk::wallet::ReceiveOptions::default().into()
     }
 }
 
@@ -352,6 +450,96 @@ pub fn decode_receive_options(json: String) -> Result<ReceiveOptions, FfiError> 
 #[uniffi::export]
 pub fn encode_receive_options(options: ReceiveOptions) -> Result<String, FfiError> {
     Ok(serde_json::to_string(&options)?)
+}
+
+/// FFI-compatible Melt prepare options
+#[derive(Clone, Default, Serialize, Deserialize, uniffi::Record)]
+pub struct MeltPrepareOptions {
+    /// Signing keys for P2PK/HTLC-locked input proofs; keys known to the
+    /// wallet are merged in automatically
+    #[serde(default)]
+    pub p2pk_signing_keys: Vec<SecretKey>,
+    /// Preimages for HTLC-locked input proofs
+    #[serde(default)]
+    pub preimages: Vec<String>,
+    /// Metadata
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+}
+
+impl fmt::Debug for MeltPrepareOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MeltPrepareOptions")
+            .field("p2pk_signing_keys", &"[REDACTED]")
+            .field("preimages", &"[REDACTED]")
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+impl TryFrom<MeltPrepareOptions> for cdk::wallet::MeltPrepareOptions {
+    type Error = FfiError;
+
+    fn try_from(opts: MeltPrepareOptions) -> Result<Self, Self::Error> {
+        let p2pk_signing_keys = opts
+            .p2pk_signing_keys
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(cdk::wallet::MeltPrepareOptions {
+            p2pk_signing_keys,
+            preimages: opts.preimages,
+            metadata: opts.metadata,
+        })
+    }
+}
+
+/// Decode MeltPrepareOptions from JSON string
+#[uniffi::export]
+pub fn decode_melt_prepare_options(json: String) -> Result<MeltPrepareOptions, FfiError> {
+    Ok(serde_json::from_str(&json)?)
+}
+
+/// Encode MeltPrepareOptions to JSON string
+#[uniffi::export]
+pub fn encode_melt_prepare_options(options: MeltPrepareOptions) -> Result<String, FfiError> {
+    Ok(serde_json::to_string(&options)?)
+}
+
+/// FFI-compatible NUT-13 restore options
+#[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
+pub struct NUT13Options {
+    /// Number of blinded messages to request per batch
+    pub batch_size: u32,
+    /// Number of consecutive empty batches that terminate the scan
+    pub max_gap: u32,
+}
+
+impl Default for NUT13Options {
+    fn default() -> Self {
+        cdk::wallet::NUT13Options::default().into()
+    }
+}
+
+impl TryFrom<NUT13Options> for cdk::wallet::NUT13Options {
+    type Error = FfiError;
+
+    fn try_from(opts: NUT13Options) -> Result<Self, Self::Error> {
+        Ok(cdk::wallet::NUT13Options::new(
+            opts.batch_size,
+            opts.max_gap,
+        )?)
+    }
+}
+
+impl From<cdk::wallet::NUT13Options> for NUT13Options {
+    fn from(opts: cdk::wallet::NUT13Options) -> Self {
+        NUT13Options {
+            batch_size: opts.batch_size,
+            max_gap: opts.max_gap,
+        }
+    }
 }
 
 /// FFI-compatible PreparedSend
@@ -465,7 +653,7 @@ impl PreparedSend {
 }
 
 /// FFI-compatible FinalizedMelt result
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Clone, uniffi::Record)]
 pub struct FinalizedMelt {
     pub quote_id: String,
     pub state: super::quote::QuoteState,
@@ -473,6 +661,19 @@ pub struct FinalizedMelt {
     pub change: Option<Proofs>,
     pub amount: Amount,
     pub fee_paid: Amount,
+}
+
+impl fmt::Debug for FinalizedMelt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FinalizedMelt")
+            .field("quote_id", &self.quote_id)
+            .field("state", &self.state)
+            .field("preimage", &self.preimage.as_ref().map(|_| "[REDACTED]"))
+            .field("change_proof_count", &self.change.as_ref().map(Vec::len))
+            .field("amount", &self.amount)
+            .field("fee_paid", &self.fee_paid)
+            .finish()
+    }
 }
 
 impl From<cdk_common::common::FinalizedMelt> for FinalizedMelt {
@@ -490,6 +691,81 @@ impl From<cdk_common::common::FinalizedMelt> for FinalizedMelt {
     }
 }
 
+/// A pending async melt accepted by the mint.
+///
+/// FFI callers receive this handle when the mint accepts a melt for background
+/// processing. Call [`PendingMelt::wait`] from a background task/coroutine to
+/// poll existing wallet recovery until the melt settles.
+///
+/// Mobile apps should also call [`crate::Wallet::recover_incomplete_sagas`] or
+/// [`crate::Wallet::finalize_pending_melts`] on startup/resume, because
+/// operating systems may suspend or cancel long-running background waits.
+#[derive(uniffi::Object)]
+pub struct PendingMelt {
+    wallet: Arc<cdk::Wallet>,
+    quote_id: String,
+    operation_id: uuid::Uuid,
+    payment_method: cdk_common::PaymentMethod,
+}
+
+impl std::fmt::Debug for PendingMelt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingMelt")
+            .field("operation_id", &self.operation_id)
+            .field("quote_id", &self.quote_id)
+            .finish()
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl PendingMelt {
+    /// Quote ID for this pending melt.
+    pub fn quote_id(&self) -> String {
+        self.quote_id.clone()
+    }
+
+    /// Operation ID for this pending melt saga.
+    pub fn operation_id(&self) -> String {
+        self.operation_id.to_string()
+    }
+
+    /// Wait for this pending melt to complete.
+    ///
+    /// This method polls the wallet's existing melt recovery path until the
+    /// pending saga finalizes or fails.
+    ///
+    /// This can wait for an extended period. Swift/Kotlin callers should run it
+    /// in a cancellable background task or coroutine, not directly in UI
+    /// control flow. If the app is suspended or killed before this returns,
+    /// call `Wallet::recover_incomplete_sagas()` or
+    /// `Wallet::finalize_pending_melts()` after restart/resume.
+    pub async fn wait(&self) -> Result<FinalizedMelt, FfiError> {
+        let finalized = self
+            .wallet
+            .wait_pending_melt(
+                self.operation_id,
+                &self.quote_id,
+                self.payment_method.clone(),
+            )
+            .await?;
+
+        Ok(finalized.into())
+    }
+}
+
+/// Result of async-preferred melt confirmation.
+///
+/// `Paid` means the melt finalized during confirmation. `Pending` means the
+/// mint accepted the melt for asynchronous processing; call
+/// [`PendingMelt::wait`] to complete the normal app flow.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum MeltConfirmOutcome {
+    /// Melt finalized during confirmation.
+    Paid { finalized: FinalizedMelt },
+    /// Mint accepted async melt processing and the payment is still pending.
+    Pending { pending: Arc<PendingMelt> },
+}
+
 /// FFI-compatible PreparedMelt
 ///
 /// This wraps the data from a prepared melt operation along with a reference
@@ -497,7 +773,7 @@ impl From<cdk_common::common::FinalizedMelt> for FinalizedMelt {
 /// that doesn't work with FFI, so we store the wallet and cached data separately.
 #[derive(uniffi::Object)]
 pub struct PreparedMelt {
-    wallet: std::sync::Arc<cdk::Wallet>,
+    wallet: Arc<cdk::Wallet>,
     operation_id: uuid::Uuid,
     quote: cdk_common::wallet::MeltQuote,
     proofs: cdk::nuts::Proofs,
@@ -520,10 +796,7 @@ impl std::fmt::Debug for PreparedMelt {
 
 impl PreparedMelt {
     /// Create a new FFI PreparedMelt from a cdk::wallet::PreparedMelt and wallet
-    pub fn new(
-        wallet: std::sync::Arc<cdk::Wallet>,
-        prepared: &cdk::wallet::PreparedMelt<'_>,
-    ) -> Self {
+    pub fn new(wallet: Arc<cdk::Wallet>, prepared: &cdk::wallet::PreparedMelt<'_>) -> Self {
         Self {
             wallet,
             operation_id: prepared.operation_id(),
@@ -533,7 +806,40 @@ impl PreparedMelt {
             swap_fee: prepared.swap_fee().into(),
             input_fee: prepared.input_fee().into(),
             input_fee_without_swap: prepared.input_fee_without_swap().into(),
-            metadata: HashMap::new(),
+            metadata: prepared.metadata().clone(),
+        }
+    }
+
+    async fn confirm_prefer_async_with_options(
+        &self,
+        options: MeltConfirmOptions,
+    ) -> Result<MeltConfirmOutcome, FfiError> {
+        let outcome = self
+            .wallet
+            .confirm_prepared_melt_prefer_async_with_options(
+                self.operation_id,
+                self.quote.clone(),
+                self.proofs.clone(),
+                self.proofs_to_swap.clone(),
+                self.input_fee.into(),
+                self.input_fee_without_swap.into(),
+                self.metadata.clone(),
+                options.into(),
+            )
+            .await?;
+
+        match outcome {
+            cdk::wallet::MeltOutcome::Paid(finalized) => Ok(MeltConfirmOutcome::Paid {
+                finalized: finalized.into(),
+            }),
+            cdk::wallet::MeltOutcome::Pending(_) => Ok(MeltConfirmOutcome::Pending {
+                pending: Arc::new(PendingMelt {
+                    wallet: Arc::clone(&self.wallet),
+                    quote_id: self.quote.id.clone(),
+                    operation_id: self.operation_id,
+                    payment_method: self.quote.payment_method.clone(),
+                }),
+            }),
         }
     }
 }
@@ -650,6 +956,23 @@ impl PreparedMelt {
         Ok(finalized.into())
     }
 
+    /// Confirm the prepared melt using NUT-05 async support when the mint accepts it.
+    ///
+    /// If the melt completes immediately, this returns
+    /// `MeltConfirmOutcome::Paid`. If the mint accepts the payment for
+    /// background processing, this returns `MeltConfirmOutcome::Pending` with a
+    /// `PendingMelt` handle.
+    ///
+    /// FFI callers should call `PendingMelt::wait()` from a background
+    /// task/coroutine to poll for completion. Mobile apps should also call
+    /// `recover_incomplete_sagas()` or `finalize_pending_melts()` on
+    /// startup/resume, because operating systems may suspend or cancel
+    /// long-running background waits.
+    pub async fn confirm_prefer_async(&self) -> Result<MeltConfirmOutcome, FfiError> {
+        self.confirm_prefer_async_with_options(MeltConfirmOptions::default())
+            .await
+    }
+
     /// Cancel the prepared melt and release reserved proofs
     pub async fn cancel(&self) -> Result<(), FfiError> {
         self.wallet
@@ -717,6 +1040,31 @@ impl From<cdk_common::wallet::Restored> for Restored {
         }
     }
 }
+
+/// Report of wallet saga recovery operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Record)]
+pub struct RecoveryReport {
+    /// Operations successfully completed after crash.
+    pub recovered: u64,
+    /// Operations rolled back and resources released.
+    pub compensated: u64,
+    /// Operations still pending and left for a later retry.
+    pub skipped: u64,
+    /// Operations that could not be recovered.
+    pub failed: u64,
+}
+
+impl From<cdk::wallet::RecoveryReport> for RecoveryReport {
+    fn from(report: cdk::wallet::RecoveryReport) -> Self {
+        Self {
+            recovered: report.recovered as u64,
+            compensated: report.compensated as u64,
+            skipped: report.skipped as u64,
+            failed: report.failed as u64,
+        }
+    }
+}
+
 /// FFI-compatible options for confirming a melt operation
 #[derive(Debug, Clone, Default, Serialize, Deserialize, uniffi::Record)]
 pub struct MeltConfirmOptions {
@@ -767,5 +1115,54 @@ impl From<cdk::WalletKey> for WalletKey {
             mint_url: value.mint_url.into(),
             unit: value.unit.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::proof::Proof;
+
+    #[test]
+    fn receive_options_debug_redacts_preimages() {
+        let preimage = "ffi-receive-preimage-secret";
+        let options = ReceiveOptions {
+            preimages: vec![preimage.to_string()],
+            ..Default::default()
+        };
+
+        let debug = format!("{options:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(preimage));
+    }
+
+    #[test]
+    fn finalized_melt_debug_redacts_preimage_and_change_proofs() {
+        let preimage = "payment-preimage";
+        let proof_secret = "change-proof-secret";
+        let finalized = FinalizedMelt {
+            quote_id: "public-melt-quote-id".to_string(),
+            state: super::super::quote::QuoteState::Paid,
+            preimage: Some(preimage.to_string()),
+            change: Some(vec![Proof {
+                amount: Amount::new(1),
+                secret: proof_secret.to_string(),
+                c: "public-signature".to_string(),
+                keyset_id: "public-keyset-id".to_string(),
+                witness: None,
+                dleq: None,
+                p2pk_e: None,
+            }]),
+            amount: Amount::new(100),
+            fee_paid: Amount::new(1),
+        };
+
+        let debug = format!("{finalized:?}");
+
+        assert!(debug.contains("public-melt-quote-id"));
+        assert!(debug.contains("change_proof_count: Some(1)"));
+        assert!(!debug.contains(preimage));
+        assert!(!debug.contains(proof_secret));
     }
 }

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use cdk_common::grpc::create_version_check_interceptor;
 use cdk_common::payment::{IncomingPaymentOptions, MintPayment};
-use cdk_common::CurrencyUnit;
+use cdk_common::{CurrencyUnit, PublicKey, QuoteId};
 use futures::{Stream, StreamExt};
 use lightning::offers::offer::Offer;
 use tokio::sync::{mpsc, Notify};
@@ -201,6 +201,12 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
             }),
             bolt12: settings.bolt12.map(|b| super::Bolt12Settings {
                 amountless: b.amountless,
+                invoice_description: b.invoice_description,
+            }),
+            onchain: settings.onchain.map(|o| super::OnchainSettings {
+                confirmations: o.confirmations,
+                min_receive_amount_sat: o.min_receive_amount_sat,
+                min_send_amount_sat: o.min_send_amount_sat,
             }),
             custom: settings.custom,
         }))
@@ -219,11 +225,25 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
             .ok_or_else(|| Status::invalid_argument("Missing options"))?
         {
             incoming_payment_options::Options::Custom(opts) => {
-                let amount = opts
-                    .amount
-                    .ok_or_else(|| Status::invalid_argument("Missing amount"))?
-                    .try_into()
-                    .map_err(|_| Status::invalid_argument("Invalid amount"))?;
+                let amount: Option<cdk_common::Amount<CurrencyUnit>> = match opts.amount {
+                    Some(a) => Some(
+                        a.try_into()
+                            .map_err(|_| Status::invalid_argument("Invalid amount"))?,
+                    ),
+                    None => None,
+                };
+                if opts.quote_id.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "Missing quote_id in Custom options",
+                    ));
+                }
+                let quote_id = parse_quote_id(&opts.quote_id)?;
+                let pubkey = opts
+                    .pubkey
+                    .as_deref()
+                    .map(PublicKey::from_str)
+                    .transpose()
+                    .map_err(|_| Status::invalid_argument("Invalid pubkey in Custom options"))?;
                 IncomingPaymentOptions::Custom(Box::new(
                     cdk_common::payment::CustomIncomingPaymentOptions {
                         method: "".to_string(),
@@ -231,6 +251,8 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                         amount,
                         unix_expiry: opts.unix_expiry,
                         extra_json: opts.extra_json,
+                        quote_id,
+                        pubkey,
                     },
                 ))
             }
@@ -262,6 +284,13 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     },
                 ))
             }
+            incoming_payment_options::Options::Onchain(opts) => IncomingPaymentOptions::Onchain(
+                cdk_common::payment::OnchainIncomingPaymentOptions {
+                    quote_id: opts.quote_id.parse().map_err(|_| {
+                        Status::invalid_argument("Invalid quote_id in Onchain options")
+                    })?,
+                },
+            ),
         };
 
         let invoice_response = self
@@ -282,6 +311,8 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
         let unit = CurrencyUnit::from_str(&request.unit)
             .map_err(|_| Status::invalid_argument("Invalid currency unit"))?;
 
+        let quote_id = parse_quote_id(&request.quote_id)?;
+
         let options = match request.request_type() {
             OutgoingPaymentRequestType::Bolt11Invoice => {
                 let bolt11: cdk_common::Bolt11Invoice =
@@ -292,7 +323,8 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                         bolt11,
                         max_fee_amount: None,
                         timeout_secs: None,
-                        melt_options: request.options.map(Into::into),
+                        melt_options: request.options.map(TryInto::try_into).transpose()?,
+                        quote_id,
                     },
                 ))
             }
@@ -306,20 +338,59 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                             .expect("Already validated offer above"),
                         max_fee_amount: None,
                         timeout_secs: None,
-                        melt_options: request.options.map(Into::into),
+                        melt_options: request.options.map(TryInto::try_into).transpose()?,
+                        quote_id,
                     },
                 ))
             }
             OutgoingPaymentRequestType::Custom => {
+                let amount = request
+                    .amount
+                    .try_from_proto()
+                    .map_err(|_| Status::invalid_argument("Invalid amount"))?;
+
                 // Custom payment method - pass request as-is with no validation
                 cdk_common::payment::OutgoingPaymentOptions::Custom(Box::new(
                     cdk_common::payment::CustomOutgoingPaymentOptions {
                         method: String::new(), // Will be set from variant
                         request: request.request.clone(),
+                        amount,
                         max_fee_amount: None,
                         timeout_secs: None,
-                        melt_options: request.options.map(Into::into),
+                        melt_options: request.options.map(TryInto::try_into).transpose()?,
                         extra_json: request.extra_json.clone(),
+                        quote_id,
+                    },
+                ))
+            }
+            OutgoingPaymentRequestType::Onchain => {
+                let opts = request.onchain_options.ok_or_else(|| {
+                    Status::invalid_argument("Missing onchain_options for onchain quote")
+                })?;
+                let amount = opts
+                    .amount
+                    .ok_or_else(|| Status::invalid_argument("Missing amount in onchain quote"))?
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("Invalid amount"))?;
+                let max_fee_amount = opts
+                    .max_fee_amount
+                    .try_from_proto()
+                    .map_err(|_| Status::invalid_argument("Invalid max_fee_amount"))?;
+                let onchain_quote_id = parse_quote_id(&opts.quote_id)?;
+                if onchain_quote_id != quote_id {
+                    return Err(Status::invalid_argument(
+                        "quote_id does not match onchain_options quote_id",
+                    ));
+                }
+
+                cdk_common::payment::OutgoingPaymentOptions::Onchain(Box::new(
+                    cdk_common::payment::OnchainOutgoingPaymentOptions {
+                        address: opts.address,
+                        amount,
+                        max_fee_amount,
+                        quote_id,
+                        fee_index: opts.fee_index,
+                        metadata: opts.metadata,
                     },
                 ))
             }
@@ -365,13 +436,15 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     .max_fee_amount
                     .try_from_proto()
                     .map_err(|_| Status::invalid_argument("Invalid max_fee_amount"))?;
+                let quote_id = parse_quote_id(&opts.quote_id)?;
 
                 cdk_common::payment::OutgoingPaymentOptions::Bolt11(Box::new(
                     cdk_common::payment::Bolt11OutgoingPaymentOptions {
                         bolt11,
                         max_fee_amount,
                         timeout_secs: opts.timeout_secs,
-                        melt_options: opts.melt_options.map(Into::into),
+                        melt_options: opts.melt_options.map(TryInto::try_into).transpose()?,
+                        quote_id,
                     },
                 ))
             }
@@ -382,13 +455,15 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     .max_fee_amount
                     .try_from_proto()
                     .map_err(|_| Status::invalid_argument("Invalid max_fee_amount"))?;
+                let quote_id = parse_quote_id(&opts.quote_id)?;
 
                 cdk_common::payment::OutgoingPaymentOptions::Bolt12(Box::new(
                     cdk_common::payment::Bolt12OutgoingPaymentOptions {
                         offer,
                         max_fee_amount,
                         timeout_secs: opts.timeout_secs,
-                        melt_options: opts.melt_options.map(Into::into),
+                        melt_options: opts.melt_options.map(TryInto::try_into).transpose()?,
+                        quote_id,
                     },
                 ))
             }
@@ -397,15 +472,50 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
                     .max_fee_amount
                     .try_from_proto()
                     .map_err(|_| Status::invalid_argument("Invalid max_fee_amount"))?;
+                let quote_id = parse_quote_id(&opts.quote_id)?;
+                let amount: Option<cdk_common::Amount<CurrencyUnit>> = match opts.amount {
+                    Some(a) => Some(
+                        a.try_into()
+                            .map_err(|_| Status::invalid_argument("Invalid amount"))?,
+                    ),
+                    None => None,
+                };
 
                 cdk_common::payment::OutgoingPaymentOptions::Custom(Box::new(
                     cdk_common::payment::CustomOutgoingPaymentOptions {
                         method: String::new(), // Method will be determined from context
                         request: opts.offer,   // Reusing offer field for custom request string
+                        amount,
                         max_fee_amount,
                         timeout_secs: opts.timeout_secs,
-                        melt_options: opts.melt_options.map(Into::into),
+                        melt_options: opts.melt_options.map(TryInto::try_into).transpose()?,
                         extra_json: opts.extra_json,
+                        quote_id,
+                    },
+                ))
+            }
+            outgoing_payment_variant::Options::Onchain(opts) => {
+                let amount = opts
+                    .amount
+                    .ok_or_else(|| Status::invalid_argument("Missing amount"))?
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("Invalid amount"))?;
+
+                let max_fee_amount = opts
+                    .max_fee_amount
+                    .try_from_proto()
+                    .map_err(|_| Status::invalid_argument("Invalid max_fee_amount"))?;
+
+                cdk_common::payment::OutgoingPaymentOptions::Onchain(Box::new(
+                    cdk_common::payment::OnchainOutgoingPaymentOptions {
+                        address: opts.address,
+                        amount,
+                        max_fee_amount,
+                        quote_id: opts.quote_id.parse().map_err(|_| {
+                            Status::invalid_argument("Invalid quote_id in Onchain options")
+                        })?,
+                        fee_index: opts.fee_index,
+                        metadata: opts.metadata,
                     },
                 ))
             }
@@ -490,35 +600,36 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
         let shutdown_clone = self.shutdown.clone();
         let ln = self.inner.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown_clone.notified() => {
-                        tracing::info!("Shutdown signal received, stopping task");
-                        ln.cancel_payment_event_stream();
-                        break;
-                    }
-                    result = ln.wait_payment_event() => {
-                        match result {
-                            Ok(mut stream) => {
-                                while let Some(event) = stream.next().await {
-                                    match tx.send(Result::<_, Status>::Ok(event.into())).await {
-                                        Ok(_) => {
-                                            // Response was queued to be sent to client
-                                        }
-                                        Err(item) => {
-                                            tracing::error!("Error adding payment event to stream: {}", item);
-                                            break;
-                                        }
-                                    }
+            let forward_events = async {
+                loop {
+                    match ln.wait_payment_event().await {
+                        Ok(mut stream) => {
+                            while let Some(event) = stream.next().await {
+                                if tx
+                                    .send(Result::<_, Status>::Ok(event.into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
                                 }
                             }
-                            Err(err) => {
-                                tracing::warn!("Could not get invoice stream: {}", err);
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("Could not get invoice stream: {}", err);
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
                     }
                 }
+            };
+
+            // Keep cancellation active during subscription setup, forwarding, and retries.
+            tokio::select! {
+                _ = tx.closed() => {}
+                _ = shutdown_clone.notified() => {
+                    tracing::info!("Shutdown signal received, stopping task");
+                    ln.cancel_payment_event_stream();
+                }
+                _ = forward_events => {}
             }
         });
 
@@ -526,5 +637,161 @@ impl CdkPaymentProcessor for PaymentProcessorServer {
         Ok(Response::new(
             Box::pin(output_stream) as Self::WaitPaymentEventStream
         ))
+    }
+}
+
+fn parse_quote_id(s: &str) -> Result<QuoteId, Status> {
+    s.parse()
+        .map_err(|err| Status::invalid_argument(format!("Invalid quote_id: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use cdk_common::payment;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    enum SubscriptionState {
+        Subscribing,
+        Idle,
+        Retrying,
+    }
+
+    struct TestPayment {
+        state: SubscriptionState,
+        started: Arc<Notify>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl MintPayment for TestPayment {
+        type Err = payment::Error;
+
+        async fn wait_payment_event(
+            &self,
+        ) -> Result<Pin<Box<dyn Stream<Item = payment::Event> + Send>>, Self::Err> {
+            self.started.notify_one();
+            match self.state {
+                SubscriptionState::Subscribing => std::future::pending().await,
+                SubscriptionState::Idle => Ok(Box::pin(futures::stream::pending())),
+                SubscriptionState::Retrying => Err(payment::Error::Custom(
+                    "subscription unavailable".to_owned(),
+                )),
+            }
+        }
+
+        fn cancel_payment_event_stream(&self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+
+        fn is_payment_event_stream_active(&self) -> bool {
+            unimplemented!()
+        }
+
+        async fn get_settings(&self) -> Result<payment::SettingsResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn create_incoming_payment_request(
+            &self,
+            _options: IncomingPaymentOptions,
+        ) -> Result<payment::CreateIncomingPaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn get_payment_quote(
+            &self,
+            _unit: &CurrencyUnit,
+            _options: payment::OutgoingPaymentOptions,
+        ) -> Result<payment::PaymentQuoteResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn make_payment(
+            &self,
+            _unit: &CurrencyUnit,
+            _options: payment::OutgoingPaymentOptions,
+        ) -> Result<payment::MakePaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn check_incoming_payment_status(
+            &self,
+            _payment_identifier: &payment::PaymentIdentifier,
+        ) -> Result<Vec<payment::WaitPaymentResponse>, Self::Err> {
+            unimplemented!()
+        }
+
+        async fn check_outgoing_payment(
+            &self,
+            _payment_identifier: &payment::PaymentIdentifier,
+        ) -> Result<payment::MakePaymentResponse, Self::Err> {
+            unimplemented!()
+        }
+    }
+
+    async fn assert_forwarding_stops(state: SubscriptionState, shutdown: bool) {
+        let started = Arc::new(Notify::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let backend = Arc::new(TestPayment {
+            state,
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        });
+        let server = PaymentProcessorServer::new(backend, "127.0.0.1", 0).unwrap();
+        let stream = server
+            .wait_payment_event(Request::new(EmptyRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("backend subscription should start");
+
+        // Keep the client connected in the shutdown case, so only shutdown can
+        // release the task. In the disconnect case, do not notify shutdown.
+        let _connected_stream = if shutdown {
+            server.shutdown.notify_waiters();
+            Some(stream)
+        } else {
+            drop(stream);
+            None
+        };
+        // Keep the server alive: dropping it also signals shutdown. Once the
+        // task exits, only the server should retain the backend.
+        timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&server.inner) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("forwarding task retained the backend in {state:?}"));
+        assert_eq!(cancelled.load(Ordering::SeqCst), shutdown);
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_stops_payment_event_forwarding() {
+        for state in [
+            SubscriptionState::Subscribing,
+            SubscriptionState::Idle,
+            SubscriptionState::Retrying,
+        ] {
+            assert_forwarding_stops(state, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_payment_event_forwarding() {
+        for state in [
+            SubscriptionState::Subscribing,
+            SubscriptionState::Idle,
+            SubscriptionState::Retrying,
+        ] {
+            assert_forwarding_stops(state, true).await;
+        }
     }
 }

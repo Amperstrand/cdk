@@ -1,0 +1,916 @@
+//! SendIntent typestate wrapper
+//!
+//! Represents a single outgoing on-chain payment request. Each intent
+//! progresses through: `Pending` -> `Batched` -> `AwaitingConfirmation`.
+//!
+//! The wrapper is internal to the crate. Durable record state is the source of
+//! truth for recovery, while typestate enforces valid runtime transitions.
+
+pub(crate) mod record;
+pub(crate) mod state;
+
+use uuid::Uuid;
+
+use self::record::{SendIntentRecord, SendIntentState};
+use self::state::{AwaitingConfirmation, Batched, Failed, Pending};
+use crate::error::Error;
+use crate::storage::{BdkStorage, FailedSendAttemptRecord, FinalizedSendIntentRecord};
+use crate::types::{PaymentMetadata, PaymentTier};
+
+/// A send intent in a particular typestate
+///
+/// Each intent tracks a single outgoing on-chain payment request through
+/// the send saga lifecycle.
+#[derive(Debug, Clone)]
+pub(crate) struct SendIntent<S> {
+    /// Unique identifier for this intent
+    pub intent_id: Uuid,
+    /// Quote ID linking this intent to a melt quote
+    pub quote_id: String,
+    /// Destination Bitcoin address
+    pub address: String,
+    /// Payment amount in satoshis
+    pub amount: u64,
+    /// Maximum fee this intent will accept in satoshis
+    pub max_fee_amount: u64,
+    /// Batching tier
+    pub tier: PaymentTier,
+    /// Opaque metadata
+    pub metadata: PaymentMetadata,
+    /// When the intent was created (unix timestamp seconds)
+    pub created_at: u64,
+    /// Current typestate
+    pub state: S,
+}
+
+impl SendIntent<Pending> {
+    /// Create a new pending send intent and persist it immediately.
+    ///
+    /// This is called from `make_payment()` to enqueue a new payment request.
+    pub async fn new(
+        storage: &BdkStorage,
+        quote_id: String,
+        address: String,
+        amount: u64,
+        max_fee_amount: u64,
+        tier: PaymentTier,
+        metadata: PaymentMetadata,
+    ) -> Result<Self, Error> {
+        let intent_id = Uuid::new_v4();
+        let created_at = crate::util::unix_now();
+
+        let record = SendIntentRecord {
+            intent_id,
+            quote_id: quote_id.clone(),
+            address: address.clone(),
+            amount_sat: amount,
+            max_fee_amount_sat: max_fee_amount,
+            tier,
+            metadata: metadata.clone(),
+            state: SendIntentState::Pending { created_at },
+        };
+
+        let record = storage.create_or_retry_failed_send_intent(&record).await?;
+        let created_at = match record.state {
+            SendIntentState::Pending { created_at } => created_at,
+            _ => {
+                return Err(Error::Wallet(
+                    "send intent retry did not return Pending state".to_string(),
+                ));
+            }
+        };
+
+        Ok(Self {
+            intent_id: record.intent_id,
+            quote_id: record.quote_id,
+            address: record.address,
+            amount: record.amount_sat,
+            max_fee_amount: record.max_fee_amount_sat,
+            tier: record.tier,
+            metadata: record.metadata,
+            created_at,
+            state: Pending,
+        })
+    }
+
+    /// Transition to Batched state
+    pub async fn assign_to_batch(
+        self,
+        storage: &BdkStorage,
+        batch_id: Uuid,
+    ) -> Result<SendIntent<Batched>, Error> {
+        storage
+            .update_send_intent(
+                &self.intent_id,
+                &SendIntentState::Batched {
+                    batch_id,
+                    created_at: self.created_at,
+                },
+            )
+            .await?;
+
+        Ok(SendIntent {
+            intent_id: self.intent_id,
+            quote_id: self.quote_id,
+            address: self.address,
+            amount: self.amount,
+            max_fee_amount: self.max_fee_amount,
+            tier: self.tier,
+            metadata: self.metadata,
+            created_at: self.created_at,
+            state: Batched { batch_id },
+        })
+    }
+
+    /// Mark a pending intent as failed before a signed transaction was committed.
+    pub async fn fail(
+        self,
+        storage: &BdkStorage,
+        reason: String,
+    ) -> Result<SendIntent<Failed>, Error> {
+        let failed_at = crate::util::unix_now();
+        storage
+            .update_send_intent(
+                &self.intent_id,
+                &SendIntentState::Failed {
+                    reason: reason.clone(),
+                    created_at: self.created_at,
+                    failed_at,
+                },
+            )
+            .await?;
+        storage
+            .add_failed_send_attempt(&FailedSendAttemptRecord {
+                attempt_id: Uuid::new_v4(),
+                intent_id: self.intent_id,
+                quote_id: self.quote_id.clone(),
+                reason: reason.clone(),
+                failed_at,
+            })
+            .await?;
+
+        Ok(SendIntent {
+            intent_id: self.intent_id,
+            quote_id: self.quote_id,
+            address: self.address,
+            amount: self.amount,
+            max_fee_amount: self.max_fee_amount,
+            tier: self.tier,
+            metadata: self.metadata,
+            created_at: self.created_at,
+            state: Failed,
+        })
+    }
+}
+
+impl SendIntent<Batched> {
+    /// Transition to AwaitingConfirmation state after broadcast
+    pub async fn mark_broadcast(
+        self,
+        storage: &BdkStorage,
+        txid: String,
+        outpoint: String,
+        fee_contribution_sat: u64,
+    ) -> Result<SendIntent<AwaitingConfirmation>, Error> {
+        storage
+            .update_send_intent(
+                &self.intent_id,
+                &SendIntentState::AwaitingConfirmation {
+                    batch_id: self.state.batch_id,
+                    txid: txid.clone(),
+                    outpoint: outpoint.clone(),
+                    fee_contribution_sat,
+                    created_at: self.created_at,
+                },
+            )
+            .await?;
+
+        Ok(SendIntent {
+            intent_id: self.intent_id,
+            quote_id: self.quote_id,
+            address: self.address,
+            amount: self.amount,
+            max_fee_amount: self.max_fee_amount,
+            tier: self.tier,
+            metadata: self.metadata,
+            created_at: self.created_at,
+            state: AwaitingConfirmation {
+                batch_id: self.state.batch_id,
+                txid,
+                outpoint,
+                fee_contribution_sat,
+            },
+        })
+    }
+
+    /// Revert to Pending state (compensation)
+    pub async fn revert_to_pending(
+        self,
+        storage: &BdkStorage,
+    ) -> Result<SendIntent<Pending>, Error> {
+        storage
+            .update_send_intent(
+                &self.intent_id,
+                &SendIntentState::Pending {
+                    created_at: self.created_at,
+                },
+            )
+            .await?;
+
+        Ok(SendIntent {
+            intent_id: self.intent_id,
+            quote_id: self.quote_id,
+            address: self.address,
+            amount: self.amount,
+            max_fee_amount: self.max_fee_amount,
+            tier: self.tier,
+            metadata: self.metadata,
+            created_at: self.created_at,
+            state: Pending,
+        })
+    }
+}
+
+impl SendIntent<AwaitingConfirmation> {
+    /// Finalize a confirmed intent: write a tombstone and delete the active record.
+    ///
+    /// Called after the transaction reaches the required confirmation depth.
+    /// The tombstone preserves `total_spent` and `outpoint` so that
+    /// `check_outgoing_payment` returns correct data after the intent is gone.
+    pub async fn finalize(self, storage: &BdkStorage) -> Result<(), Error> {
+        let total_spent_sat = self.amount + self.state.fee_contribution_sat;
+
+        let tombstone = FinalizedSendIntentRecord {
+            intent_id: self.intent_id,
+            quote_id: self.quote_id.clone(),
+            total_spent_sat,
+            outpoint: self.state.outpoint.clone(),
+            finalized_at: crate::util::unix_now(),
+        };
+
+        storage
+            .finalize_send_intent(&self.intent_id, &tombstone)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Reconstruct a `SendIntent` from a durable record for recovery
+pub(crate) fn from_record(record: &SendIntentRecord) -> SendIntentAny {
+    match &record.state {
+        SendIntentState::Pending { created_at } => SendIntentAny::Pending(SendIntent {
+            intent_id: record.intent_id,
+            quote_id: record.quote_id.clone(),
+            address: record.address.clone(),
+            amount: record.amount_sat,
+            max_fee_amount: record.max_fee_amount_sat,
+            tier: record.tier,
+            metadata: record.metadata.clone(),
+            created_at: *created_at,
+            state: Pending,
+        }),
+        SendIntentState::Batched {
+            batch_id,
+            created_at,
+        } => SendIntentAny::Batched(SendIntent {
+            intent_id: record.intent_id,
+            quote_id: record.quote_id.clone(),
+            address: record.address.clone(),
+            amount: record.amount_sat,
+            max_fee_amount: record.max_fee_amount_sat,
+            tier: record.tier,
+            metadata: record.metadata.clone(),
+            created_at: *created_at,
+            state: Batched {
+                batch_id: *batch_id,
+            },
+        }),
+        SendIntentState::AwaitingConfirmation {
+            batch_id,
+            txid,
+            outpoint,
+            fee_contribution_sat,
+            created_at,
+        } => SendIntentAny::AwaitingConfirmation(SendIntent {
+            intent_id: record.intent_id,
+            quote_id: record.quote_id.clone(),
+            address: record.address.clone(),
+            amount: record.amount_sat,
+            max_fee_amount: record.max_fee_amount_sat,
+            tier: record.tier,
+            metadata: record.metadata.clone(),
+            created_at: *created_at,
+            state: AwaitingConfirmation {
+                batch_id: *batch_id,
+                txid: txid.clone(),
+                outpoint: outpoint.clone(),
+                fee_contribution_sat: *fee_contribution_sat,
+            },
+        }),
+        SendIntentState::Failed {
+            reason,
+            created_at,
+            failed_at,
+        } => {
+            let _ = (reason, created_at, failed_at);
+            SendIntentAny::Failed
+        }
+    }
+}
+
+/// Type-erased send intent for recovery and querying
+pub(crate) enum SendIntentAny {
+    /// Intent in Pending state
+    Pending(SendIntent<Pending>),
+    /// Intent in Batched state
+    Batched(SendIntent<Batched>),
+    /// Intent in AwaitingConfirmation state
+    AwaitingConfirmation(SendIntent<AwaitingConfirmation>),
+    /// Intent in Failed state
+    Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use async_trait::async_trait;
+    use cdk_common::database::{
+        DbTransactionFinalizer, Error as DatabaseError, KVStore, KVStoreDatabase,
+        KVStoreTransaction,
+    };
+    use cdk_common::payment::{MakePaymentResponse, PaymentIdentifier};
+    use cdk_common::{Amount, CurrencyUnit, MeltQuoteState};
+    use tokio::sync::Barrier;
+
+    use super::*;
+    use crate::storage::{BdkStorage, SEND_INTENT_QUOTE_ID_NAMESPACE};
+
+    type KvKey = (String, String, String);
+
+    /// KV store that lets two concurrent transactions both observe a missing
+    /// quote-id index entry before either writes. `kv_write_if_absent` is
+    /// atomic across transactions, mirroring the SQL backend.
+    #[derive(Clone)]
+    struct RacingKvStore {
+        data: Arc<StdMutex<HashMap<KvKey, Vec<u8>>>>,
+        reservations: Arc<StdMutex<HashSet<KvKey>>>,
+        index_read_barrier: Arc<Barrier>,
+    }
+
+    impl RacingKvStore {
+        fn new(parties: usize) -> Self {
+            Self {
+                data: Arc::new(StdMutex::new(HashMap::new())),
+                reservations: Arc::new(StdMutex::new(HashSet::new())),
+                index_read_barrier: Arc::new(Barrier::new(parties)),
+            }
+        }
+    }
+
+    struct RacingTransaction {
+        store: RacingKvStore,
+        writes: Vec<(KvKey, Option<Vec<u8>>)>,
+        reserved: Vec<KvKey>,
+    }
+
+    #[async_trait]
+    impl DbTransactionFinalizer for RacingTransaction {
+        type Err = DatabaseError;
+
+        async fn commit(self: Box<Self>) -> Result<(), Self::Err> {
+            let mut data = self.store.data.lock().expect("lock racing kv store");
+            for (key, value) in self.writes {
+                if let Some(value) = value {
+                    data.insert(key, value);
+                } else {
+                    data.remove(&key);
+                }
+            }
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), Self::Err> {
+            let mut reservations = self.store.reservations.lock().expect("lock reservations");
+            for key in &self.reserved {
+                reservations.remove(key);
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl KVStoreTransaction<DatabaseError> for RacingTransaction {
+        async fn kv_read(
+            &mut self,
+            primary_namespace: &str,
+            secondary_namespace: &str,
+            key: &str,
+        ) -> Result<Option<Vec<u8>>, DatabaseError> {
+            let map_key = (
+                primary_namespace.to_string(),
+                secondary_namespace.to_string(),
+                key.to_string(),
+            );
+            let value = self
+                .writes
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate == &map_key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| {
+                    self.store
+                        .data
+                        .lock()
+                        .expect("lock racing kv store")
+                        .get(&map_key)
+                        .cloned()
+                });
+
+            if secondary_namespace == SEND_INTENT_QUOTE_ID_NAMESPACE {
+                self.store.index_read_barrier.wait().await;
+            }
+
+            Ok(value)
+        }
+
+        async fn kv_write(
+            &mut self,
+            primary_namespace: &str,
+            secondary_namespace: &str,
+            key: &str,
+            value: &[u8],
+        ) -> Result<(), DatabaseError> {
+            self.writes.push((
+                (
+                    primary_namespace.to_string(),
+                    secondary_namespace.to_string(),
+                    key.to_string(),
+                ),
+                Some(value.to_vec()),
+            ));
+            Ok(())
+        }
+
+        async fn kv_write_if_absent(
+            &mut self,
+            primary_namespace: &str,
+            secondary_namespace: &str,
+            key: &str,
+            value: &[u8],
+        ) -> Result<bool, DatabaseError> {
+            let map_key = (
+                primary_namespace.to_string(),
+                secondary_namespace.to_string(),
+                key.to_string(),
+            );
+
+            let exists = match self
+                .writes
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate == &map_key)
+            {
+                Some((_, pending)) => pending.is_some(),
+                None => {
+                    let data = self.store.data.lock().expect("lock racing kv store");
+                    let reservations = self.store.reservations.lock().expect("lock reservations");
+                    data.contains_key(&map_key) || reservations.contains(&map_key)
+                }
+            };
+
+            if exists {
+                return Ok(false);
+            }
+
+            self.store
+                .reservations
+                .lock()
+                .expect("lock reservations")
+                .insert(map_key.clone());
+            self.reserved.push(map_key.clone());
+            self.writes.push((map_key, Some(value.to_vec())));
+
+            Ok(true)
+        }
+
+        async fn kv_remove(
+            &mut self,
+            primary_namespace: &str,
+            secondary_namespace: &str,
+            key: &str,
+        ) -> Result<(), DatabaseError> {
+            self.writes.push((
+                (
+                    primary_namespace.to_string(),
+                    secondary_namespace.to_string(),
+                    key.to_string(),
+                ),
+                None,
+            ));
+            Ok(())
+        }
+
+        async fn kv_write_if_equals(
+            &mut self,
+            primary_namespace: &str,
+            secondary_namespace: &str,
+            key: &str,
+            expected: &[u8],
+            replacement: &[u8],
+        ) -> Result<bool, DatabaseError> {
+            let map_key = (
+                primary_namespace.to_string(),
+                secondary_namespace.to_string(),
+                key.to_string(),
+            );
+
+            let current = self
+                .writes
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate == &map_key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| {
+                    self.store
+                        .data
+                        .lock()
+                        .expect("lock racing kv store")
+                        .get(&map_key)
+                        .cloned()
+                });
+
+            match current {
+                Some(current) if current == expected => {
+                    self.writes.push((map_key, Some(replacement.to_vec())));
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+
+        async fn kv_list(
+            &mut self,
+            primary_namespace: &str,
+            secondary_namespace: &str,
+        ) -> Result<Vec<String>, DatabaseError> {
+            self.store
+                .kv_list(primary_namespace, secondary_namespace)
+                .await
+        }
+    }
+
+    #[async_trait]
+    impl KVStoreDatabase for RacingKvStore {
+        type Err = DatabaseError;
+
+        async fn kv_read(
+            &self,
+            primary_namespace: &str,
+            secondary_namespace: &str,
+            key: &str,
+        ) -> Result<Option<Vec<u8>>, Self::Err> {
+            Ok(self
+                .data
+                .lock()
+                .expect("lock racing kv store")
+                .get(&(
+                    primary_namespace.to_string(),
+                    secondary_namespace.to_string(),
+                    key.to_string(),
+                ))
+                .cloned())
+        }
+
+        async fn kv_list(
+            &self,
+            primary_namespace: &str,
+            secondary_namespace: &str,
+        ) -> Result<Vec<String>, Self::Err> {
+            Ok(self
+                .data
+                .lock()
+                .expect("lock racing kv store")
+                .keys()
+                .filter(|(primary, secondary, _)| {
+                    primary == primary_namespace && secondary == secondary_namespace
+                })
+                .map(|(_, _, key)| key.clone())
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl KVStore for RacingKvStore {
+        async fn begin_transaction(
+            &self,
+        ) -> Result<Box<dyn KVStoreTransaction<Self::Err> + Send + Sync>, DatabaseError> {
+            Ok(Box::new(RacingTransaction {
+                store: self.clone(),
+                writes: Vec::new(),
+                reserved: Vec::new(),
+            }))
+        }
+    }
+
+    /// Helper: create an in-memory KVStore-backed BdkStorage for tests
+    async fn test_storage() -> BdkStorage {
+        let db = cdk_sqlite::mint::memory::empty()
+            .await
+            .expect("in-memory db");
+        BdkStorage::new(Arc::new(db))
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_quote_creates_only_one_intent() {
+        let storage = BdkStorage::new(Arc::new(RacingKvStore::new(2)));
+        let create = || {
+            SendIntent::new(
+                &storage,
+                "quote-race".to_string(),
+                "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+                10_000,
+                500,
+                PaymentTier::Immediate,
+                PaymentMetadata::default(),
+            )
+        };
+
+        let (first, second) = tokio::join!(create(), create());
+
+        let success_count = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(success_count, 1, "only one intent per quote id");
+
+        let duplicate_count = [&first, &second]
+            .iter()
+            .filter(
+                |result| matches!(result, Err(Error::DuplicateQuoteId(id)) if id == "quote-race"),
+            )
+            .count();
+        assert_eq!(duplicate_count, 1, "loser must get DuplicateQuoteId");
+
+        let records = storage
+            .get_all_send_intents()
+            .await
+            .expect("list send intents");
+        assert_eq!(records.len(), 1, "only one intent record may be persisted");
+    }
+
+    #[tokio::test]
+    async fn test_pending_to_batched_to_awaiting() {
+        let storage = test_storage().await;
+
+        let quote_id = "quote123".to_string();
+        let address = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string();
+        let amount = 10_000;
+        let max_fee = 500;
+
+        // 1. Create Pending
+        let pending = SendIntent::new(
+            &storage,
+            quote_id.clone(),
+            address.clone(),
+            amount,
+            max_fee,
+            PaymentTier::Immediate,
+            PaymentMetadata::default(),
+        )
+        .await
+        .expect("new");
+
+        assert_eq!(pending.amount, amount);
+
+        // 2. Transition to Batched
+        let batch_id = Uuid::new_v4();
+        let batched = pending
+            .assign_to_batch(&storage, batch_id)
+            .await
+            .expect("assign");
+        assert_eq!(batched.state.batch_id, batch_id);
+
+        // 3. Transition to AwaitingConfirmation
+        let txid = "tx123".to_string();
+        let outpoint = "tx123:0".to_string();
+        let fee_contrib = 250;
+        let awaiting = batched
+            .mark_broadcast(&storage, txid.clone(), outpoint.clone(), fee_contrib)
+            .await
+            .expect("mark_broadcast");
+
+        assert_eq!(awaiting.state.txid, txid);
+        assert_eq!(awaiting.state.outpoint, outpoint);
+        assert_eq!(awaiting.state.fee_contribution_sat, fee_contrib);
+    }
+
+    #[tokio::test]
+    async fn test_pending_to_failed() {
+        let storage = test_storage().await;
+
+        let pending = SendIntent::new(
+            &storage,
+            "quote-failed".to_string(),
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            10_000,
+            500,
+            PaymentTier::Immediate,
+            PaymentMetadata::default(),
+        )
+        .await
+        .expect("new");
+
+        let intent_id = pending.intent_id;
+        let failed = pending
+            .fail(&storage, "fee too high".to_string())
+            .await
+            .expect("fail");
+
+        assert_eq!(failed.intent_id, intent_id);
+
+        let persisted = storage
+            .get_send_intent(&intent_id)
+            .await
+            .expect("get intent")
+            .expect("intent should remain as failed terminal record");
+        assert!(matches!(
+            persisted.state,
+            SendIntentState::Failed { ref reason, .. } if reason == "fee too high"
+        ));
+
+        let attempts = storage
+            .get_failed_send_attempts_by_quote_id("quote-failed")
+            .await
+            .expect("failed attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].intent_id, intent_id);
+        assert_eq!(attempts[0].reason, "fee too high");
+    }
+
+    #[tokio::test]
+    async fn test_failed_intent_can_be_requeued_with_same_quote_id() {
+        let storage = test_storage().await;
+        let quote_id = "quote-retry".to_string();
+
+        let pending = SendIntent::new(
+            &storage,
+            quote_id.clone(),
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            10_000,
+            500,
+            PaymentTier::Immediate,
+            PaymentMetadata::default(),
+        )
+        .await
+        .expect("new");
+        let intent_id = pending.intent_id;
+
+        pending
+            .fail(&storage, "fee too high".to_string())
+            .await
+            .expect("fail");
+
+        let retried = SendIntent::new(
+            &storage,
+            quote_id,
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            10_000,
+            750,
+            PaymentTier::Immediate,
+            PaymentMetadata::default(),
+        )
+        .await
+        .expect("retry failed intent");
+
+        assert_eq!(retried.intent_id, intent_id);
+        assert_eq!(retried.max_fee_amount, 750);
+
+        let persisted = storage
+            .get_send_intent(&intent_id)
+            .await
+            .expect("get intent")
+            .expect("intent should remain present");
+        assert!(matches!(persisted.state, SendIntentState::Pending { .. }));
+        assert_eq!(persisted.max_fee_amount_sat, 750);
+
+        let attempts = storage
+            .get_failed_send_attempts_by_quote_id("quote-retry")
+            .await
+            .expect("failed attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].intent_id, intent_id);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_send_intent_creates_tombstone_and_preserves_total_spent() {
+        let storage = test_storage().await;
+
+        let pending = SendIntent::new(
+            &storage,
+            "quote-finalize".to_string(),
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            20_000,
+            1_000,
+            PaymentTier::Immediate,
+            PaymentMetadata::default(),
+        )
+        .await
+        .expect("new");
+
+        let batched = pending
+            .assign_to_batch(&storage, Uuid::new_v4())
+            .await
+            .expect("assign");
+
+        let awaiting = batched
+            .mark_broadcast(
+                &storage,
+                "txid-finalize".to_string(),
+                "txid-finalize:1".to_string(),
+                321,
+            )
+            .await
+            .expect("mark_broadcast");
+
+        let intent_id = awaiting.intent_id;
+        let quote_id = awaiting.quote_id.clone();
+        let outpoint = awaiting.state.outpoint.clone();
+
+        awaiting.finalize(&storage).await.expect("finalize");
+
+        let active = storage
+            .get_send_intent(&intent_id)
+            .await
+            .expect("get active");
+        assert!(
+            active.is_none(),
+            "active intent should be deleted after finalization"
+        );
+
+        let tombstone = storage
+            .get_finalized_intent(&intent_id)
+            .await
+            .expect("get tombstone")
+            .expect("tombstone should exist");
+
+        assert_eq!(tombstone.quote_id, quote_id);
+        assert_eq!(tombstone.outpoint, outpoint);
+        assert_eq!(tombstone.total_spent_sat, 20_321);
+
+        let payment_lookup_id = PaymentIdentifier::CustomId(tombstone.quote_id.clone());
+        let response = MakePaymentResponse {
+            payment_lookup_id,
+            payment_proof: Some(tombstone.outpoint.clone()),
+            status: MeltQuoteState::Paid,
+            total_spent: Amount::new(tombstone.total_spent_sat, CurrencyUnit::Sat),
+        };
+
+        assert_eq!(response.status, MeltQuoteState::Paid);
+        assert_eq!(response.total_spent, Amount::new(20_321, CurrencyUnit::Sat));
+    }
+
+    #[tokio::test]
+    async fn test_finalized_intent_quote_id_cannot_be_requeued() {
+        let storage = test_storage().await;
+        let quote_id = "quote-finalized-no-retry".to_string();
+
+        let pending = SendIntent::new(
+            &storage,
+            quote_id.clone(),
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            20_000,
+            1_000,
+            PaymentTier::Immediate,
+            PaymentMetadata::default(),
+        )
+        .await
+        .expect("new");
+
+        let awaiting = pending
+            .assign_to_batch(&storage, Uuid::new_v4())
+            .await
+            .expect("assign")
+            .mark_broadcast(
+                &storage,
+                "txid-finalized-no-retry".to_string(),
+                "txid-finalized-no-retry:0".to_string(),
+                250,
+            )
+            .await
+            .expect("mark_broadcast");
+
+        awaiting.finalize(&storage).await.expect("finalize");
+
+        let result = SendIntent::new(
+            &storage,
+            quote_id.clone(),
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080".to_string(),
+            20_000,
+            1_000,
+            PaymentTier::Immediate,
+            PaymentMetadata::default(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(Error::DuplicateQuoteId(id)) if id == quote_id));
+    }
+}

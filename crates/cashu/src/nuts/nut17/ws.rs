@@ -8,21 +8,14 @@ use super::{NotificationPayload, Params};
 /// JSON RPC version
 pub const JSON_RPC_VERSION: &str = "2.0";
 
-/// The response to a subscription request
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The result returned after a subscription or unsubscription request.
+///
+/// NUT-17 uses the same result shape for both methods. Clients that need to
+/// distinguish them must correlate the response's JSON-RPC request ID with the
+/// request they sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound = "I: Serialize + DeserializeOwned")]
-pub struct WsSubscribeResponse<I> {
-    /// Status
-    pub status: String,
-    /// Subscription ID
-    #[serde(rename = "subId")]
-    pub sub_id: I,
-}
-
-/// The response to an unsubscription request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound = "I: Serialize + DeserializeOwned")]
-pub struct WsUnsubscribeResponse<I> {
+pub struct WsResponseResult<I> {
     /// Status
     pub status: String,
     /// Subscription ID
@@ -34,8 +27,14 @@ pub struct WsUnsubscribeResponse<I> {
 ///
 /// This is the notification that is sent to the client when an event matches a
 /// subscription
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound = "T: Serialize + DeserializeOwned, I: Serialize + DeserializeOwned")]
+///
+/// This type is serialize-only in practice: notification payloads are not
+/// self-describing. Clients should deserialize notifications as
+/// [`RawNotificationInner`] and decode the payload with
+/// [`deserialize_payload_for_kind`](super::deserialize_payload_for_kind), using
+/// the kind of the subscription the notification belongs to.
+#[derive(Debug, Clone, Serialize)]
+#[serde(bound(serialize = "T: Serialize + DeserializeOwned, I: Serialize"))]
 pub struct NotificationInner<T, I>
 where
     T: Clone,
@@ -48,27 +47,19 @@ where
     pub payload: NotificationPayload<T>,
 }
 
-/// Responses from the web socket server
+/// The raw notification received from the websocket server.
+///
+/// This keeps the payload as JSON so clients can decode it with the kind of the
+/// subscription that produced the notification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "I: Serialize + DeserializeOwned")]
-#[serde(untagged)]
-pub enum WsResponseResult<I> {
-    /// A response to a subscription request
-    Subscribe(WsSubscribeResponse<I>),
-    /// Unsubscribe
-    Unsubscribe(WsUnsubscribeResponse<I>),
-}
+pub struct RawNotificationInner<I> {
+    /// The subscription ID
+    #[serde(rename = "subId")]
+    pub sub_id: I,
 
-impl<I> From<WsSubscribeResponse<I>> for WsResponseResult<I> {
-    fn from(response: WsSubscribeResponse<I>) -> Self {
-        WsResponseResult::Subscribe(response)
-    }
-}
-
-impl<I> From<WsUnsubscribeResponse<I>> for WsResponseResult<I> {
-    fn from(response: WsUnsubscribeResponse<I>) -> Self {
-        WsResponseResult::Unsubscribe(response)
-    }
+    /// The raw notification payload
+    pub payload: serde_json::Value,
 }
 
 /// The request to unsubscribe
@@ -153,13 +144,21 @@ pub struct WsErrorResponse {
     pub jsonrpc: String,
     /// The result
     pub error: WsErrorBody,
-    /// The request ID
-    pub id: usize,
+    /// The request ID, `null` when the request was too malformed to carry one.
+    ///
+    /// JSON-RPC 2.0 requires the member to be present and null in that case, so
+    /// this serializes as `null` rather than being skipped.
+    #[serde(default)]
+    pub id: Option<usize>,
 }
 
 /// Message from the server to the client
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound = "I: Serialize + DeserializeOwned")]
+///
+/// This type is serialize-only in practice. Clients parsing incoming messages
+/// should use [`RawWsMessageOrResponse`] so notification payloads are kept as
+/// raw JSON until the subscription kind is known.
+#[derive(Debug, Clone, Serialize)]
+#[serde(bound(serialize = "I: Serialize + DeserializeOwned"))]
 #[serde(untagged)]
 pub enum WsMessageOrResponse<I> {
     /// A response to a request
@@ -168,6 +167,34 @@ pub enum WsMessageOrResponse<I> {
     ErrorResponse(WsErrorResponse),
     /// A notification
     Notification(Box<WsNotification<NotificationInner<String, I>>>),
+}
+
+/// Raw message from the server to the client.
+///
+/// Use this type when deserializing websocket messages from a mint. Notification
+/// payloads must then be decoded with
+/// [`deserialize_payload_for_kind`](super::deserialize_payload_for_kind).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound = "I: Serialize + DeserializeOwned")]
+#[serde(untagged)]
+pub enum RawWsMessageOrResponse<I> {
+    /// A response to a request
+    Response(WsResponse<I>),
+    /// An error response
+    ErrorResponse(WsErrorResponse),
+    /// A notification with raw JSON payload
+    Notification(Box<WsNotification<RawNotificationInner<I>>>),
+}
+
+impl<I> RawWsMessageOrResponse<I> {
+    /// The `jsonrpc` member, which every kind of incoming frame carries.
+    pub fn jsonrpc(&self) -> &str {
+        match self {
+            Self::Response(response) => &response.jsonrpc,
+            Self::ErrorResponse(error) => &error.jsonrpc,
+            Self::Notification(notification) => &notification.jsonrpc,
+        }
+    }
 }
 
 impl<I> From<(usize, Result<WsResponseResult<I>, WsErrorBody>)> for WsMessageOrResponse<I> {
@@ -181,8 +208,151 @@ impl<I> From<(usize, Result<WsResponseResult<I>, WsErrorBody>)> for WsMessageOrR
             Err(err) => WsMessageOrResponse::ErrorResponse(WsErrorResponse {
                 jsonrpc: JSON_RPC_VERSION.to_owned(),
                 error: err,
-                id,
+                id: Some(id),
             }),
+        }
+    }
+}
+
+/// Carries an error whose request could not be identified, which the tuple
+/// conversion above cannot express: it pairs an id with a `Result`, so it has no
+/// way to say "no id" without also allowing a success response without one.
+impl<I> From<WsErrorResponse> for WsMessageOrResponse<I> {
+    fn from(response: WsErrorResponse) -> Self {
+        WsMessageOrResponse::ErrorResponse(response)
+    }
+}
+
+impl WsErrorResponse {
+    /// Build an error response, for a request whose id may not have survived
+    /// parsing.
+    pub fn new(id: Option<usize>, error: WsErrorBody) -> Self {
+        WsErrorResponse {
+            jsonrpc: JSON_RPC_VERSION.to_owned(),
+            error,
+            id,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn response_result_uses_shared_nut17_acknowledgement_shape() {
+        let encoded = json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "status": "OK",
+                "subId": "sub-id"
+            },
+            "id": 7
+        });
+
+        let decoded: WsResponse<String> =
+            serde_json::from_value(encoded.clone()).expect("NUT-17 response");
+
+        assert_eq!(decoded.id, 7);
+        assert_eq!(
+            decoded.result,
+            WsResponseResult {
+                status: "OK".to_string(),
+                sub_id: "sub-id".to_string(),
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(decoded).expect("serialized NUT-17 response"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn error_response_without_an_id_round_trips_as_null() {
+        let encoded = json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32700, "message": "Parse error" },
+            "id": null
+        });
+
+        let decoded: WsErrorResponse =
+            serde_json::from_value(encoded.clone()).expect("NUT-17 error response");
+        assert_eq!(decoded.id, None);
+        assert_eq!(decoded.error.code, -32700);
+        assert_eq!(
+            serde_json::to_value(decoded).expect("serialized error response"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn error_response_keeps_a_numeric_id() {
+        let response: WsMessageOrResponse<String> = (
+            9usize,
+            Err(WsErrorBody {
+                code: -32602,
+                message: "Invalid params".to_string(),
+            }),
+        )
+            .into();
+
+        assert_eq!(
+            serde_json::to_value(response).expect("serialized error response")["id"],
+            json!(9)
+        );
+    }
+
+    #[test]
+    fn raw_ws_message_reads_the_version_of_every_variant() {
+        for encoded in [
+            json!({
+                "jsonrpc": "2.0",
+                "method": "subscribe",
+                "params": { "subId": "sub-id", "payload": {} }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "result": { "status": "OK", "subId": "sub-id" },
+                "id": 1
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "error": { "code": -32700, "message": "Parse error" },
+                "id": null
+            }),
+        ] {
+            let decoded: RawWsMessageOrResponse<String> =
+                serde_json::from_value(encoded.clone()).expect("a raw websocket frame");
+
+            assert_eq!(decoded.jsonrpc(), "2.0", "{encoded} should carry a version");
+        }
+    }
+
+    #[test]
+    fn raw_ws_message_deserializes_notification_payload_as_json() {
+        let encoded = r#"{
+            "jsonrpc": "2.0",
+            "method": "subscribe",
+            "params": {
+                "subId": "sub-id",
+                "payload": {
+                    "quote": "quote-id",
+                    "method": "bolt12"
+                }
+            }
+        }"#;
+
+        let decoded: RawWsMessageOrResponse<String> =
+            serde_json::from_str(encoded).expect("raw websocket notification");
+
+        match decoded {
+            RawWsMessageOrResponse::Notification(notification) => {
+                assert_eq!(notification.params.sub_id, "sub-id");
+                assert_eq!(notification.params.payload["quote"], "quote-id");
+            }
+            other => panic!("expected notification, got {:?}", other),
         }
     }
 }

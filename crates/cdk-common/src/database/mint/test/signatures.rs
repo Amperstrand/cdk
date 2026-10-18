@@ -1,5 +1,6 @@
 //! Blind signature tests
 
+use std::cmp::Reverse;
 use std::str::FromStr;
 
 use cashu::{Amount, BlindSignature, Id, SecretKey};
@@ -13,12 +14,16 @@ where
     DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
 {
     let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
-    let quote_id = QuoteId::new_uuid();
+    let quote_id = QuoteId::new();
 
     // Create blinded messages and signatures
-    let blinded_message1 = SecretKey::generate().public_key();
-    let blinded_message2 = SecretKey::generate().public_key();
-    let blinded_messages = vec![blinded_message1, blinded_message2];
+    // Use reverse key order to verify physical lock ordering preserves the
+    // request order represented by order_index.
+    let mut blinded_messages = [
+        SecretKey::generate().public_key(),
+        SecretKey::generate().public_key(),
+    ];
+    blinded_messages.sort_unstable_by_key(|message| Reverse(message.to_bytes()));
 
     let sig1 = BlindSignature {
         amount: Amount::from(100u64),
@@ -116,11 +121,15 @@ where
     DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
 {
     let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
-    let quote_id1 = QuoteId::new_uuid();
-    let quote_id2 = QuoteId::new_uuid();
+    let quote_id1 = QuoteId::new();
+    let quote_id2 = QuoteId::new();
 
-    // Create signatures for quote 1
-    let blinded_message1 = SecretKey::generate().public_key();
+    // Keep request order opposite to physical lock order so order_index is exercised.
+    let mut blinded_messages = [
+        SecretKey::generate().public_key(),
+        SecretKey::generate().public_key(),
+    ];
+    blinded_messages.sort_unstable_by_key(|message| Reverse(message.to_bytes()));
     let sig1 = BlindSignature {
         amount: Amount::from(100u64),
         keyset_id,
@@ -128,10 +137,17 @@ where
         dleq: None,
     };
 
-    // Create signatures for quote 2
-    let blinded_message2 = SecretKey::generate().public_key();
     let sig2 = BlindSignature {
         amount: Amount::from(200u64),
+        keyset_id,
+        c: SecretKey::generate().public_key(),
+        dleq: None,
+    };
+
+    // Create signature for quote 2
+    let blinded_message3 = SecretKey::generate().public_key();
+    let sig3 = BlindSignature {
+        amount: Amount::from(300u64),
         keyset_id,
         c: SecretKey::generate().public_key(),
         dleq: None,
@@ -140,15 +156,15 @@ where
     // Add signatures with different quote ids
     let mut tx = Database::begin_transaction(&db).await.unwrap();
     tx.add_blind_signatures(
-        &[blinded_message1],
-        std::slice::from_ref(&sig1),
+        &blinded_messages,
+        &[sig1.clone(), sig2.clone()],
         Some(quote_id1.clone()),
     )
     .await
     .unwrap();
     tx.add_blind_signatures(
-        &[blinded_message2],
-        std::slice::from_ref(&sig2),
+        &[blinded_message3],
+        std::slice::from_ref(&sig3),
         Some(quote_id2.clone()),
     )
     .await
@@ -157,15 +173,17 @@ where
 
     // Get signatures for quote 1
     let sigs1 = db.get_blind_signatures_for_quote(&quote_id1).await.unwrap();
-    assert_eq!(sigs1.len(), 1);
+    assert_eq!(sigs1.len(), 2);
     assert_eq!(sigs1[0].c, sig1.c);
     assert_eq!(sigs1[0].amount, sig1.amount);
+    assert_eq!(sigs1[1].c, sig2.c);
+    assert_eq!(sigs1[1].amount, sig2.amount);
 
     // Get signatures for quote 2
     let sigs2 = db.get_blind_signatures_for_quote(&quote_id2).await.unwrap();
     assert_eq!(sigs2.len(), 1);
-    assert_eq!(sigs2[0].c, sig2.c);
-    assert_eq!(sigs2[0].amount, sig2.amount);
+    assert_eq!(sigs2[0].c, sig3.c);
+    assert_eq!(sigs2[0].amount, sig3.amount);
 }
 
 /// Test getting total issued by keyset
@@ -264,4 +282,31 @@ where
         .await;
     assert!(result.is_err());
     tx.rollback().await.unwrap();
+}
+
+/// Test that an amount too large for the signed column is refused, not stored
+pub async fn reject_blind_signature_amount_over_i64_max<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
+{
+    let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
+    let blinded_message = SecretKey::generate().public_key();
+
+    let sig = BlindSignature {
+        amount: Amount::from(u64::MAX),
+        keyset_id,
+        c: SecretKey::generate().public_key(),
+        dleq: None,
+    };
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let err = tx
+        .add_blind_signatures(&[blinded_message], std::slice::from_ref(&sig), None)
+        .await
+        .expect_err("amount does not fit the column");
+    assert!(matches!(err, Error::ValueOutOfRange(_)), "{err:?}");
+    tx.rollback().await.unwrap();
+
+    let retrieved = db.get_blind_signatures(&[blinded_message]).await.unwrap();
+    assert!(retrieved[0].is_none());
 }

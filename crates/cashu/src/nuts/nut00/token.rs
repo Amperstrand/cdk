@@ -326,14 +326,16 @@ impl TokenV3 {
     /// Value - errors if duplicate proofs are found
     #[inline]
     pub fn value(&self) -> Result<Amount, Error> {
-        let proofs: Vec<ProofV3> = self.token.iter().flat_map(|t| t.proofs.clone()).collect();
-        let unique_count = proofs
+        let proof_count = self.token.iter().map(|t| t.proofs.len()).sum::<usize>();
+        let unique_count = self
+            .token
             .iter()
+            .flat_map(|t| t.proofs.iter().map(|p| &p.secret))
             .collect::<std::collections::HashSet<_>>()
             .len();
 
         // Check if there are any duplicate proofs
-        if unique_count != proofs.len() {
+        if unique_count != proof_count {
             return Err(Error::DuplicateProofs);
         }
 
@@ -459,14 +461,16 @@ impl TokenV4 {
     /// Value - errors if duplicate proofs are found
     #[inline]
     pub fn value(&self) -> Result<Amount, Error> {
-        let proofs: Vec<ProofV4> = self.token.iter().flat_map(|t| t.proofs.clone()).collect();
-        let unique_count = proofs
+        let proof_count = self.token.iter().map(|t| t.proofs.len()).sum::<usize>();
+        let unique_count = self
+            .token
             .iter()
+            .flat_map(|t| t.proofs.iter().map(|p| &p.secret))
             .collect::<std::collections::HashSet<_>>()
             .len();
 
         // Check if there are any duplicate proofs
-        if unique_count != proofs.len() {
+        if unique_count != proof_count {
             return Err(Error::DuplicateProofs);
         }
 
@@ -667,6 +671,88 @@ mod tests {
     }
 
     #[test]
+    fn test_token_accessors_preserve_v3_and_v4_metadata() {
+        let token_v3_str = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91LiJ9";
+        let token_v4_str = "cashuBpGF0gaJhaUgArSaMTR9YJmFwgaNhYQFhc3hAOWE2ZGJiODQ3YmQyMzJiYTc2ZGIwZGYxOTcyMTZiMjlkM2I4Y2MxNDU1M2NkMjc4MjdmYzFjYzk0MmZlZGI0ZWFjWCEDhhhUP_trhpXfStS6vN6So0qWvc2X3O4NfM-Y1HISZ5JhZGlUaGFuayB5b3VhbXVodHRwOi8vbG9jYWxob3N0OjMzMzhhdWNzYXQ=";
+
+        let token_v3 = TokenV3::from_str(token_v3_str).unwrap();
+        assert_eq!(token_v3.memo(), &Some("Thank you.".to_string()));
+        assert_eq!(token_v3.unit(), &Some(CurrencyUnit::Sat));
+        assert!(!token_v3.is_multi_mint());
+
+        let mut multi_mint_v3 = token_v3.clone();
+        multi_mint_v3.token.push(token_v3.token[0].clone());
+        assert!(multi_mint_v3.is_multi_mint());
+
+        let token = Token::TokenV3(token_v3);
+        assert_eq!(token.memo(), &Some("Thank you.".to_string()));
+        assert_eq!(token.unit(), Some(CurrencyUnit::Sat));
+        assert_eq!(
+            TokenV3::from_str(&token.to_v3_string()).unwrap(),
+            TokenV3::from_str(token_v3_str).unwrap()
+        );
+
+        let token_v3 = TokenV3 {
+            token: vec![],
+            memo: None,
+            unit: Some(CurrencyUnit::Eur),
+        };
+        assert_eq!(token_v3.unit(), &Some(CurrencyUnit::Eur));
+        assert_eq!(Token::TokenV3(token_v3).unit(), Some(CurrencyUnit::Eur));
+
+        let token_v4 = TokenV4::from_str(token_v4_str).unwrap();
+        assert_eq!(token_v4.memo(), &Some("Thank you".to_string()));
+        assert_eq!(token_v4.unit(), &CurrencyUnit::Sat);
+
+        let token = Token::TokenV4(token_v4);
+        assert_eq!(token.memo(), &Some("Thank you".to_string()));
+        assert_eq!(token.unit(), Some(CurrencyUnit::Sat));
+        assert!(token.to_v3_string().starts_with("cashuA"));
+
+        let token_v4 = TokenV4 {
+            mint_url: MintUrl::from_str("https://example.com").unwrap(),
+            unit: CurrencyUnit::Usd,
+            memo: None,
+            token: vec![],
+        };
+        assert_eq!(token_v4.unit(), &CurrencyUnit::Usd);
+        assert_eq!(Token::TokenV4(token_v4).unit(), Some(CurrencyUnit::Usd));
+    }
+
+    #[test]
+    fn test_generic_token_parser_accepts_v3_prefix() {
+        let token_v3_str = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91LiJ9";
+
+        assert!(matches!(
+            Token::from_str(token_v3_str).unwrap(),
+            Token::TokenV3(_)
+        ));
+    }
+
+    #[test]
+    fn test_token_proofs_extract_v3_and_v4_proofs() {
+        let token_v3_str = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91LiJ9";
+        let token_v4_str = "cashuBpGF0gaJhaUgArSaMTR9YJmFwgaNhYQFhc3hAOWE2ZGJiODQ3YmQyMzJiYTc2ZGIwZGYxOTcyMTZiMjlkM2I4Y2MxNDU1M2NkMjc4MjdmYzFjYzk0MmZlZGI0ZWFjWCEDhhhUP_trhpXfStS6vN6So0qWvc2X3O4NfM-Y1HISZ5JhZGlUaGFuayB5b3VhbXVodHRwOi8vbG9jYWxob3N0OjMzMzhhdWNzYXQ=";
+
+        let proofs = TokenV3::from_str(token_v3_str)
+            .unwrap()
+            .proofs(&[])
+            .unwrap();
+        assert_eq!(proofs.len(), 2);
+        assert_eq!(
+            Amount::try_sum(proofs.iter().map(|proof| proof.amount)).unwrap(),
+            10.into()
+        );
+
+        let proofs = TokenV4::from_str(token_v4_str)
+            .unwrap()
+            .proofs(&[])
+            .unwrap();
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].amount, Amount::ONE);
+    }
+
+    #[test]
     fn test_token_v4_multi_keyset() {
         let token_str_multi_keysets = "cashuBo2F0gqJhaUgA_9SLj17PgGFwgaNhYQFhc3hAYWNjMTI0MzVlN2I4NDg0YzNjZjE4NTAxNDkyMThhZjkwZjcxNmE1MmJmNGE1ZWQzNDdlNDhlY2MxM2Y3NzM4OGFjWCECRFODGd5IXVW-07KaZCvuWHk3WrnnpiDhHki6SCQh88-iYWlIAK0mjE0fWCZhcIKjYWECYXN4QDEzMjNkM2Q0NzA3YTU4YWQyZTIzYWRhNGU5ZjFmNDlmNWE1YjRhYzdiNzA4ZWIwZDYxZjczOGY0ODMwN2U4ZWVhY1ghAjRWqhENhLSsdHrr2Cw7AFrKUL9Ffr1XN6RBT6w659lNo2FhAWFzeEA1NmJjYmNiYjdjYzY0MDZiM2ZhNWQ1N2QyMTc0ZjRlZmY4YjQ0MDJiMTc2OTI2ZDNhNTdkM2MzZGNiYjU5ZDU3YWNYIQJzEpxXGeWZN5qXSmJjY8MzxWyvwObQGr5G1YCCgHicY2FtdWh0dHA6Ly9sb2NhbGhvc3Q6MzMzOGF1Y3NhdA==";
 
@@ -797,6 +883,25 @@ mod tests {
         let token = Token::new(mint_url.clone(), proofs, None, CurrencyUnit::Sat);
 
         // Verify that value() returns an error
+        let result = token.value();
+        assert!(result.is_err());
+
+        // Proofs with the same secret are duplicates even if another field differs.
+        let proof2 = Proof {
+            amount: Amount::from(10_000),
+            ..proof1.clone()
+        };
+
+        let proofs = vec![proof1.clone(), proof2.clone()].into_iter().collect();
+        let token = Token::new(mint_url.clone(), proofs, None, CurrencyUnit::Sat);
+
+        let result = token.value();
+        assert!(result.is_err());
+
+        let proofs = vec![proof1.clone(), proof2].into_iter().collect();
+        let token = TokenV3::new(mint_url.clone(), proofs, None, Some(CurrencyUnit::Sat))
+            .expect("token should be created");
+
         let result = token.value();
         assert!(result.is_err());
 

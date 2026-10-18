@@ -1,15 +1,15 @@
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes_gcm::aead::{Aead, AeadCore, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::aead::{Aead, Generate, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, Key};
 use async_trait::async_trait;
 use bitcoin::bip32::DerivationPath;
-use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::rand::rngs::OsRng;
+use bitcoin::secp256k1::rand::RngCore;
 use cdk_common::auth::oidc::OidcClient;
 use cdk_common::common::ProofInfo;
 use cdk_common::database::wallet::Database;
@@ -18,12 +18,15 @@ use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::{
     CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PublicKey, SpendingConditions, State,
 };
+use cdk_common::redact::url_for_logs;
 use cdk_common::secret::Secret;
 use cdk_common::util::hex;
 use cdk_common::wallet::{
-    self, MintQuote, Transaction, TransactionDirection, TransactionId, WalletSaga,
+    self, MintQuote, Transaction, TransactionDirection, TransactionId, TransactionStatus,
+    WalletSaga,
 };
 use reqwest::{Client, StatusCode};
+use scrypt::Params as ScryptParams;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use url::Url;
@@ -49,8 +52,16 @@ pub(crate) fn get_schema_sql_inner() -> String {
 
 /// URL-encode a value for use in query parameters
 fn url_encode(value: &str) -> String {
-    urlencoding::encode(value).into_owned()
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
+
+const ENCRYPTION_METADATA_VERSION: i64 = 1;
+const ENCRYPTION_KDF: &str = "scrypt";
+const ENCRYPTION_SALT_BYTES: usize = 16;
+const ENCRYPTION_KEY_BYTES: usize = 32;
+const SCRYPT_LOG_N: u8 = 15;
+const SCRYPT_R: u32 = 8;
+const SCRYPT_P: u32 = 1;
 
 /// Decode JWT expiration from token string (without verification)
 fn decode_jwt_expiry(token: &str) -> Option<u64> {
@@ -90,13 +101,26 @@ pub enum AuthProvider {
 }
 
 /// Response from Supabase Auth token refresh
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SupabaseTokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: Option<i64>,
     #[serde(skip)]
     _token_type: (),
+}
+
+impl fmt::Debug for SupabaseTokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SupabaseTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
 }
 
 /// Supabase wallet database implementation
@@ -117,7 +141,7 @@ struct SupabaseTokenResponse {
 /// - **None**: No automatic token refresh, use API key only
 /// - **SupabaseAuth**: Uses Supabase's GoTrue API for token refresh
 /// - **Oidc**: Uses an external OIDC provider for token refresh
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SupabaseWalletDatabase {
     url: Url,
     api_key: String,
@@ -129,15 +153,30 @@ pub struct SupabaseWalletDatabase {
     encryption_key: Arc<RwLock<Option<Key<Aes256Gcm>>>>,
 }
 
+impl fmt::Debug for SupabaseWalletDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SupabaseWalletDatabase")
+            .field("url", &url_for_logs(self.url.as_str()))
+            .field("api_key", &"[REDACTED]")
+            .field("jwt_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("token_expiration", &"[REDACTED]")
+            .field("auth_provider", &"[REDACTED]")
+            .field("client", &"Client")
+            .field("encryption_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl SupabaseWalletDatabase {
     /// Create a new SupabaseWalletDatabase with API key only (legacy behavior)
     ///
     /// No automatic token refresh is configured.
     ///
     /// **Note**: This does NOT run or check migrations automatically. After
-    /// authentication, call [`check_schema_compatibility()`] to verify the
+    /// authentication, call [`Self::check_schema_compatibility`] to verify the
     /// database schema is ready. Migrations must be run separately by an
-    /// administrator — see [`get_schema_sql()`] or use `supabase db push`.
+    /// administrator: see [`Self::get_schema_sql`] or use `supabase db push`.
     pub async fn new(url: Url, api_key: String) -> Result<Self, Error> {
         Ok(Self {
             url,
@@ -157,9 +196,9 @@ impl SupabaseWalletDatabase {
     /// Token refresh uses `POST /auth/v1/token` with `grant_type=refresh_token`.
     ///
     /// **Note**: This does NOT run or check migrations automatically. After
-    /// authentication, call [`check_schema_compatibility()`] to verify the
+    /// authentication, call [`Self::check_schema_compatibility`] to verify the
     /// database schema is ready. Migrations must be run separately by an
-    /// administrator — see [`get_schema_sql()`] or use `supabase db push`.
+    /// administrator: see [`Self::get_schema_sql`] or use `supabase db push`.
     pub async fn with_supabase_auth(url: Url, api_key: String) -> Result<Self, Error> {
         Ok(Self {
             url,
@@ -179,9 +218,9 @@ impl SupabaseWalletDatabase {
     /// The OIDC provider must be configured in Supabase to validate the JWTs.
     ///
     /// **Note**: This does NOT run or check migrations automatically. After
-    /// authentication, call [`check_schema_compatibility()`] to verify the
+    /// authentication, call [`Self::check_schema_compatibility`] to verify the
     /// database schema is ready. Migrations must be run separately by an
-    /// administrator — see [`get_schema_sql()`] or use `supabase db push`.
+    /// administrator: see [`Self::get_schema_sql`] or use `supabase db push`.
     pub async fn with_oidc(
         url: Url,
         api_key: String,
@@ -204,7 +243,7 @@ impl SupabaseWalletDatabase {
     /// This must match the latest `schema_version` value set in the migration files.
     /// When adding new migrations, update this constant and set the same value
     /// in the new migration's `INSERT INTO schema_info` statement.
-    pub const REQUIRED_SCHEMA_VERSION: u32 = 5;
+    pub const REQUIRED_SCHEMA_VERSION: u32 = 10;
 
     /// Get the full database schema SQL
     ///
@@ -313,12 +352,81 @@ impl SupabaseWalletDatabase {
         *refresh = token;
     }
 
-    /// Derives an AES-256-GCM encryption key from `password` via SHA-256.
-    pub async fn set_encryption_password(&self, password: &str) {
-        let key = sha256::Hash::hash(password.as_bytes());
+    /// Derives an AES-256-GCM encryption key from `password` via scrypt.
+    pub async fn set_encryption_password(&self, password: &str) -> Result<(), Error> {
+        let metadata = self.get_or_create_encryption_metadata().await?;
+        let key = Self::derive_encryption_key(password, &metadata)?;
 
         let mut encryption_key = self.encryption_key.write().await;
-        *encryption_key = Some(*Key::<Aes256Gcm>::from_slice(key.as_byte_array()));
+        *encryption_key = Some(key);
+        Ok(())
+    }
+
+    async fn get_or_create_encryption_metadata(&self) -> Result<EncryptionMetadataTable, Error> {
+        if let Some(metadata) = self.get_encryption_metadata().await? {
+            return Ok(metadata);
+        }
+
+        let metadata = EncryptionMetadataTable::new();
+        let (status, text) = self
+            .insert_request("rest/v1/wallet_encryption_metadata", &metadata)
+            .await?;
+
+        match status {
+            s if s.is_success() => Ok(metadata),
+            StatusCode::CONFLICT => self.get_encryption_metadata().await?.ok_or_else(|| {
+                Error::Supabase(
+                    "wallet encryption metadata conflicted but could not be loaded".to_string(),
+                )
+            }),
+            _ => Err(Error::Supabase(format!(
+                "wallet encryption metadata insert failed: HTTP {} - {}",
+                status, text
+            ))),
+        }
+    }
+
+    async fn get_encryption_metadata(&self) -> Result<Option<EncryptionMetadataTable>, Error> {
+        let path = "rest/v1/wallet_encryption_metadata?select=version,kdf,salt,scrypt_log_n,scrypt_r,scrypt_p&limit=1";
+        let (status, text) = self.get_request(path).await?;
+
+        if !status.is_success() && status != StatusCode::NO_CONTENT {
+            return Err(Error::Supabase(format!(
+                "wallet encryption metadata lookup failed: HTTP {} - {}",
+                status, text
+            )));
+        }
+
+        Ok(Self::parse_response::<EncryptionMetadataTable>(&text)?
+            .and_then(|rows| rows.into_iter().next()))
+    }
+
+    fn derive_encryption_key(
+        password: &str,
+        metadata: &EncryptionMetadataTable,
+    ) -> Result<Key<Aes256Gcm>, Error> {
+        if metadata.version != ENCRYPTION_METADATA_VERSION || metadata.kdf != ENCRYPTION_KDF {
+            return Err(Error::Supabase(format!(
+                "unsupported wallet encryption metadata: version={}, kdf={}",
+                metadata.version, metadata.kdf
+            )));
+        }
+
+        let salt = hex::decode(&metadata.salt)
+            .map_err(|_| Error::Supabase("invalid wallet encryption salt".to_string()))?;
+        let log_n = u8::try_from(metadata.scrypt_log_n)
+            .map_err(|_| Error::Supabase("invalid wallet encryption scrypt log_n".to_string()))?;
+        let r = u32::try_from(metadata.scrypt_r)
+            .map_err(|_| Error::Supabase("invalid wallet encryption scrypt r".to_string()))?;
+        let p = u32::try_from(metadata.scrypt_p)
+            .map_err(|_| Error::Supabase("invalid wallet encryption scrypt p".to_string()))?;
+        let params = ScryptParams::new(log_n, r, p)
+            .map_err(|_| Error::Supabase("invalid wallet encryption scrypt params".to_string()))?;
+        let mut key = [0u8; ENCRYPTION_KEY_BYTES];
+        scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key)
+            .map_err(|_| Error::Supabase("wallet encryption key derivation failed".to_string()))?;
+
+        Ok(key.into())
     }
 
     async fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, DatabaseError> {
@@ -327,7 +435,7 @@ impl SupabaseWalletDatabase {
             .as_ref()
             .ok_or(DatabaseError::Internal("Encryption key not set".into()))?;
         let cipher = Aes256Gcm::new(key);
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits; unique per message
+        let nonce = Nonce::<Aes256Gcm>::generate(); // 96-bits; unique per message
         let ciphertext = cipher
             .encrypt(&nonce, data)
             .map_err(|_| DatabaseError::Internal("Encryption failed".into()))?;
@@ -349,7 +457,8 @@ impl SupabaseWalletDatabase {
             return Err(DatabaseError::Internal("Invalid ciphertext length".into()));
         }
 
-        let nonce = Nonce::from_slice(&data[0..12]);
+        let nonce = <&Nonce<Aes256Gcm>>::try_from(&data[0..12])
+            .map_err(|_| DatabaseError::Internal("Invalid nonce length".into()))?;
         let ciphertext = &data[12..];
 
         cipher
@@ -527,7 +636,7 @@ impl SupabaseWalletDatabase {
             serde_json::from_str(params_json).map_err(Error::Serde)?
         };
 
-        let path = format!("rest/v1/rpc/{}", function_name);
+        let path = format!("rest/v1/rpc/{}", url_encode(function_name));
         let url = self.join_url(&path)?;
         let auth_bearer = self.get_auth_bearer().await;
 
@@ -613,7 +722,7 @@ impl SupabaseWalletDatabase {
     }
 
     /// Make a POST request with JSON body
-    async fn post_request<T: Serialize + Debug>(
+    async fn post_request<T: Serialize + fmt::Debug>(
         &self,
         path: &str,
         body: &T,
@@ -642,8 +751,43 @@ impl SupabaseWalletDatabase {
         Ok((status, text))
     }
 
+    /// Make a plain INSERT POST request (no upsert/merge).
+    ///
+    /// Unlike [`post_request`], this does NOT send `Prefer: resolution=merge-duplicates`,
+    /// so PostgREST returns `409 Conflict` if a row with the same primary key already
+    /// exists. This is used by the optimistic-locking insert path so a concurrent
+    /// row can be detected instead of silently overwritten.
+    async fn insert_request<T: Serialize + fmt::Debug>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<(StatusCode, String), Error> {
+        let url = self.join_url(path)?;
+        let auth_bearer = self.get_auth_bearer().await;
+
+        tracing::debug!(method = "POST", url = %url, "Supabase insert request");
+
+        let res = self
+            .client
+            .post(url.clone())
+            .header("apikey", &self.api_key)
+            .header("Authorization", format!("Bearer {}", auth_bearer))
+            .header("Prefer", "missing=default")
+            .json(body)
+            .send()
+            .await
+            .map_err(Error::Reqwest)?;
+
+        let status = res.status();
+        let text = res.text().await.map_err(Error::Reqwest)?;
+
+        tracing::debug!(method = "POST", url = %url, status = %status, response_len = text.len(), "Supabase insert response");
+
+        Ok((status, text))
+    }
+
     /// Make a PATCH request with JSON body
-    async fn patch_request<T: Serialize + Debug>(
+    async fn patch_request<T: Serialize + fmt::Debug>(
         &self,
         path: &str,
         body: &T,
@@ -674,7 +818,7 @@ impl SupabaseWalletDatabase {
     /// Make a PATCH request and ask PostgREST to return the updated rows as JSON
     /// (`Prefer: return=representation`).  Returns `(status, body)` where body is
     /// an empty JSON array `[]` when the filter matched no rows.
-    async fn patch_request_returning<T: Serialize + Debug>(
+    async fn patch_request_returning<T: Serialize + fmt::Debug>(
         &self,
         path: &str,
         body: &T,
@@ -1121,7 +1265,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         transaction_id: TransactionId,
     ) -> Result<Option<Transaction>, DatabaseError> {
         let id_hex = transaction_id.to_string();
-        let path = format!("rest/v1/transactions?id=eq.\\x{}", id_hex);
+        let path = format!("rest/v1/transactions?id=eq.{}", url_encode(&id_hex));
 
         let (status, text) = self.get_request(&path).await?;
 
@@ -1307,7 +1451,7 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
 
     async fn remove_transaction(&self, transaction_id: TransactionId) -> Result<(), DatabaseError> {
         let id_hex = transaction_id.to_string();
-        let path = format!("rest/v1/transactions?id=eq.\\x{}", id_hex);
+        let path = format!("rest/v1/transactions?id=eq.{}", url_encode(&id_hex));
 
         let (status, response_text) = self.delete_request(&path).await?;
 
@@ -1429,6 +1573,48 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         )))
     }
 
+    async fn increment_derivation_counter(
+        &self,
+        namespace: &str,
+        count: u32,
+    ) -> Result<u32, DatabaseError> {
+        let rpc_body = serde_json::json!({
+            "p_namespace": namespace,
+            "p_increment": count
+        });
+        let url = self.join_url("rest/v1/rpc/increment_derivation_counter")?;
+        let auth_bearer = self.get_auth_bearer().await;
+
+        let res = self
+            .client
+            .post(url)
+            .header("apikey", &self.api_key)
+            .header("Authorization", format!("Bearer {}", auth_bearer))
+            .header("Content-Type", "application/json")
+            .header("Prefer", "return=representation")
+            .json(&rpc_body)
+            .send()
+            .await
+            .map_err(Error::Reqwest)?;
+        let status = res.status();
+        let text = res.text().await.map_err(Error::Reqwest)?;
+
+        if status.is_success() {
+            let new_counter: i64 = serde_json::from_str(&text).map_err(|err| {
+                DatabaseError::Internal(format!(
+                    "Failed to parse derivation counter response: {}",
+                    err
+                ))
+            })?;
+            return u32::try_from(new_counter).map_err(|_| DatabaseError::AmountOverflow);
+        }
+
+        Err(DatabaseError::Internal(format!(
+            "increment_derivation_counter RPC failed: HTTP {}. Ensure migrations have been run.",
+            status
+        )))
+    }
+
     async fn add_mint(
         &self,
         mint_url: MintUrl,
@@ -1502,6 +1688,9 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
     async fn add_mint_quote(&self, quote: MintQuote) -> Result<(), DatabaseError> {
         let expected_version = quote.version;
         let mut item: MintQuoteTable = quote.try_into()?;
+
+        // Try UPDATE first: only matches a row whose stored version equals the
+        // expected version, bumping it to `expected_version + 1`.
         item.version = Some(expected_version.wrapping_add(1) as i32);
 
         let path = format!(
@@ -1515,33 +1704,39 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         // doesn't exist yet or was concurrently modified.
         let (status, response_text) = self.patch_request_returning(&path, &item).await?;
 
-        if status.is_success() {
-            let updated: serde_json::Value =
-                serde_json::from_str(&response_text).unwrap_or(serde_json::Value::Null);
-            let row_count = updated.as_array().map(|a| a.len()).unwrap_or(0);
-
-            if row_count > 0 {
-                // PATCH updated an existing row — done.
-                return Ok(());
-            }
-
-            // No rows updated: the row doesn't exist yet — fall through to INSERT.
-            let (status, response_text) = self
-                .post_request("rest/v1/mint_quote?on_conflict=id,wallet_id", &item)
-                .await?;
-
-            if status.is_success() {
-                return Ok(());
-            }
-
+        if !status.is_success() {
             return Err(DatabaseError::Internal(format!(
-                "add_mint_quote insert failed: HTTP {} - {}",
+                "add_mint_quote failed: HTTP {} - {}",
                 status, response_text
             )));
         }
 
+        let updated: serde_json::Value =
+            serde_json::from_str(&response_text).unwrap_or(serde_json::Value::Null);
+        let row_count = updated.as_array().map(|a| a.len()).unwrap_or(0);
+
+        if row_count > 0 {
+            // PATCH updated an existing row — done.
+            return Ok(());
+        }
+
+        // No rows updated: either the row doesn't exist yet (INSERT), or it exists
+        // with a different version (concurrent update). Attempt a plain INSERT that
+        // stores the quote's own version and fails with 409 on a primary-key conflict.
+        item.version = Some(expected_version as i32);
+        let (status, response_text) = self.insert_request("rest/v1/mint_quote", &item).await?;
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        if status == StatusCode::CONFLICT {
+            // Row already exists but the version filter above did not match it.
+            return Err(DatabaseError::ConcurrentUpdate);
+        }
+
         Err(DatabaseError::Internal(format!(
-            "add_mint_quote failed: HTTP {} - {}",
+            "add_mint_quote insert failed: HTTP {} - {}",
             status, response_text
         )))
     }
@@ -1562,6 +1757,9 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
     async fn add_melt_quote(&self, quote: wallet::MeltQuote) -> Result<(), DatabaseError> {
         let expected_version = quote.version;
         let mut item: MeltQuoteTable = quote.try_into()?;
+
+        // Try UPDATE first: only matches a row whose stored version equals the
+        // expected version, bumping it to `expected_version + 1`.
         item.version = Some(expected_version.wrapping_add(1) as i32);
 
         let path = format!(
@@ -1575,33 +1773,39 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         // doesn't exist yet or was concurrently modified.
         let (status, response_text) = self.patch_request_returning(&path, &item).await?;
 
-        if status.is_success() {
-            let updated: serde_json::Value =
-                serde_json::from_str(&response_text).unwrap_or(serde_json::Value::Null);
-            let row_count = updated.as_array().map(|a| a.len()).unwrap_or(0);
-
-            if row_count > 0 {
-                // PATCH updated an existing row — done.
-                return Ok(());
-            }
-
-            // No rows updated: the row doesn't exist yet — fall through to INSERT.
-            let (status, response_text) = self
-                .post_request("rest/v1/melt_quote?on_conflict=id,wallet_id", &item)
-                .await?;
-
-            if status.is_success() {
-                return Ok(());
-            }
-
+        if !status.is_success() {
             return Err(DatabaseError::Internal(format!(
-                "add_melt_quote insert failed: HTTP {} - {}",
+                "add_melt_quote failed: HTTP {} - {}",
                 status, response_text
             )));
         }
 
+        let updated: serde_json::Value =
+            serde_json::from_str(&response_text).unwrap_or(serde_json::Value::Null);
+        let row_count = updated.as_array().map(|a| a.len()).unwrap_or(0);
+
+        if row_count > 0 {
+            // PATCH updated an existing row — done.
+            return Ok(());
+        }
+
+        // No rows updated: either the row doesn't exist yet (INSERT), or it exists
+        // with a different version (concurrent update). Attempt a plain INSERT that
+        // stores the quote's own version and fails with 409 on a primary-key conflict.
+        item.version = Some(expected_version as i32);
+        let (status, response_text) = self.insert_request("rest/v1/melt_quote", &item).await?;
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        if status == StatusCode::CONFLICT {
+            // Row already exists but the version filter above did not match it.
+            return Err(DatabaseError::ConcurrentUpdate);
+        }
+
         Err(DatabaseError::Internal(format!(
-            "add_melt_quote failed: HTTP {} - {}",
+            "add_melt_quote insert failed: HTTP {} - {}",
             status, response_text
         )))
     }
@@ -1797,7 +2001,10 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
             expected_version
         );
 
-        let (status, response_text) = self.patch_request(&path, &item).await?;
+        // Use `return=representation` so PostgREST reports which rows were actually
+        // updated. An empty array means the version filter matched no row (stale
+        // update / concurrent modification), so the update did not succeed.
+        let (status, response_text) = self.patch_request_returning(&path, &item).await?;
 
         if !status.is_success() {
             return Err(DatabaseError::Internal(format!(
@@ -1806,14 +2013,11 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
             )));
         }
 
-        // PostgREST PATCH returns empty body for 0 rows updated. Check via GET.
-        // Alternatively, we check if the response indicates changes were made.
-        // A simpler approach: re-read and verify version was updated.
-        let current = self.get_saga(&saga.id).await?;
-        match current {
-            Some(s) => Ok(s.version == saga.version),
-            None => Ok(false),
-        }
+        let updated: serde_json::Value =
+            serde_json::from_str(&response_text).unwrap_or(serde_json::Value::Null);
+        let row_count = updated.as_array().map(|a| a.len()).unwrap_or(0);
+
+        Ok(row_count > 0)
     }
 
     async fn delete_saga(&self, id: &uuid::Uuid) -> Result<(), DatabaseError> {
@@ -1860,55 +2064,60 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
         ys: Vec<PublicKey>,
         operation_id: &uuid::Uuid,
     ) -> Result<(), DatabaseError> {
-        let op_id_str = operation_id.to_string();
-        for y in &ys {
-            let y_hex = hex::encode(y.to_bytes());
-
-            // Update proof state to Reserved with operation_id atomically by filtering on state=Unspent
-            let update = serde_json::json!({
-                "state": State::Reserved.to_string(),
-                "used_by_operation": op_id_str,
-            });
-
-            // We filter on state=Unspent to ensure we only reserve proofs that are currently available.
-            // This prevents race conditions where two operations try to reserve the same proof.
-            let patch_path = format!(
-                "rest/v1/proof?y=eq.{}&state=eq.{}",
-                url_encode(&y_hex),
-                url_encode(&State::Unspent.to_string())
-            );
-
-            let (status, response_text) = self.patch_request(&patch_path, &update).await?;
-
-            if !status.is_success() {
-                return Err(DatabaseError::Internal(format!(
-                    "reserve_proofs: update failed: HTTP {} - {}",
-                    status, response_text
-                )));
-            }
-
-            // PostgREST returns 204 No Content for success.
-            // If the proof was already reserved or spent, the PATCH will succeed (HTTP 204)
-            // but no rows will be updated. We check if the proof is actually reserved.
-            let reserved_proofs = self.get_reserved_proofs(operation_id).await?;
-            if !reserved_proofs.iter().any(|p| p.y == *y) {
-                return Err(DatabaseError::ProofNotUnspent);
-            }
+        if ys.is_empty() {
+            return Ok(());
         }
+
+        let op_id_str = operation_id.to_string();
+        let update = serde_json::json!({
+            "state": State::Reserved.to_string(),
+            "used_by_operation": op_id_str,
+        });
+
+        // Filtering on state=Unspent keeps two operations from reserving the
+        // same proof, and a single PATCH keeps the whole set in one statement.
+        let y_list: Vec<String> = ys.iter().map(|y| hex::encode(y.to_bytes())).collect();
+        let patch_path = format!(
+            "rest/v1/proof?y=in.({})&state=eq.{}",
+            y_list.join(","),
+            url_encode(&State::Unspent.to_string())
+        );
+
+        let (status, response_text) = self.patch_request(&patch_path, &update).await?;
+
+        if !status.is_success() {
+            return Err(DatabaseError::Internal(format!(
+                "reserve_proofs: update failed: HTTP {} - {}",
+                status, response_text
+            )));
+        }
+
+        // PostgREST returns 204 No Content whether or not any row matched, so
+        // read back what was reserved. If some proof was not unspent, undo the
+        // partial reservation rather than leaving it behind.
+        let reserved_proofs = self.get_reserved_proofs(operation_id).await?;
+        if !ys.iter().all(|y| reserved_proofs.iter().any(|p| p.y == *y)) {
+            self.release_proofs(operation_id).await?;
+            return Err(DatabaseError::ProofNotUnspent);
+        }
+
         Ok(())
     }
 
     async fn release_proofs(&self, operation_id: &uuid::Uuid) -> Result<(), DatabaseError> {
         let op_id_str = operation_id.to_string();
 
-        // Update all proofs reserved by this operation back to Unspent
+        // Release only live reservations owned by this operation. In
+        // particular, never resurrect a proof already finalized as Spent.
         let update = serde_json::json!({
             "state": State::Unspent.to_string(),
             "used_by_operation": null,
         });
         let path = format!(
-            "rest/v1/proof?used_by_operation=eq.{}",
-            url_encode(&op_id_str)
+            "rest/v1/proof?used_by_operation=eq.{}&state=in.({},{})",
+            url_encode(&op_id_str),
+            url_encode(&State::Reserved.to_string()),
+            url_encode(&State::Pending.to_string())
         );
         let (status, response_text) = self.patch_request(&path, &update).await?;
 
@@ -2188,6 +2397,36 @@ impl Database<DatabaseError> for SupabaseWalletDatabase {
 // extra columns added by other applications (e.g., user_id, opt_version) without breaking.
 
 #[derive(Debug, Serialize, Deserialize)]
+struct EncryptionMetadataTable {
+    version: i64,
+    kdf: String,
+    salt: String,
+    scrypt_log_n: i64,
+    scrypt_r: i64,
+    scrypt_p: i64,
+    /// Extra fields from other applications (captured during deserialization, ignored during serialization)
+    #[serde(default, skip_serializing, flatten)]
+    _extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl EncryptionMetadataTable {
+    fn new() -> Self {
+        let mut salt = [0u8; ENCRYPTION_SALT_BYTES];
+        OsRng.fill_bytes(&mut salt);
+
+        Self {
+            version: ENCRYPTION_METADATA_VERSION,
+            kdf: ENCRYPTION_KDF.to_string(),
+            salt: hex::encode(salt),
+            scrypt_log_n: SCRYPT_LOG_N as i64,
+            scrypt_r: SCRYPT_R as i64,
+            scrypt_p: SCRYPT_P as i64,
+            _extra: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct KVStoreTable {
     primary_namespace: String,
     secondary_namespace: String,
@@ -2293,6 +2532,8 @@ impl TryInto<MintInfo> for MintTable {
             motd: self.motd,
             time: self.mint_time.map(|t| t as u64),
             tos_url: self.tos_url,
+            // Not persisted: a runtime hint the mint recomputes, refreshed with /v1/info.
+            max_array_length: None,
         })
     }
 }
@@ -2407,6 +2648,8 @@ struct MintQuoteTable {
     amount_issued: i64,
     amount_paid: i64,
     #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
     used_by_operation: Option<String>,
     #[serde(default)]
     version: Option<i32>,
@@ -2440,6 +2683,8 @@ impl TryInto<MintQuote> for MintQuoteTable {
                 .map_err(|_| DatabaseError::Internal("Invalid payment method".into()))?,
             amount_issued: cdk_common::Amount::from(self.amount_issued as u64),
             amount_paid: cdk_common::Amount::from(self.amount_paid as u64),
+            updated_at: self.updated_at as u64,
+            estimated_blocks: None,
             used_by_operation: self.used_by_operation,
             version: self.version.unwrap_or(0) as u32,
         })
@@ -2457,10 +2702,11 @@ impl TryFrom<MintQuote> for MintQuoteTable {
             request: Some(q.request),
             state: q.state.to_string(),
             expiry: q.expiry as i64,
-            secret_key: q.secret_key.map(|k| k.to_string()),
+            secret_key: q.secret_key.map(|key| key.to_secret_hex()),
             payment_method: q.payment_method.to_string(),
             amount_issued: q.amount_issued.to_u64() as i64,
             amount_paid: q.amount_paid.to_u64() as i64,
+            updated_at: q.updated_at as i64,
             used_by_operation: q.used_by_operation,
             version: Some(q.version as i32),
             _extra: Default::default(),
@@ -2479,6 +2725,10 @@ struct MeltQuoteTable {
     expiry: i64,
     payment_proof: Option<String>,
     payment_method: String,
+    #[serde(default)]
+    estimated_blocks: Option<i64>,
+    #[serde(default)]
+    fee_index: Option<i64>,
     #[serde(default)]
     mint_url: Option<String>,
     #[serde(default)]
@@ -2512,6 +2762,16 @@ impl TryInto<wallet::MeltQuote> for MeltQuoteTable {
             payment_proof: self.payment_proof,
             payment_method: cdk_common::PaymentMethod::from_str(&self.payment_method)
                 .map_err(|_| DatabaseError::Internal("Invalid payment method".into()))?,
+            estimated_blocks: self
+                .estimated_blocks
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| DatabaseError::Internal("Invalid estimated_blocks".into()))?,
+            fee_index: self
+                .fee_index
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| DatabaseError::Internal("Invalid fee_index".into()))?,
             used_by_operation: self.used_by_operation,
             version: self.version.unwrap_or(0) as u32,
         })
@@ -2532,6 +2792,8 @@ impl TryFrom<wallet::MeltQuote> for MeltQuoteTable {
             expiry: q.expiry as i64,
             payment_proof: q.payment_proof,
             payment_method: q.payment_method.to_string(),
+            estimated_blocks: q.estimated_blocks.map(i64::from),
+            fee_index: q.fee_index.map(i64::from),
             used_by_operation: q.used_by_operation,
             version: Some(q.version as i32),
             _extra: Default::default(),
@@ -2546,6 +2808,8 @@ struct ProofTable {
     state: String,
     spending_condition: Option<String>,
     unit: String,
+    #[serde(default)]
+    derivation_index: Option<i64>,
     amount: i64,
     keyset_id: String,
     secret: String,
@@ -2585,6 +2849,11 @@ impl TryInto<ProofInfo> for ProofTable {
                 .transpose()?,
             unit: CurrencyUnit::from_str(&self.unit)
                 .map_err(|_| DatabaseError::Internal("Invalid unit".into()))?,
+            derivation_index: self
+                .derivation_index
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| DatabaseError::Internal("Invalid derivation index".to_owned()))?,
             proof: cdk_common::Proof {
                 amount: cdk_common::Amount::from(self.amount as u64),
                 keyset_id: Id::from_str(&self.keyset_id)
@@ -2640,6 +2909,7 @@ impl TryFrom<ProofInfo> for ProofTable {
                 .map(|s| serde_json::to_string(&s))
                 .transpose()?,
             unit: p.unit.to_string(),
+            derivation_index: p.derivation_index.map(i64::from),
             amount: p.proof.amount.to_u64() as i64,
             keyset_id: p.proof.keyset_id.to_string(),
             secret: p.proof.secret.to_string(),
@@ -2690,6 +2960,8 @@ struct TransactionTable {
     payment_method: Option<String>,
     #[serde(default)]
     saga_id: Option<String>,
+    #[serde(default = "default_transaction_status")]
+    status: String,
     /// Extra fields from other applications (captured during deserialization, ignored during serialization)
     #[serde(default, skip_serializing, flatten)]
     _extra: serde_json::Map<String, serde_json::Value>,
@@ -2746,6 +3018,8 @@ impl TryInto<Transaction> for TransactionTable {
                 .map(|s| uuid::Uuid::parse_str(&s))
                 .transpose()
                 .map_err(|_| DatabaseError::Internal("Invalid saga_id uuid".into()))?,
+            status: TransactionStatus::from_str(&self.status)
+                .map_err(|_| DatabaseError::Internal("Invalid transaction status".into()))?,
         })
     }
 }
@@ -2773,9 +3047,14 @@ impl TryFrom<Transaction> for TransactionTable {
             payment_proof: t.payment_proof,
             payment_method: t.payment_method.map(|p| p.to_string()),
             saga_id: t.saga_id.map(|u| u.to_string()),
+            status: t.status.to_string(),
             _extra: Default::default(),
         })
     }
+}
+
+fn default_transaction_status() -> String {
+    TransactionStatus::Completed.to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2792,7 +3071,7 @@ struct SagaTable {
 }
 
 /// Response from Supabase Auth sign-up/sign-in
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct SupabaseAuthResponse {
     /// Access token
     pub access_token: String,
@@ -2804,6 +3083,21 @@ pub struct SupabaseAuthResponse {
     pub refresh_token: Option<String>,
     /// User
     pub user: serde_json::Value,
+}
+
+impl fmt::Debug for SupabaseAuthResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SupabaseAuthResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("user", &self.user)
+            .finish()
+    }
 }
 
 /// Helper for Supabase Authentication
@@ -2890,15 +3184,630 @@ impl SupabaseAuth {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use bitcoin::base64::engine::general_purpose;
+    use bitcoin::base64::Engine as _;
+    use cdk_common::database::{Error as DatabaseError, WalletDatabase};
+    #[cfg(feature = "integration-tests")]
+    use cdk_common::wallet_db_test;
+    use mockito::Matcher;
+    use serde_json::json;
+    use url::Url;
+
     use super::*;
+    #[cfg(feature = "integration-tests")]
+    use crate::Error;
 
     #[test]
-    fn test_set_encryption_password_key_derivation() {
-        // SHA-256("password") == 5e884898...
-        let key = sha256::Hash::hash(b"password");
+    fn token_response_debug_redacts_tokens() {
+        let access_token = "supabase-internal-access-token";
+        let refresh_token = "supabase-internal-refresh-token";
+        let response = SupabaseTokenResponse {
+            access_token: access_token.to_string(),
+            refresh_token: Some(refresh_token.to_string()),
+            expires_in: Some(3_600),
+            _token_type: (),
+        };
+
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("expires_in: Some(3600)"));
+        assert!(!debug.contains(access_token));
+        assert!(!debug.contains(refresh_token));
+    }
+
+    #[test]
+    fn auth_response_debug_redacts_tokens() {
+        let access_token = "supabase-public-access-token";
+        let refresh_token = "supabase-public-refresh-token";
+        let response = SupabaseAuthResponse {
+            access_token: access_token.to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: Some(3_600),
+            refresh_token: Some(refresh_token.to_string()),
+            user: json!({"id": "public-user-id"}),
+        };
+
+        let debug = format!("{response:?}");
+
+        assert!(debug.contains("public-user-id"));
+        assert!(!debug.contains(access_token));
+        assert!(!debug.contains(refresh_token));
+    }
+
+    #[tokio::test]
+    async fn wallet_database_debug_redacts_credentials() {
+        let api_key = "supabase-api-key-secret";
+        let url_secret = "supabase-url-secret";
+        let url = Url::parse(&format!(
+            "https://user:{url_secret}@example.supabase.co/rest/v1?token={url_secret}"
+        ))
+        .expect("valid Supabase URL");
+        let database = SupabaseWalletDatabase::new(url, api_key.to_string())
+            .await
+            .expect("database construction should succeed");
+
+        let debug = format!("{database:?}");
+
+        assert!(debug.contains("https://example.supabase.co/rest/v1"));
+        assert!(!debug.contains(api_key));
+        assert!(!debug.contains(url_secret));
+    }
+
+    #[test]
+    fn mint_quote_table_round_trip_preserves_secret_key_hex() {
+        let secret_key = cdk_common::nuts::SecretKey::generate();
+        let secret_hex = secret_key.to_secret_hex();
+        let quote = MintQuote {
+            id: "quote-with-secret-key".to_string(),
+            mint_url: MintUrl::from_str("https://example.com").expect("valid mint URL"),
+            payment_method: cdk_common::PaymentMethod::BOLT11,
+            amount: Some(cdk_common::Amount::from(1)),
+            unit: CurrencyUnit::Sat,
+            request: "lnbc1test".to_string(),
+            state: cdk_common::nuts::MintQuoteState::Unpaid,
+            expiry: 1,
+            secret_key: Some(secret_key.clone()),
+            amount_issued: cdk_common::Amount::ZERO,
+            amount_paid: cdk_common::Amount::ZERO,
+            updated_at: 0,
+            estimated_blocks: None,
+            used_by_operation: None,
+            version: 0,
+        };
+
+        let table = MintQuoteTable::try_from(quote).expect("quote converts to table row");
+        assert_eq!(table.secret_key.as_deref(), Some(secret_hex.as_str()));
+
+        let round_trip: MintQuote = table.try_into().expect("table row converts to quote");
+        assert_eq!(round_trip.secret_key, Some(secret_key));
+    }
+    use crate::SupabaseWalletDatabase;
+
+    fn extract_schema_versions(schema_sql: &str) -> Vec<u32> {
+        const PREFIX: &str = "VALUES ('schema_version', '";
+
+        schema_sql
+            .lines()
+            .filter_map(|line| {
+                let start = line.find(PREFIX)? + PREFIX.len();
+                let end = line[start..].find('\'')? + start;
+                line[start..end].parse().ok()
+            })
+            .collect()
+    }
+
+    fn schema_info_query() -> Matcher {
+        Matcher::AllOf(vec![
+            Matcher::UrlEncoded("key".to_string(), "eq.schema_version".to_string()),
+            Matcher::UrlEncoded("select".to_string(), "value".to_string()),
+        ])
+    }
+
+    fn encryption_metadata_query() -> Matcher {
+        Matcher::AllOf(vec![
+            Matcher::UrlEncoded(
+                "select".to_string(),
+                "version,kdf,salt,scrypt_log_n,scrypt_r,scrypt_p".to_string(),
+            ),
+            Matcher::UrlEncoded("limit".to_string(), "1".to_string()),
+        ])
+    }
+
+    fn jwt_with_expiry(exp: u64) -> String {
+        let header = general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload =
+            general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#).as_bytes());
+
+        format!("{header}.{payload}.signature")
+    }
+
+    fn unix_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_secs()
+    }
+
+    #[test]
+    fn supabase_wallet_database_implements_wallet_database() {
+        fn assert_wallet_database<T: WalletDatabase<DatabaseError>>() {}
+
+        assert_wallet_database::<SupabaseWalletDatabase>();
+    }
+
+    #[test]
+    fn schema_sql_tracks_required_schema_version() {
+        let schema_sql = SupabaseWalletDatabase::get_schema_sql();
+        let versions = extract_schema_versions(&schema_sql);
+
+        assert!(
+            !versions.is_empty(),
+            "embedded schema should expose a schema version"
+        );
+        assert!(schema_sql.contains("CREATE TABLE IF NOT EXISTS schema_info"));
+        assert!(schema_sql.contains("CREATE TABLE IF NOT EXISTS p2pk_signing_key"));
+        assert!(schema_sql.contains("CREATE TABLE IF NOT EXISTS wallet_encryption_metadata"));
+        assert!(schema_sql.contains("CREATE TABLE IF NOT EXISTS derivation_counter"));
+        assert!(schema_sql.contains("CREATE OR REPLACE FUNCTION increment_derivation_counter"));
+        assert!(schema_sql
+            .contains("ALTER TABLE proof ADD COLUMN IF NOT EXISTS derivation_index INTEGER"));
+        assert!(schema_sql.contains("ALTER TABLE proof ADD COLUMN IF NOT EXISTS p2pk_e TEXT"));
+        assert!(schema_sql.contains(
+            "derivation_index = COALESCE(\n                EXCLUDED.derivation_index,\n                existing.derivation_index"
+        ));
         assert_eq!(
-            hex::encode(key.as_byte_array()),
-            "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+            versions.last().copied(),
+            Some(SupabaseWalletDatabase::REQUIRED_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            versions.iter().max().copied(),
+            Some(SupabaseWalletDatabase::REQUIRED_SCHEMA_VERSION)
         );
     }
+
+    #[test]
+    fn proof_update_function_has_a_dedicated_migration() {
+        let (_, _, sql) = migrations::MIGRATIONS
+            .iter()
+            .find(|(_, name, _)| *name == "20260811000002_fn_update_proofs_atomic.sql")
+            .expect("proof update function migration should be embedded");
+
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION update_proofs_atomic"));
+        assert!(sql.contains("SET search_path = ''"));
+        assert!(sql.contains("INSERT INTO public.proof AS existing"));
+        assert!(!sql.contains("ALTER TABLE"));
+        assert!(!sql.contains("schema_info"));
+        assert!(sql.contains("used_by_operation"));
+        assert!(sql.contains("created_by_operation"));
+        assert!(sql.contains("p2pk_e"));
+        assert!(sql.contains("derivation_index"));
+    }
+
+    #[tokio::test]
+    async fn schema_compatibility_uses_api_key_without_jwt() {
+        let mut server = mockito::Server::new_async().await;
+        let required_version = SupabaseWalletDatabase::REQUIRED_SCHEMA_VERSION.to_string();
+        let mock = server
+            .mock("GET", "/rest/v1/schema_info")
+            .match_query(schema_info_query())
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", "Bearer anon-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"[{{"value":"{required_version}"}}]"#))
+            .create_async()
+            .await;
+
+        let db = SupabaseWalletDatabase::new(
+            Url::parse(&server.url()).expect("mock server URL should parse"),
+            "anon-key".to_string(),
+        )
+        .await
+        .expect("database should initialize");
+
+        db.check_schema_compatibility()
+            .await
+            .expect("required schema version should pass");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn schema_compatibility_reports_outdated_schema() {
+        let mut server = mockito::Server::new_async().await;
+        let found_version = SupabaseWalletDatabase::REQUIRED_SCHEMA_VERSION - 1;
+        let mock = server
+            .mock("GET", "/rest/v1/schema_info")
+            .match_query(schema_info_query())
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", "Bearer anon-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"[{{"value":"{found_version}"}}]"#))
+            .create_async()
+            .await;
+
+        let db = SupabaseWalletDatabase::new(
+            Url::parse(&server.url()).expect("mock server URL should parse"),
+            "anon-key".to_string(),
+        )
+        .await
+        .expect("database should initialize");
+
+        let error = db
+            .check_schema_compatibility()
+            .await
+            .expect_err("outdated schema should fail");
+
+        match error {
+            Error::SchemaMismatch { required, found } => {
+                assert_eq!(required, SupabaseWalletDatabase::REQUIRED_SCHEMA_VERSION);
+                assert_eq!(found, found_version);
+            }
+            other => panic!("expected schema mismatch error, got {other:?}"),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn schema_compatibility_reports_missing_schema_info() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/rest/v1/schema_info")
+            .match_query(schema_info_query())
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", "Bearer anon-key")
+            .with_status(404)
+            .with_body(r#"{"message":"relation \"schema_info\" does not exist"}"#)
+            .create_async()
+            .await;
+
+        let db = SupabaseWalletDatabase::new(
+            Url::parse(&server.url()).expect("mock server URL should parse"),
+            "anon-key".to_string(),
+        )
+        .await
+        .expect("database should initialize");
+
+        let error = db
+            .check_schema_compatibility()
+            .await
+            .expect_err("missing schema_info should fail");
+
+        match error {
+            Error::SchemaNotInitialized => {}
+            other => panic!("expected schema not initialized error, got {other:?}"),
+        }
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn call_rpc_uses_jwt_token_and_serializes_json_body() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/rest/v1/rpc/update_proofs_atomic")
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", "Bearer jwt-token")
+            .match_header("content-type", "application/json")
+            .match_body(Matcher::Json(json!({ "proofs": [] })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"updated":1}"#)
+            .create_async()
+            .await;
+
+        let db = SupabaseWalletDatabase::new(
+            Url::parse(&server.url()).expect("mock server URL should parse"),
+            "anon-key".to_string(),
+        )
+        .await
+        .expect("database should initialize");
+        db.set_jwt_token(Some("jwt-token".to_string())).await;
+
+        let response = db
+            .call_rpc("update_proofs_atomic", r#"{"proofs":[]}"#)
+            .await
+            .expect("RPC request should succeed");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response)
+                .expect("RPC response should be JSON"),
+            json!({ "updated": 1 })
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn call_rpc_encodes_function_name_path_segments() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "POST",
+                "/rest/v1/rpc/..%2F..%2F..%2Fauth%2Fv1%2Fadmin%2Fusers",
+            )
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", "Bearer jwt-token")
+            .match_header("content-type", "application/json")
+            .match_body(Matcher::Json(json!({})))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create_async()
+            .await;
+
+        let db = SupabaseWalletDatabase::new(
+            Url::parse(&server.url()).expect("mock server URL should parse"),
+            "anon-key".to_string(),
+        )
+        .await
+        .expect("database should initialize");
+        db.set_jwt_token(Some("jwt-token".to_string())).await;
+
+        let response = db
+            .call_rpc("../../../auth/v1/admin/users", "{}")
+            .await
+            .expect("RPC request should succeed");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response)
+                .expect("RPC response should be JSON"),
+            json!({ "ok": true })
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn schema_compatibility_refreshes_expiring_supabase_tokens() {
+        let mut server = mockito::Server::new_async().await;
+        let refreshed_token = "fresh-access-token";
+        let refreshed_auth_header = format!("Bearer {refreshed_token}");
+        let required_version = SupabaseWalletDatabase::REQUIRED_SCHEMA_VERSION.to_string();
+
+        let refresh_mock = server
+            .mock("POST", "/auth/v1/token")
+            .match_query(Matcher::UrlEncoded(
+                "grant_type".to_string(),
+                "refresh_token".to_string(),
+            ))
+            .match_header("apikey", "anon-key")
+            .match_header("content-type", "application/json")
+            .match_body(Matcher::Json(json!({ "refresh_token": "refresh-token" })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"access_token":"{refreshed_token}","refresh_token":"rotated-refresh-token","expires_in":3600}}"#
+            ))
+            .create_async()
+            .await;
+
+        let schema_mock = server
+            .mock("GET", "/rest/v1/schema_info")
+            .match_query(schema_info_query())
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", refreshed_auth_header.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"[{{"value":"{required_version}"}}]"#))
+            .create_async()
+            .await;
+
+        let db = SupabaseWalletDatabase::with_supabase_auth(
+            Url::parse(&server.url()).expect("mock server URL should parse"),
+            "anon-key".to_string(),
+        )
+        .await
+        .expect("database should initialize");
+        db.set_refresh_token(Some("refresh-token".to_string()))
+            .await;
+        db.set_jwt_token(Some(jwt_with_expiry(unix_now().saturating_sub(1))))
+            .await;
+
+        db.check_schema_compatibility()
+            .await
+            .expect("token refresh should make schema check succeed");
+
+        assert_eq!(db.get_jwt_token().await.as_deref(), Some(refreshed_token));
+        refresh_mock.assert_async().await;
+        schema_mock.assert_async().await;
+    }
+
+    #[test]
+    fn encryption_key_derivation_uses_scrypt_metadata() {
+        use bitcoin::hashes::{sha256, Hash};
+
+        let metadata = EncryptionMetadataTable {
+            version: ENCRYPTION_METADATA_VERSION,
+            kdf: ENCRYPTION_KDF.to_string(),
+            salt: "000102030405060708090a0b0c0d0e0f".to_string(),
+            scrypt_log_n: SCRYPT_LOG_N as i64,
+            scrypt_r: SCRYPT_R as i64,
+            scrypt_p: SCRYPT_P as i64,
+            _extra: Default::default(),
+        };
+        let key = SupabaseWalletDatabase::derive_encryption_key("password", &metadata)
+            .expect("scrypt key derivation should succeed");
+        let raw_sha = sha256::Hash::hash(b"password");
+
+        assert_ne!(key.as_slice(), &raw_sha.as_byte_array()[..]);
+    }
+
+    #[tokio::test]
+    async fn set_encryption_password_creates_metadata_and_sets_key() {
+        use bitcoin::hashes::{sha256, Hash};
+
+        let mut server = mockito::Server::new_async().await;
+        let get_mock = server
+            .mock("GET", "/rest/v1/wallet_encryption_metadata")
+            .match_query(encryption_metadata_query())
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", "Bearer anon-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+        let insert_mock = server
+            .mock("POST", "/rest/v1/wallet_encryption_metadata")
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", "Bearer anon-key")
+            .match_header("prefer", "missing=default")
+            .with_status(201)
+            .create_async()
+            .await;
+
+        let db = SupabaseWalletDatabase::new(
+            Url::parse(&server.url()).expect("mock server URL should parse"),
+            "anon-key".to_string(),
+        )
+        .await
+        .expect("database should initialize");
+
+        db.set_encryption_password("password")
+            .await
+            .expect("encryption password should be set");
+
+        let guard = db.encryption_key.read().await;
+        let key = guard.as_ref().expect("encryption key should be set");
+        let raw_sha = sha256::Hash::hash(b"password");
+        assert_ne!(key.as_slice(), &raw_sha.as_byte_array()[..]);
+
+        get_mock.assert_async().await;
+        insert_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn set_encryption_password_reuses_existing_metadata() {
+        let mut server = mockito::Server::new_async().await;
+        let salt = "000102030405060708090a0b0c0d0e0f";
+        let get_mock = server
+            .mock("GET", "/rest/v1/wallet_encryption_metadata")
+            .match_query(encryption_metadata_query())
+            .match_header("apikey", "anon-key")
+            .match_header("authorization", "Bearer anon-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"[{{"version":1,"kdf":"scrypt","salt":"{salt}","scrypt_log_n":15,"scrypt_r":8,"scrypt_p":1}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let db = SupabaseWalletDatabase::new(
+            Url::parse(&server.url()).expect("mock server URL should parse"),
+            "anon-key".to_string(),
+        )
+        .await
+        .expect("database should initialize");
+
+        db.set_encryption_password("password")
+            .await
+            .expect("encryption password should be set");
+
+        let metadata = EncryptionMetadataTable {
+            version: ENCRYPTION_METADATA_VERSION,
+            kdf: ENCRYPTION_KDF.to_string(),
+            salt: salt.to_string(),
+            scrypt_log_n: SCRYPT_LOG_N as i64,
+            scrypt_r: SCRYPT_R as i64,
+            scrypt_p: SCRYPT_P as i64,
+            _extra: Default::default(),
+        };
+        let expected = SupabaseWalletDatabase::derive_encryption_key("password", &metadata)
+            .expect("scrypt key derivation should succeed");
+
+        let guard = db.encryption_key.read().await;
+        let key = guard.as_ref().expect("encryption key should be set");
+        assert_eq!(key.as_slice(), expected.as_slice());
+
+        get_mock.assert_async().await;
+    }
+
+    // -------------------------------------------------------------------------
+    // Integration tests against a live (or local) Supabase instance.
+    //
+    // These tests are gated behind the `integration-tests` feature and the
+    // environment variables:
+    //   SUPABASE_URL       – e.g. http://localhost:54321 or https://<ref>.supabase.co
+    //   SUPABASE_ANON_KEY  – the project's `anon` / publishable API key
+    //
+    // Each test signs up a fresh, unique user so that Row-Level Security
+    // guarantees complete data isolation between concurrent test runs.
+    // The test_id string passed to `provide_db` is used as a per-test
+    // password for client-side AES-256-GCM encryption of proof secrets.
+    //
+    // To run locally against the Supabase CLI:
+    //   supabase start                       # starts PostgREST + GoTrue + Postgres
+    //   export SUPABASE_URL=http://localhost:54321
+    //   export SUPABASE_ANON_KEY=$(supabase status --output json | jq -r '.ANON_KEY')
+    //   # Apply migrations once:
+    //   supabase db push   OR   run get_schema_sql() output in the SQL editor
+    //   cargo test -p cdk-supabase
+    // -------------------------------------------------------------------------
+
+    /// Build a fresh `SupabaseWalletDatabase` for one test run.
+    ///
+    /// * Signs up a brand-new Supabase Auth user whose email is derived from
+    ///   `test_id`, ensuring RLS-based data isolation from all other tests.
+    /// * Sets an AES-256-GCM encryption password equal to `test_id` so every
+    ///   test uses a distinct key.
+    /// * If the required environment variables are absent the function panics
+    ///   with a clear message – the `wallet_db_test!` expansion will then
+    ///   report the test as failed, which is intentional: the CI job that
+    ///   enables this job *must* supply the credentials.
+    #[cfg(feature = "integration-tests")]
+    pub async fn provide_db(test_id: String) -> SupabaseWalletDatabase {
+        let url_str = std::env::var("SUPABASE_URL")
+            .expect("SUPABASE_URL must be set to run Supabase integration tests");
+        let anon_key = std::env::var("SUPABASE_ANON_KEY")
+            .expect("SUPABASE_ANON_KEY must be set to run Supabase integration tests");
+
+        let url = Url::parse(&url_str).expect("SUPABASE_URL is not a valid URL");
+
+        // Use a hash of the test_id as a short, filesystem-safe identifier.
+        // Supabase email addresses must be ≤ 254 chars; UUIDs are safe here.
+        let email_id = {
+            use bitcoin::hashes::{sha256, Hash};
+            let hash = sha256::Hash::hash(test_id.as_bytes());
+            hex::encode(&hash.as_byte_array()[..8]) // 16 hex chars
+        };
+        let email = format!("cdk-test-{}@example.com", email_id);
+        // Use a fixed-length password derived from the test id.
+        let password = {
+            use bitcoin::hashes::{sha256, Hash};
+            let hash = sha256::Hash::hash(test_id.as_bytes());
+            hex::encode(hash.as_byte_array()) // 64 hex chars, always valid
+        };
+
+        let db = SupabaseWalletDatabase::with_supabase_auth(url, anon_key)
+            .await
+            .expect("failed to create SupabaseWalletDatabase");
+
+        // Sign up a fresh user. Ignore "already registered" errors that can
+        // occur if a previous test run with the same hash left the user behind.
+        let auth_result = db.signup(&email, &password).await;
+        match auth_result {
+            Ok(_) => {}
+            Err(Error::Supabase(msg)) if msg.contains("already registered") => {
+                // Re-use the existing user by signing in instead.
+                db.signin(&email, &password)
+                    .await
+                    .expect("failed to sign in with existing test user");
+            }
+            Err(e) => panic!("Supabase signup failed: {e}"),
+        }
+
+        // Each test encrypts its proof secrets with a unique key.
+        db.set_encryption_password(&test_id)
+            .await
+            .expect("failed to set Supabase wallet encryption password");
+
+        db
+    }
+
+    #[cfg(feature = "integration-tests")]
+    cdk_common::wallet_db_test!(provide_db);
 }

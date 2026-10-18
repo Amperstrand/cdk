@@ -2,6 +2,7 @@
 //!
 //! <https://github.com/cashubtc/nuts/blob/main/10.md>
 
+use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -57,7 +58,7 @@ pub enum Kind {
 }
 
 /// Secret Date
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SecretData {
     /// Unique random string
     nonce: String,
@@ -66,6 +67,16 @@ pub struct SecretData {
     /// Additional data committed to and can be used for feature extensions
     #[serde(skip_serializing_if = "Option::is_none")]
     tags: Option<Vec<Vec<String>>>,
+}
+
+impl fmt::Debug for SecretData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretData")
+            .field("nonce", &"[REDACTED]")
+            .field("data", &"[REDACTED]")
+            .field("tags", &self.tags.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl SecretData {
@@ -100,6 +111,17 @@ impl SecretData {
     }
 }
 
+/// NUT-28 locking slots available across `data`, `pubkeys` and refund keys.
+///
+/// Slot indices are carried in a single `i_byte` (0x00..=0x0A), so eleven is a
+/// hard ceiling rather than a policy choice.
+pub const MAX_LOCKING_SLOTS: usize = 11;
+
+/// Reject a key repeated within one signing pathway, comparing x-coordinates.
+///
+/// NUT-11 counts two keys sharing an x-coordinate as one, so a repetition can
+/// never add a signer. Construction and verification both run this, so a lock
+/// that is built is a lock that can be spent.
 fn check_duplicate_pubkeys(pubkeys: &[PublicKey]) -> Result<(), Error> {
     let mut x_coords = std::collections::HashSet::with_capacity(pubkeys.len());
     for pk in pubkeys {
@@ -428,6 +450,46 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
+    use crate::nuts::{Id, Proof, SecretKey, SigFlag};
+    use crate::{Amount, Proofs};
+
+    struct TestSpendRequest {
+        inputs: Proofs,
+    }
+
+    impl SpendingConditionVerification for TestSpendRequest {
+        fn inputs(&self) -> &Proofs {
+            &self.inputs
+        }
+
+        fn sig_all_msg_to_sign(&self) -> String {
+            "test message".to_string()
+        }
+    }
+
+    fn p2pk_proof_with_sig_flag(sig_flag: SigFlag) -> Proof {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let secret: crate::secret::Secret = SpendingConditions::new_p2pk(
+            pubkey,
+            Some(Conditions {
+                sig_flag,
+                ..Default::default()
+            }),
+        )
+        .try_into()
+        .unwrap();
+
+        Proof {
+            amount: Amount::ONE,
+            keyset_id: Id::from_str("009a1f293253e41e").unwrap(),
+            secret,
+            c: pubkey,
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        }
+    }
 
     #[test]
     fn test_secret_serialize() {
@@ -448,6 +510,36 @@ mod tests {
         );
 
         assert_eq!(serde_json::to_string(&secret).unwrap(), secret_str);
+    }
+
+    #[allow(clippy::use_debug)]
+    #[test]
+    fn secret_debug_redacts_canonical_secret_data() {
+        let secret = Secret::new(
+            Kind::P2PK,
+            SecretData {
+                nonce: "known-secret-nonce".to_string(),
+                data: "known-secret-data".to_string(),
+                tags: Some(vec![vec!["known-secret-tag".to_string()]]),
+            },
+        );
+
+        let debug = format!("{secret:?}");
+        let secret_data_debug = format!("{:?}", secret.secret_data());
+
+        for secret_value in [
+            "known-secret-nonce",
+            "known-secret-data",
+            "known-secret-tag",
+        ] {
+            assert!(!debug.contains(secret_value));
+            assert!(!secret_data_debug.contains(secret_value));
+        }
+        assert!(debug.contains("kind: P2PK"));
+        assert!(debug.contains("secret_data: SecretData"));
+        assert!(secret_data_debug.contains("nonce: \"[REDACTED]\""));
+        assert!(secret_data_debug.contains("data: \"[REDACTED]\""));
+        assert!(secret_data_debug.contains("tags: Some(\"[REDACTED]\")"));
     }
 
     #[test]
@@ -507,5 +599,71 @@ mod tests {
         assert_eq!(original_secret, deserialized_secret);
         assert_eq!(deserialized_secret.kind(), Kind::HTLC);
         assert_eq!(deserialized_secret.secret_data().data, payment_hash);
+    }
+
+    #[test]
+    fn test_locktime_refund_path_starts_after_not_at_locktime() {
+        let recipient = SecretKey::generate().public_key();
+        let refund_key = SecretKey::generate().public_key();
+        let secret: Secret = SpendingConditions::new_p2pk(
+            recipient,
+            Some(Conditions {
+                locktime: Some(100),
+                refund_keys: Some(vec![refund_key]),
+                ..Default::default()
+            }),
+        )
+        .try_into()
+        .unwrap();
+
+        assert_eq!(
+            get_pubkeys_and_required_sigs(&secret, 100)
+                .unwrap()
+                .refund_path,
+            None
+        );
+
+        let requirements = get_pubkeys_and_required_sigs(&secret, 101).unwrap();
+        assert_eq!(
+            requirements.refund_path.unwrap(),
+            RefundPath {
+                pubkeys: vec![refund_key],
+                required_sigs: 1,
+            }
+        );
+    }
+
+    /// The secret is built from raw parts rather than through
+    /// [`SpendingConditions`], which rejects the duplicate: a hostile token can
+    /// still carry both keys, and verification has to reject it.
+    #[test]
+    fn test_htlc_rejects_duplicate_receiver_pubkeys() {
+        let pubkey = SecretKey::generate().public_key();
+        let secret = Secret::new(
+            Kind::HTLC,
+            SecretData::new(
+                "5c23fc3aec9d985bd5fc88ca8bceaccc52cf892715dd94b42b84f1b43350751e",
+                Some(Conditions {
+                    pubkeys: Some(vec![pubkey, pubkey]),
+                    ..Default::default()
+                }),
+            ),
+        );
+
+        assert!(matches!(
+            get_pubkeys_and_required_sigs(&secret, 0),
+            Err(Error::NUT11(crate::nuts::nut11::Error::DuplicatePubkey))
+        ));
+    }
+
+    #[test]
+    fn test_has_at_least_one_sig_all_is_false_for_sig_inputs_only() {
+        let request = TestSpendRequest {
+            inputs: vec![p2pk_proof_with_sig_flag(SigFlag::SigInputs)]
+                .into_iter()
+                .collect(),
+        };
+
+        assert!(!request.has_at_least_one_sig_all().unwrap());
     }
 }

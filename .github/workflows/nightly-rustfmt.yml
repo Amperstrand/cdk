@@ -14,11 +14,12 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
           token: ${{ secrets.BACKPORT_TOKEN }}
-      - uses: cachix/cachix-action@v16
+          persist-credentials: false
+      - uses: cachix/cachix-action@v17
         with:
           name: cashudevkit
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -26,7 +27,7 @@ jobs:
         continue-on-error: true
       - name: Run Nightly rustfmt
         run: |
-          nix develop -i -L .#nightly --command bash -c '
+          nix develop --fallback -i -L .#nightly --command bash -c '
             # Force use of Nix-provided rustfmt
             export RUSTFMT=$(command -v rustfmt)
             cargo fmt
@@ -36,7 +37,7 @@ jobs:
       - name: Get the current date
         run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e # v7.0.8
+        uses: peter-evans/create-pull-request@98357b18bf14b5342f975ff684046ec3b2a07725 # v8
         env:
           PRE_COMMIT_ALLOW_NO_CONFIG: 1
         with:

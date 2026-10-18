@@ -15,13 +15,14 @@ use cdk_signatory::signatory::{RotateKeyArguments, Signatory};
 
 use super::nut17::SupportedMethods;
 use super::nut19::{self, CachedEndpoint};
+use super::verification::validate_custom_payment_method;
 use super::Nuts;
 use crate::amount::Amount;
 use crate::cdk_database;
 use crate::mint::Mint;
 use crate::nuts::{
-    ContactInfo, CurrencyUnit, MeltMethodSettings, MintInfo, MintMethodSettings, MintVersion,
-    MppMethodSettings, PaymentMethod, ProtectedEndpoint,
+    AuthRequired, ContactInfo, CurrencyUnit, MeltMethodSettings, MintInfo, MintMethodSettings,
+    MintVersion, MppMethodSettings, PaymentMethod, ProtectedEndpoint,
 };
 use crate::types::PaymentProcessorKey;
 
@@ -64,6 +65,9 @@ pub struct MintBuilder {
     mint_info: MintInfo,
     localstore: DynMintDatabase,
     auth_localstore: Option<DynMintAuthDatabase>,
+    clear_auth_endpoints: Vec<ProtectedEndpoint>,
+    blind_auth_endpoints: Vec<ProtectedEndpoint>,
+    blind_auth_configured: bool,
     payment_processors: HashMap<PaymentProcessorKey, DynMintPayment>,
     supported_units: HashMap<CurrencyUnit, (u64, Vec<u64>)>,
     custom_paths: HashMap<CurrencyUnit, DerivationPath>,
@@ -72,6 +76,11 @@ pub struct MintBuilder {
     max_inputs: usize,
     max_outputs: usize,
     max_batch_size: Option<u64>,
+    /// Interval at which the built signatory reloads keysets from the shared
+    /// database. `None` (the default) disables the reload for a single-instance
+    /// deployment that owns its database; set an interval only to run several
+    /// mints/signatories against one shared database.
+    keyset_refresh_interval: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for MintBuilder {
@@ -104,6 +113,9 @@ impl MintBuilder {
             mint_info,
             localstore,
             auth_localstore: None,
+            clear_auth_endpoints: Vec::new(),
+            blind_auth_endpoints: Vec::new(),
+            blind_auth_configured: false,
             payment_processors: HashMap::new(),
             supported_units: HashMap::new(),
             custom_paths: HashMap::new(),
@@ -112,12 +124,23 @@ impl MintBuilder {
             max_inputs: 1000,
             max_outputs: 1000,
             max_batch_size: None,
+            keyset_refresh_interval: None,
         }
     }
 
     /// Set use keyset v2
     pub fn with_keyset_v2(mut self, use_keyset_v2: Option<bool>) -> Self {
         self.use_keyset_v2 = use_keyset_v2;
+        self
+    }
+
+    /// Set how often the built signatory reloads keysets from the shared
+    /// database. `None` (the default) disables the reload: a single mint owns
+    /// its database and needs no polling. Set an interval only to run several
+    /// mints/signatories against one shared database, so each picks up peers'
+    /// rotations without a restart. A few seconds is a reasonable cadence.
+    pub fn with_keyset_refresh_interval(mut self, interval: Option<std::time::Duration>) -> Self {
+        self.keyset_refresh_interval = interval;
         self
     }
 
@@ -137,6 +160,7 @@ impl MintBuilder {
         protected_endpoints: Vec<ProtectedEndpoint>,
     ) -> Self {
         self.auth_localstore = Some(auth_localstore);
+        self.clear_auth_endpoints = protected_endpoints.clone();
         self.mint_info.nuts.nut21 = Some(nut21::Settings::new(
             openid_discovery,
             client_id,
@@ -177,6 +201,9 @@ impl MintBuilder {
         protected_endpoints: Vec<ProtectedEndpoint>,
     ) -> Self {
         let mut nuts = self.mint_info.nuts;
+
+        self.blind_auth_endpoints = protected_endpoints.clone();
+        self.blind_auth_configured = true;
 
         nuts.nut22 = Some(nut22::Settings::new(bat_max_mint, protected_endpoints));
 
@@ -388,10 +415,18 @@ impl MintBuilder {
         limits: MintMeltLimits,
         payment_processor: DynMintPayment,
     ) -> Result<(), Error> {
+        validate_custom_payment_method(&method)?;
+
         let key = PaymentProcessorKey {
             unit: unit.clone(),
             method: method.clone(),
         };
+        if self.payment_processors.contains_key(&key) {
+            return Err(Error::Custom(format!(
+                "Duplicate payment processor for unit {} and method {}",
+                unit, method
+            )));
+        }
 
         let settings = payment_processor.get_settings().await?;
 
@@ -415,6 +450,7 @@ impl MintBuilder {
                     let mint_method_settings = MintMethodSettings {
                         method: method.clone(),
                         unit: unit.clone(),
+                        method_name: Some("Bolt11".to_string()),
                         min_amount: Some(limits.mint_min),
                         max_amount: Some(limits.mint_max),
                         options: Some(MintMethodOptions::Bolt11 {
@@ -428,6 +464,7 @@ impl MintBuilder {
                     let melt_method_settings = MeltMethodSettings {
                         method: method.clone(),
                         unit: unit.clone(),
+                        method_name: Some("Bolt11".to_string()),
                         min_amount: Some(limits.melt_min),
                         max_amount: Some(limits.melt_max),
                         options: Some(MeltMethodOptions::Bolt11 {
@@ -440,14 +477,17 @@ impl MintBuilder {
             }
             // Handle bolt12 methods
             PaymentMethod::Known(KnownMethod::Bolt12) => {
-                if settings.bolt12.is_some() {
-                    // Add to NUT04 (mint) - bolt12 doesn't have specific options yet
+                if let Some(bolt12_settings) = &settings.bolt12 {
+                    // Add to NUT04 (mint)
                     let mint_method_settings = MintMethodSettings {
                         method: method.clone(),
                         unit: unit.clone(),
+                        method_name: Some("Bolt12".to_string()),
                         min_amount: Some(limits.mint_min),
                         max_amount: Some(limits.mint_max),
-                        options: None, // No bolt12-specific options in NUT04 yet
+                        options: Some(MintMethodOptions::Bolt12 {
+                            description: bolt12_settings.invoice_description,
+                        }),
                     };
                     self.mint_info.nuts.nut04.methods.push(mint_method_settings);
                     self.mint_info.nuts.nut04.disabled = false;
@@ -456,6 +496,7 @@ impl MintBuilder {
                     let melt_method_settings = MeltMethodSettings {
                         method: method.clone(),
                         unit: unit.clone(),
+                        method_name: Some("Bolt12".to_string()),
                         min_amount: Some(limits.melt_min),
                         max_amount: Some(limits.melt_max),
                         options: None, // No bolt12-specific options in NUT05 yet
@@ -472,6 +513,7 @@ impl MintBuilder {
                     let mint_method_settings = MintMethodSettings {
                         method: method.clone(),
                         unit: unit.clone(),
+                        method_name: None,
                         min_amount: Some(limits.mint_min),
                         max_amount: Some(limits.mint_max),
                         options: Some(MintMethodOptions::Custom {}),
@@ -483,9 +525,53 @@ impl MintBuilder {
                     let melt_method_settings = MeltMethodSettings {
                         method: method.clone(),
                         unit: unit.clone(),
+                        method_name: None,
                         min_amount: Some(limits.melt_min),
                         max_amount: Some(limits.melt_max),
                         options: None, // No custom-specific options in NUT05 yet
+                    };
+                    self.mint_info.nuts.nut05.methods.push(melt_method_settings);
+                    self.mint_info.nuts.nut05.disabled = false;
+                }
+            }
+            // Handle onchain methods
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                if let Some(onchain_settings) = settings.onchain {
+                    let mint_min = Amount::from(
+                        limits
+                            .mint_min
+                            .to_u64()
+                            .max(onchain_settings.min_receive_amount_sat),
+                    );
+                    let melt_min = Amount::from(
+                        limits
+                            .melt_min
+                            .to_u64()
+                            .max(onchain_settings.min_send_amount_sat),
+                    );
+
+                    // Add to NUT04 (mint)
+                    let mint_method_settings = MintMethodSettings {
+                        method: method.clone(),
+                        unit: unit.clone(),
+                        method_name: Some("Onchain".to_string()),
+                        min_amount: Some(mint_min),
+                        max_amount: Some(limits.mint_max),
+                        options: Some(MintMethodOptions::Onchain {
+                            confirmations: onchain_settings.confirmations,
+                        }),
+                    };
+                    self.mint_info.nuts.nut04.methods.push(mint_method_settings);
+                    self.mint_info.nuts.nut04.disabled = false;
+
+                    // Add to NUT05 (melt)
+                    let melt_method_settings = MeltMethodSettings {
+                        method: method.clone(),
+                        unit: unit.clone(),
+                        method_name: Some("Onchain".to_string()),
+                        min_amount: Some(melt_min),
+                        max_amount: Some(limits.melt_max),
+                        options: None,
                     };
                     self.mint_info.nuts.nut05.methods.push(melt_method_settings);
                     self.mint_info.nuts.nut05.disabled = false;
@@ -503,7 +589,7 @@ impl MintBuilder {
     }
     /// Sets the input fee ppk for a given unit
     ///
-    /// The unit **MUST** already have been added with a ln backend
+    /// The unit **MUST** already have been added with a payment backend
     pub fn set_unit_fee(&mut self, unit: &CurrencyUnit, input_fee_ppk: u64) -> Result<(), Error> {
         let (input_fee, _) = self
             .supported_units
@@ -540,6 +626,10 @@ impl MintBuilder {
             let mut rotate = false;
 
             if let Some(keyset) = keyset {
+                if keyset.is_expired() {
+                    tracing::warn!("Active keyset for unit {} has expired; not rotating", unit);
+                    continue;
+                }
                 // Check if fee matches
                 if keyset.input_fee_ppk != *fee {
                     tracing::info!(
@@ -609,7 +699,30 @@ impl MintBuilder {
                 .await?;
         }
 
+        if self.blind_auth_configured
+            && self.mint_info.nuts.nut22.is_some()
+            && self.auth_localstore.is_none()
+        {
+            return Err(Error::Custom(
+                "Blind auth requires an auth localstore; call MintBuilder::with_auth before MintBuilder::with_blind_auth".to_string(),
+            ));
+        }
+
         if let Some(auth_localstore) = self.auth_localstore {
+            let mut protected_endpoints = HashMap::new();
+            for endpoint in self.clear_auth_endpoints {
+                protected_endpoints.insert(endpoint, AuthRequired::Clear);
+            }
+            for endpoint in self.blind_auth_endpoints {
+                protected_endpoints.insert(endpoint, AuthRequired::Blind);
+            }
+
+            if !protected_endpoints.is_empty() {
+                let mut tx = auth_localstore.begin_transaction().await?;
+                tx.add_protected_endpoints(protected_endpoints).await?;
+                tx.commit().await?;
+            }
+
             return Mint::new_with_auth(
                 self.mint_info,
                 signatory,
@@ -638,17 +751,23 @@ impl MintBuilder {
         keystore: Arc<dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync>,
         seed: &[u8],
     ) -> Result<Mint, Error> {
-        let in_memory_signatory = cdk_signatory::db_signatory::DbSignatory::new(
-            keystore,
-            seed,
-            self.supported_units.clone(),
-            self.custom_paths.clone(),
-        )
-        .await?;
+        let in_memory_signatory = Arc::new(
+            cdk_signatory::db_signatory::DbSignatory::new(
+                keystore,
+                seed,
+                self.supported_units.clone(),
+                self.custom_paths.clone(),
+            )
+            .await?,
+        );
 
-        let signatory = Arc::new(cdk_signatory::embedded::Service::new(Arc::new(
-            in_memory_signatory,
-        )));
+        // Off by default: a single mint owns its database. When an interval is
+        // configured, periodically reload keysets from the shared database so
+        // multiple mints/signatories can run active/active, a rotation by any
+        // instance is picked up on the next refresh without a restart.
+        in_memory_signatory.spawn_keyset_refresh(self.keyset_refresh_interval);
+
+        let signatory = Arc::new(cdk_signatory::embedded::Service::new(in_memory_signatory));
 
         self.build_with_signatory(signatory).await
     }
@@ -686,16 +805,19 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use bip39::Mnemonic;
+    use cdk_common::nut21::{Method, RoutePath};
     use cdk_common::payment::{
         Bolt11Settings, Bolt12Settings, CreateIncomingPaymentResponse, Event,
-        IncomingPaymentOptions, MakePaymentResponse, OutgoingPaymentOptions, PaymentIdentifier,
-        PaymentQuoteResponse, SettingsResponse,
+        IncomingPaymentOptions, MakePaymentResponse, OnchainSettings, OutgoingPaymentOptions,
+        PaymentIdentifier, PaymentQuoteResponse, SettingsResponse,
     };
-    use cdk_sqlite::mint::memory;
+    use cdk_sqlite::mint::{memory, MintSqliteAuthDatabase, MintSqliteDatabase};
     use futures::Stream;
     use KnownMethod;
 
     use super::*;
+    use crate::mint::verification::MAX_CUSTOM_PAYMENT_METHOD_LEN;
 
     // Mock payment processor for testing
     struct MockPaymentProcessor {
@@ -758,6 +880,42 @@ mod tests {
         ) -> Result<MakePaymentResponse, Self::Err> {
             unimplemented!()
         }
+    }
+
+    async fn builder_with_bolt11_processor() -> (MintBuilder, Arc<MintSqliteDatabase>) {
+        let localstore = Arc::new(memory::empty().await.expect("mint db"));
+        let mut builder = MintBuilder::new(localstore.clone());
+
+        let settings = SettingsResponse {
+            unit: "sat".to_string(),
+            bolt11: Some(Bolt11Settings {
+                mpp: false,
+                amountless: false,
+                invoice_description: false,
+            }),
+            bolt12: None,
+            onchain: None,
+            custom: HashMap::new(),
+        };
+
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Known(KnownMethod::Bolt11),
+                MintMeltLimits::new(1, 10_000),
+                Arc::new(MockPaymentProcessor { settings }),
+            )
+            .await
+            .expect("payment processor");
+
+        (builder, localstore)
+    }
+
+    fn seed() -> Vec<u8> {
+        Mnemonic::generate(12)
+            .expect("mnemonic")
+            .to_seed_normalized("")
+            .to_vec()
     }
 
     #[tokio::test]
@@ -826,6 +984,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_with_auth_protected_endpoints_are_enforced_and_advertised() {
+        let (builder, localstore) = builder_with_bolt11_processor().await;
+        let auth_db = Arc::new(
+            MintSqliteAuthDatabase::new(":memory:")
+                .await
+                .expect("auth db"),
+        );
+        let swap_endpoint = ProtectedEndpoint::new(Method::Post, RoutePath::Swap);
+        let seed = seed();
+
+        let mint = builder
+            .with_auth(
+                auth_db,
+                "https://example.com/.well-known/openid-configuration".to_string(),
+                "test-client".to_string(),
+                vec![swap_endpoint.clone()],
+            )
+            .build_with_seed(localstore, &seed)
+            .await
+            .expect("mint");
+
+        assert_eq!(
+            mint.is_protected(&swap_endpoint)
+                .await
+                .expect("is protected"),
+            Some(AuthRequired::Clear)
+        );
+        assert_eq!(
+            mint.mint_info()
+                .await
+                .expect("mint info")
+                .protected_endpoints()
+                .get(&swap_endpoint),
+            Some(&AuthRequired::Clear)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_blind_auth_protected_endpoints_are_enforced_and_advertised() {
+        let (builder, localstore) = builder_with_bolt11_processor().await;
+        let auth_db = Arc::new(
+            MintSqliteAuthDatabase::new(":memory:")
+                .await
+                .expect("auth db"),
+        );
+        let swap_endpoint = ProtectedEndpoint::new(Method::Post, RoutePath::Swap);
+        let seed = seed();
+
+        let mint = builder
+            .with_auth(
+                auth_db,
+                "https://example.com/.well-known/openid-configuration".to_string(),
+                "test-client".to_string(),
+                vec![],
+            )
+            .with_blind_auth(50, vec![swap_endpoint.clone()])
+            .build_with_seed(localstore, &seed)
+            .await
+            .expect("mint");
+
+        assert_eq!(
+            mint.is_protected(&swap_endpoint)
+                .await
+                .expect("is protected"),
+            Some(AuthRequired::Blind)
+        );
+        assert_eq!(
+            mint.mint_info()
+                .await
+                .expect("mint info")
+                .protected_endpoints()
+                .get(&swap_endpoint),
+            Some(&AuthRequired::Blind)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_blind_auth_without_auth_localstore_errors() {
+        let (builder, localstore) = builder_with_bolt11_processor().await;
+        let swap_endpoint = ProtectedEndpoint::new(Method::Post, RoutePath::Swap);
+        let seed = seed();
+
+        let err = builder
+            .with_blind_auth(50, vec![swap_endpoint])
+            .build_with_seed(localstore, &seed)
+            .await
+            .expect_err("blind auth requires auth localstore");
+
+        assert!(matches!(
+            err,
+            Error::Custom(message) if message.contains("Blind auth requires an auth localstore")
+        ));
+    }
+
+    #[tokio::test]
     async fn test_add_payment_processor_bolt11() {
         let localstore = Arc::new(memory::empty().await.unwrap());
         let mut builder = MintBuilder::new(localstore);
@@ -851,6 +1104,7 @@ mod tests {
             unit: "sat".to_string(),
             bolt11: Some(bolt11_settings),
             bolt12: None,
+            onchain: None,
             custom: HashMap::new(),
         };
 
@@ -872,6 +1126,7 @@ mod tests {
         let mint_method = &mint_info.nuts.nut04.methods[0];
         assert_eq!(mint_method.method, method);
         assert_eq!(mint_method.unit, unit);
+        assert_eq!(mint_method.method_name, Some("Bolt11".to_string()));
         assert_eq!(mint_method.min_amount, Some(limits.mint_min));
         assert_eq!(mint_method.max_amount, Some(limits.mint_max));
         assert!(matches!(
@@ -885,6 +1140,7 @@ mod tests {
         let melt_method = &mint_info.nuts.nut05.methods[0];
         assert_eq!(melt_method.method, method);
         assert_eq!(melt_method.unit, unit);
+        assert_eq!(melt_method.method_name, Some("Bolt11".to_string()));
         assert_eq!(melt_method.min_amount, Some(limits.melt_min));
         assert_eq!(melt_method.max_amount, Some(limits.melt_max));
         assert!(matches!(
@@ -897,6 +1153,54 @@ mod tests {
         let mpp_method = &mint_info.nuts.nut15.methods[0];
         assert_eq!(mpp_method.method, method);
         assert_eq!(mpp_method.unit, unit);
+    }
+
+    #[tokio::test]
+    async fn test_add_payment_processor_rejects_duplicate_unit_method() {
+        let localstore = Arc::new(memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(localstore);
+
+        let settings = SettingsResponse {
+            unit: "sat".to_string(),
+            bolt11: Some(Bolt11Settings {
+                mpp: false,
+                amountless: false,
+                invoice_description: false,
+            }),
+            bolt12: None,
+            onchain: None,
+            custom: HashMap::new(),
+        };
+        let unit = CurrencyUnit::Sat;
+        let method = PaymentMethod::Known(KnownMethod::Bolt11);
+        let limits = MintMeltLimits::new(100, 10000);
+
+        builder
+            .add_payment_processor(
+                unit.clone(),
+                method.clone(),
+                limits,
+                Arc::new(MockPaymentProcessor {
+                    settings: settings.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let err = builder
+            .add_payment_processor(
+                unit,
+                method,
+                limits,
+                Arc::new(MockPaymentProcessor { settings }),
+            )
+            .await
+            .expect_err("duplicate unit/method pair should be rejected");
+
+        assert!(matches!(
+            err,
+            Error::Custom(message) if message.contains("Duplicate payment processor")
+        ));
     }
 
     #[tokio::test]
@@ -925,6 +1229,7 @@ mod tests {
             unit: "sat".to_string(),
             bolt11: Some(bolt11_settings),
             bolt12: None,
+            onchain: None,
             custom: HashMap::new(),
         };
 
@@ -964,12 +1269,16 @@ mod tests {
             )
             .unwrap();
 
-        let bolt12_settings = Bolt12Settings { amountless: true };
+        let bolt12_settings = Bolt12Settings {
+            amountless: true,
+            invoice_description: true,
+        };
 
         let settings = SettingsResponse {
             unit: "sat".to_string(),
             bolt11: None,
             bolt12: Some(bolt12_settings),
+            onchain: None,
             custom: HashMap::new(),
         };
 
@@ -991,9 +1300,13 @@ mod tests {
         let mint_method = &mint_info.nuts.nut04.methods[0];
         assert_eq!(mint_method.method, method);
         assert_eq!(mint_method.unit, unit);
+        assert_eq!(mint_method.method_name, Some("Bolt12".to_string()));
         assert_eq!(mint_method.min_amount, Some(limits.mint_min));
         assert_eq!(mint_method.max_amount, Some(limits.mint_max));
-        assert!(mint_method.options.is_none());
+        assert_eq!(
+            mint_method.options,
+            Some(MintMethodOptions::Bolt12 { description: true })
+        );
 
         // Check NUT05 (melt) settings
         assert!(!mint_info.nuts.nut05.disabled);
@@ -1001,6 +1314,7 @@ mod tests {
         let melt_method = &mint_info.nuts.nut05.methods[0];
         assert_eq!(melt_method.method, method);
         assert_eq!(melt_method.unit, unit);
+        assert_eq!(melt_method.method_name, Some("Bolt12".to_string()));
         assert_eq!(melt_method.min_amount, Some(limits.melt_min));
         assert_eq!(melt_method.max_amount, Some(limits.melt_max));
         assert!(melt_method.options.is_none());
@@ -1029,6 +1343,7 @@ mod tests {
             unit: "usd".to_string(),
             bolt11: None,
             bolt12: None,
+            onchain: None,
             custom: custom_methods,
         };
 
@@ -1069,6 +1384,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_payment_processor_rejects_oversized_custom_method() {
+        let localstore = Arc::new(memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(localstore);
+        let method_name = "a".repeat(MAX_CUSTOM_PAYMENT_METHOD_LEN + 1);
+        let method = PaymentMethod::Custom(method_name.clone());
+        let settings = SettingsResponse {
+            unit: "usd".to_string(),
+            bolt11: None,
+            bolt12: None,
+            onchain: None,
+            custom: HashMap::from([(method_name, "{}".to_string())]),
+        };
+
+        let err = builder
+            .add_payment_processor(
+                CurrencyUnit::Usd,
+                method,
+                MintMeltLimits::new(100, 10_000),
+                Arc::new(MockPaymentProcessor { settings }),
+            )
+            .await
+            .expect_err("oversized custom method");
+
+        assert!(matches!(
+            err,
+            Error::RequestFieldTooLarge {
+                field,
+                actual,
+                max,
+            } if field == "method"
+                && actual == MAX_CUSTOM_PAYMENT_METHOD_LEN + 1
+                && max == MAX_CUSTOM_PAYMENT_METHOD_LEN
+        ));
+    }
+
+    #[tokio::test]
     async fn test_add_payment_processor_custom_not_supported() {
         let localstore = Arc::new(memory::empty().await.unwrap());
         let mut builder = MintBuilder::new(localstore);
@@ -1089,6 +1440,7 @@ mod tests {
             unit: "usd".to_string(),
             bolt11: None,
             bolt12: None,
+            onchain: None,
             custom: HashMap::new(), // Empty - no custom methods supported
         };
 
@@ -1107,6 +1459,140 @@ mod tests {
         // NUT04 and NUT05 should remain empty since the custom method is not in settings
         assert_eq!(mint_info.nuts.nut04.methods.len(), 0);
         assert_eq!(mint_info.nuts.nut05.methods.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_add_payment_processor_onchain_uses_backend_min_receive_amount() {
+        let localstore = Arc::new(memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(localstore);
+
+        builder
+            .configure_unit(
+                CurrencyUnit::Sat,
+                UnitConfig {
+                    amounts: vec![1, 2, 4, 8, 16, 32],
+                    input_fee_ppk: 0,
+                },
+            )
+            .unwrap();
+
+        let settings = SettingsResponse {
+            unit: "sat".to_string(),
+            bolt11: None,
+            bolt12: None,
+            onchain: Some(OnchainSettings {
+                confirmations: 6,
+                min_receive_amount_sat: 1000,
+                min_send_amount_sat: 546,
+            }),
+            custom: HashMap::new(),
+        };
+
+        let payment_processor = Arc::new(MockPaymentProcessor { settings });
+        let unit = CurrencyUnit::Sat;
+        let method = PaymentMethod::Known(KnownMethod::Onchain);
+        let limits = MintMeltLimits::new(100, 10000);
+
+        builder
+            .add_payment_processor(unit.clone(), method.clone(), limits, payment_processor)
+            .await
+            .unwrap();
+
+        let mint_info = builder.current_mint_info();
+
+        assert_eq!(mint_info.nuts.nut04.methods.len(), 1);
+        let mint_method = &mint_info.nuts.nut04.methods[0];
+        assert_eq!(mint_method.method, method);
+        assert_eq!(mint_method.unit, unit);
+        assert_eq!(mint_method.method_name, Some("Onchain".to_string()));
+        assert_eq!(mint_method.min_amount, Some(Amount::from(1000)));
+        assert_eq!(mint_method.max_amount, Some(limits.mint_max));
+        assert!(matches!(
+            mint_method.options,
+            Some(MintMethodOptions::Onchain { confirmations: 6 })
+        ));
+
+        assert_eq!(mint_info.nuts.nut05.methods.len(), 1);
+        let melt_method = &mint_info.nuts.nut05.methods[0];
+        assert_eq!(melt_method.method_name, Some("Onchain".to_string()));
+        assert_eq!(melt_method.min_amount, Some(Amount::from(546)));
+    }
+
+    #[tokio::test]
+    async fn test_add_payment_processor_onchain_keeps_higher_configured_mint_min() {
+        let localstore = Arc::new(memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(localstore);
+
+        let settings = SettingsResponse {
+            unit: "sat".to_string(),
+            bolt11: None,
+            bolt12: None,
+            onchain: Some(OnchainSettings {
+                confirmations: 1,
+                min_receive_amount_sat: 1000,
+                min_send_amount_sat: 546,
+            }),
+            custom: HashMap::new(),
+        };
+
+        let payment_processor = Arc::new(MockPaymentProcessor { settings });
+        let limits = MintMeltLimits::new(2000, 10000);
+
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Known(KnownMethod::Onchain),
+                limits,
+                payment_processor,
+            )
+            .await
+            .unwrap();
+
+        let mint_info = builder.current_mint_info();
+        let mint_method = &mint_info.nuts.nut04.methods[0];
+
+        assert_eq!(mint_method.min_amount, Some(Amount::from(2000)));
+    }
+
+    #[tokio::test]
+    async fn test_add_payment_processor_onchain_keeps_higher_configured_melt_min() {
+        let localstore = Arc::new(memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(localstore);
+
+        let settings = SettingsResponse {
+            unit: "sat".to_string(),
+            bolt11: None,
+            bolt12: None,
+            onchain: Some(OnchainSettings {
+                confirmations: 1,
+                min_receive_amount_sat: 1000,
+                min_send_amount_sat: 546,
+            }),
+            custom: HashMap::new(),
+        };
+
+        let payment_processor = Arc::new(MockPaymentProcessor { settings });
+        let limits = MintMeltLimits {
+            mint_min: Amount::from(1),
+            mint_max: Amount::from(10_000),
+            melt_min: Amount::from(2_000),
+            melt_max: Amount::from(10_000),
+        };
+
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Known(KnownMethod::Onchain),
+                limits,
+                payment_processor,
+            )
+            .await
+            .unwrap();
+
+        let mint_info = builder.current_mint_info();
+        let melt_method = &mint_info.nuts.nut05.methods[0];
+
+        assert_eq!(melt_method.min_amount, Some(Amount::from(2_000)));
     }
 
     #[tokio::test]
@@ -1135,6 +1621,7 @@ mod tests {
             unit: "sat".to_string(),
             bolt11: Some(bolt11_settings),
             bolt12: None,
+            onchain: None,
             custom: HashMap::new(),
         };
         let processor1 = Arc::new(MockPaymentProcessor {
@@ -1151,11 +1638,15 @@ mod tests {
             .unwrap();
 
         // Add Bolt12
-        let bolt12_settings = Bolt12Settings { amountless: false };
+        let bolt12_settings = Bolt12Settings {
+            amountless: false,
+            invoice_description: true,
+        };
         let settings2 = SettingsResponse {
             unit: "sat".to_string(),
             bolt11: None,
             bolt12: Some(bolt12_settings),
+            onchain: None,
             custom: HashMap::new(),
         };
         let processor2 = Arc::new(MockPaymentProcessor {

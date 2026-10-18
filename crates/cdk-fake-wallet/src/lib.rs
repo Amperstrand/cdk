@@ -1,4 +1,4 @@
-//! CDK Fake LN Backend
+//! CDK fake payment backend
 //!
 //! Used for testing where quotes are auto filled.
 //!
@@ -21,9 +21,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
+use bitcoin::{Address, CompressedPublicKey, Network};
 use cdk_common::amount::Amount;
 use cdk_common::common::FeeReserve;
 use cdk_common::ensure_cdk;
+use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
 use cdk_common::nuts::{CurrencyUnit, MeltOptions, MeltQuoteState};
 use cdk_common::payment::{
     self, CreateIncomingPaymentResponse, Event, IncomingPaymentOptions, MakePaymentResponse,
@@ -49,6 +51,10 @@ pub mod error;
 const DEFAULT_REPAY_QUEUE_MAX_SIZE: usize = 100;
 /// Default amount used for custom outgoing payments in tests
 const DEFAULT_CUSTOM_OUTGOING_AMOUNT: u64 = 1000;
+/// Default amount reported for fake onchain deposits.
+const DEFAULT_ONCHAIN_INCOMING_AMOUNT: u64 = 1000;
+/// Default confirmation target for fake onchain sends.
+const DEFAULT_ONCHAIN_ESTIMATED_BLOCKS: u32 = 6;
 
 /// Payment state entry containing the melt quote state and amount spent
 type PaymentStateEntry = (MeltQuoteState, Amount<CurrencyUnit>);
@@ -144,8 +150,9 @@ async fn convert_currency_amount(
 ) -> Result<Amount<CurrencyUnit>, Error> {
     use CurrencyUnit::*;
 
-    // Try basic unit conversion first (handles SAT/MSAT and same-unit conversions)
-    if let Ok(converted) = Amount::new(amount, from_unit.clone()).convert_to(target_unit) {
+    // Outgoing amounts must cover the full principal. Incoming Lightning
+    // requests convert to msat, which remains exact for sat/msat amounts.
+    if let Ok(converted) = Amount::new(amount, from_unit.clone()).convert_to_ceil(target_unit) {
         return Ok(converted);
     }
 
@@ -344,6 +351,7 @@ pub struct FakeWallet {
     unit: CurrencyUnit,
     secondary_repayment_queue: SecondaryRepaymentQueue,
     exchange_rate_cache: ExchangeRateCache,
+    custom_payment_methods: HashMap<String, String>,
 }
 
 impl FakeWallet {
@@ -393,7 +401,30 @@ impl FakeWallet {
             unit,
             secondary_repayment_queue,
             exchange_rate_cache: ExchangeRateCache::new(),
+            custom_payment_methods: HashMap::new(),
         }
+    }
+
+    /// Configure custom payment methods advertised by this fake wallet.
+    pub fn with_custom_payment_methods(
+        mut self,
+        custom_payment_methods: HashMap<String, String>,
+    ) -> Self {
+        self.custom_payment_methods = custom_payment_methods
+            .into_iter()
+            .map(|(method, settings)| (method.to_lowercase(), settings))
+            .collect();
+        self
+    }
+
+    fn ensure_custom_method_supported(&self, method: &str) -> Result<(), payment::Error> {
+        ensure_cdk!(
+            self.custom_payment_methods
+                .contains_key(&method.to_lowercase()),
+            payment::Error::UnsupportedPaymentOption
+        );
+
+        Ok(())
     }
 
     fn fee_for_amount(&self, amount: &Amount<CurrencyUnit>) -> Amount<CurrencyUnit> {
@@ -411,8 +442,19 @@ impl FakeWallet {
     async fn custom_outgoing_amount(
         &self,
         unit: &CurrencyUnit,
+        amount: Option<&Amount<CurrencyUnit>>,
         extra_json: &Option<String>,
     ) -> Result<Amount<CurrencyUnit>, Error> {
+        if let Some(amount) = amount {
+            return convert_currency_amount(
+                amount.value(),
+                amount.unit(),
+                unit,
+                &self.exchange_rate_cache,
+            )
+            .await;
+        }
+
         #[derive(Deserialize)]
         struct CustomAmountField {
             amount: Option<u64>,
@@ -460,9 +502,6 @@ impl MintPayment for FakeWallet {
 
     #[instrument(skip_all)]
     async fn get_settings(&self) -> Result<SettingsResponse, Self::Err> {
-        let mut custom = std::collections::HashMap::new();
-        custom.insert("paypal".to_string(), "{}".to_string());
-
         Ok(SettingsResponse {
             unit: self.unit.to_string(),
             bolt11: Some(payment::Bolt11Settings {
@@ -470,8 +509,16 @@ impl MintPayment for FakeWallet {
                 amountless: false,
                 invoice_description: true,
             }),
-            bolt12: Some(payment::Bolt12Settings { amountless: false }),
-            custom,
+            bolt12: Some(payment::Bolt12Settings {
+                amountless: false,
+                invoice_description: true,
+            }),
+            onchain: Some(payment::OnchainSettings {
+                confirmations: 1,
+                min_receive_amount_sat: 1,
+                min_send_amount_sat: 1,
+            }),
+            custom: self.custom_payment_methods.clone(),
         })
     }
 
@@ -516,7 +563,7 @@ impl MintPayment for FakeWallet {
                             {
                                 ensure_cdk!(
                                     invoice_amount == u64::from(amount_msat),
-                                    Error::UnknownInvoiceAmount.into()
+                                    payment::Error::AmountMismatch
                                 );
                             }
                             amount_msat
@@ -552,8 +599,14 @@ impl MintPayment for FakeWallet {
                 (amount_msat, None)
             }
             OutgoingPaymentOptions::Custom(custom_options) => {
+                self.ensure_custom_method_supported(&custom_options.method)?;
+
                 let amount = self
-                    .custom_outgoing_amount(unit, &custom_options.extra_json)
+                    .custom_outgoing_amount(
+                        unit,
+                        custom_options.amount.as_ref(),
+                        &custom_options.extra_json,
+                    )
                     .await?;
 
                 return Ok(PaymentQuoteResponse {
@@ -563,7 +616,31 @@ impl MintPayment for FakeWallet {
                     amount: amount.clone(),
                     fee: self.fee_for_amount(&amount),
                     state: MeltQuoteState::Unpaid,
+                    extra_json: custom_options
+                        .extra_json
+                        .as_ref()
+                        .and_then(|extra_json| serde_json::from_str(extra_json).ok()),
+                    estimated_blocks: None,
+                    fee_options: None,
+                });
+            }
+            OutgoingPaymentOptions::Onchain(onchain_options) => {
+                let fee = self.fee_for_amount(&onchain_options.amount);
+
+                return Ok(PaymentQuoteResponse {
+                    request_lookup_id: Some(PaymentIdentifier::QuoteId(
+                        onchain_options.quote_id.clone(),
+                    )),
+                    amount: onchain_options.amount,
+                    fee: fee.clone(),
+                    state: MeltQuoteState::Unpaid,
                     extra_json: None,
+                    estimated_blocks: Some(DEFAULT_ONCHAIN_ESTIMATED_BLOCKS),
+                    fee_options: Some(vec![MeltQuoteOnchainFeeOption {
+                        fee_index: 0,
+                        fee_reserve: Amount::from(fee.value()),
+                        estimated_blocks: DEFAULT_ONCHAIN_ESTIMATED_BLOCKS,
+                    }]),
                 });
             }
         };
@@ -582,6 +659,8 @@ impl MintPayment for FakeWallet {
             amount,
             state: MeltQuoteState::Unpaid,
             extra_json: None,
+            estimated_blocks: None,
+            fee_options: None,
         })
     }
 
@@ -591,6 +670,11 @@ impl MintPayment for FakeWallet {
         unit: &CurrencyUnit,
         options: OutgoingPaymentOptions,
     ) -> Result<MakePaymentResponse, Self::Err> {
+        if self.payment_delay > 0 {
+            let duration = time::Duration::from_secs(self.payment_delay);
+            time::sleep(duration).await;
+        }
+
         match options {
             OutgoingPaymentOptions::Bolt11(bolt11_options) => {
                 let bolt11 = bolt11_options.bolt11;
@@ -613,7 +697,23 @@ impl MintPayment for FakeWallet {
                     .unwrap_or(MeltQuoteState::Paid);
 
                 let amount_msat: u64 = if let Some(melt_options) = bolt11_options.melt_options {
-                    melt_options.amount_msat().into()
+                    let msats = match melt_options {
+                        MeltOptions::Amountless { amountless } => {
+                            let amount_msat = amountless.amount_msat;
+
+                            if let Some(invoice_amount) = bolt11.amount_milli_satoshis() {
+                                ensure_cdk!(
+                                    invoice_amount == u64::from(amount_msat),
+                                    payment::Error::AmountMismatch
+                                );
+                            }
+
+                            amount_msat
+                        }
+                        MeltOptions::Mpp { mpp } => mpp.amount,
+                    };
+
+                    u64::from(msats)
                 } else {
                     // Fall back to invoice amount
                     bolt11
@@ -684,8 +784,14 @@ impl MintPayment for FakeWallet {
                 })
             }
             OutgoingPaymentOptions::Custom(custom_options) => {
+                self.ensure_custom_method_supported(&custom_options.method)?;
+
                 let total_spent = self
-                    .custom_outgoing_amount(unit, &custom_options.extra_json)
+                    .custom_outgoing_amount(
+                        unit,
+                        custom_options.amount.as_ref(),
+                        &custom_options.extra_json,
+                    )
                     .await?;
 
                 Ok(MakePaymentResponse {
@@ -693,6 +799,26 @@ impl MintPayment for FakeWallet {
                     payment_proof: Some(custom_options.request),
                     status: MeltQuoteState::Paid,
                     total_spent: Amount::new(total_spent.value() + 1, unit.clone()),
+                })
+            }
+            OutgoingPaymentOptions::Onchain(onchain_options) => {
+                let amount = onchain_options.amount;
+                let quote_id = onchain_options.quote_id;
+                let fee = self.fee_for_amount(&amount);
+
+                let total_spent = Amount::new(amount.value() + fee.value(), amount.unit().clone());
+                let payment_proof = fake_onchain_outpoint(&quote_id.to_string());
+
+                self.payment_states.lock().await.insert(
+                    quote_id.to_string(),
+                    (MeltQuoteState::Paid, total_spent.clone()),
+                );
+
+                Ok(MakePaymentResponse {
+                    payment_lookup_id: PaymentIdentifier::QuoteId(quote_id),
+                    payment_proof: Some(payment_proof),
+                    status: MeltQuoteState::Paid,
+                    total_spent,
                 })
             }
         }
@@ -714,6 +840,13 @@ impl MintPayment for FakeWallet {
 
                 let offer_builder = OfferBuilder::new(secret_key.public_key(&secp_ctx))
                     .description(description.clone());
+
+                let offer_builder = match expiry {
+                    Some(unix_expiry) => {
+                        offer_builder.absolute_expiry(Duration::from_secs(unix_expiry))
+                    }
+                    None => offer_builder,
+                };
 
                 let (offer_builder, final_amount) = match amount {
                     Some(ref amt) => {
@@ -761,9 +894,30 @@ impl MintPayment for FakeWallet {
                     expiry,
                 )
             }
-            IncomingPaymentOptions::Custom(_) => {
-                // Custom payment methods are not supported by fake wallet
-                return Err(cdk_common::payment::Error::UnsupportedPaymentOption);
+            IncomingPaymentOptions::Onchain(onchain_options) => {
+                let request = fake_onchain_address(&onchain_options.quote_id.to_string());
+
+                (
+                    PaymentIdentifier::QuoteId(onchain_options.quote_id),
+                    request,
+                    Amount::new(DEFAULT_ONCHAIN_INCOMING_AMOUNT, self.unit.clone()),
+                    None,
+                )
+            }
+            IncomingPaymentOptions::Custom(custom_options) => {
+                self.ensure_custom_method_supported(&custom_options.method)?;
+
+                let custom_id = Uuid::new_v4().to_string();
+                let request = format!("{}:{}", custom_options.method.to_lowercase(), custom_id);
+
+                (
+                    PaymentIdentifier::CustomId(custom_id),
+                    request,
+                    custom_options
+                        .amount
+                        .unwrap_or_else(|| Amount::new(0, self.unit.clone())),
+                    custom_options.unix_expiry,
+                )
             }
         };
 
@@ -862,9 +1016,16 @@ impl MintPayment for FakeWallet {
             return Err(payment::Error::InvoicePaymentPending);
         }
 
+        let payment_proof = match request_lookup_id {
+            PaymentIdentifier::QuoteId(quote_id) => {
+                Some(fake_onchain_outpoint(&quote_id.to_string()))
+            }
+            _ => Some("".to_string()),
+        };
+
         Ok(MakePaymentResponse {
             payment_lookup_id: request_lookup_id.clone(),
-            payment_proof: Some("".to_string()),
+            payment_proof,
             status,
             total_spent,
         })
@@ -905,4 +1066,373 @@ pub fn create_fake_invoice(amount_msat: u64, description: String) -> Bolt11Invoi
         .min_final_cltv_expiry_delta(144)
         .build_signed(|hash| Secp256k1::new().sign_ecdsa_recoverable(hash, &private_key))
         .expect("Failed to build fake invoice")
+}
+
+fn fake_onchain_outpoint(seed: &str) -> String {
+    let txid = sha256::Hash::hash(seed.as_bytes());
+    format!("{txid}:0")
+}
+
+fn fake_onchain_address(seed: &str) -> String {
+    let secp_ctx = Secp256k1::new();
+    let secret_key = fake_secret_key(seed);
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp_ctx, &secret_key);
+
+    Address::p2wpkh(&CompressedPublicKey(public_key), Network::Regtest).to_string()
+}
+
+fn fake_secret_key(seed: &str) -> SecretKey {
+    let mut attempt = 0u64;
+
+    loop {
+        let mut key_material = seed.as_bytes().to_vec();
+        key_material.extend_from_slice(&attempt.to_le_bytes());
+
+        let candidate = sha256::Hash::hash(&key_material);
+        if let Ok(secret_key) = SecretKey::from_slice(candidate.as_ref()) {
+            return secret_key;
+        }
+
+        attempt += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use cdk_common::mint::{MeltPaymentRequest, MeltQuote};
+    use cdk_common::nuts::PaymentMethod;
+    use cdk_common::payment::{
+        CustomIncomingPaymentOptions, CustomOutgoingPaymentOptions, IncomingPaymentOptions,
+        MintPayment, OnchainOutgoingPaymentOptions, OutgoingPaymentOptions, PaymentIdentifier,
+    };
+    use lightning::offers::offer::Offer;
+
+    use super::*;
+
+    fn test_wallet_with_delay(payment_delay: u64) -> FakeWallet {
+        FakeWallet::new(
+            FeeReserve {
+                min_fee_reserve: 0.into(),
+                percent_fee_reserve: 0.0,
+            },
+            HashMap::new(),
+            HashSet::new(),
+            payment_delay,
+            CurrencyUnit::Sat,
+        )
+    }
+
+    fn test_wallet() -> FakeWallet {
+        test_wallet_with_delay(0)
+    }
+
+    #[tokio::test]
+    async fn bolt12_incoming_offer_includes_absolute_expiry() {
+        let wallet = test_wallet();
+        let unix_expiry = 2_000_000_000;
+        let response = wallet
+            .create_incoming_payment_request(IncomingPaymentOptions::Bolt12(Box::new(
+                payment::Bolt12IncomingPaymentOptions {
+                    description: Some("ttl".to_string()),
+                    amount: Some(Amount::new(32, CurrencyUnit::Sat)),
+                    unix_expiry: Some(unix_expiry),
+                },
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(response.expiry, Some(unix_expiry));
+        let offer = Offer::from_str(&response.request).expect("BOLT12 offer");
+        assert_eq!(
+            offer.absolute_expiry().map(|d| d.as_secs()),
+            Some(unix_expiry)
+        );
+    }
+
+    #[tokio::test]
+    async fn lightning_quotes_and_payments_round_up_sat_amounts() {
+        let wallet = test_wallet();
+        for (msat, sat) in [(1, 1), (999, 1), (1_000, 1), (1_999, 2), (2_000, 2)] {
+            let invoice = create_fake_invoice(msat, "rounding".to_owned());
+            let offer = OfferBuilder::new(invoice.recover_payee_pub_key())
+                .amount_msats(msat)
+                .build()
+                .unwrap();
+            for (unit, expected) in [(CurrencyUnit::Sat, sat), (CurrencyUnit::Msat, msat)] {
+                for options in [
+                    OutgoingPaymentOptions::Bolt11(Box::new(
+                        payment::Bolt11OutgoingPaymentOptions {
+                            bolt11: invoice.clone(),
+                            max_fee_amount: None,
+                            timeout_secs: None,
+                            melt_options: None,
+                            quote_id: cdk_common::QuoteId::new(),
+                        },
+                    )),
+                    OutgoingPaymentOptions::Bolt12(Box::new(
+                        payment::Bolt12OutgoingPaymentOptions {
+                            offer: offer.clone(),
+                            max_fee_amount: None,
+                            timeout_secs: None,
+                            melt_options: None,
+                            quote_id: cdk_common::QuoteId::new(),
+                        },
+                    )),
+                ] {
+                    let quote = wallet
+                        .get_payment_quote(&unit, options.clone())
+                        .await
+                        .unwrap();
+                    assert_eq!(quote.amount, Amount::new(expected, unit.clone()));
+                    let payment = wallet.make_payment(&unit, options).await.unwrap();
+                    assert_eq!(payment.status, MeltQuoteState::Paid);
+                    // The fake backend adds a fee of one quote unit.
+                    assert_eq!(payment.total_spent, Amount::new(expected + 1, unit.clone()));
+                }
+            }
+        }
+    }
+
+    fn custom_outgoing_options(
+        amount: Option<Amount<CurrencyUnit>>,
+        extra_json: Option<String>,
+    ) -> OutgoingPaymentOptions {
+        OutgoingPaymentOptions::Custom(Box::new(CustomOutgoingPaymentOptions {
+            method: "venmo".to_string(),
+            request: "test-payment-request".to_string(),
+            amount,
+            max_fee_amount: None,
+            timeout_secs: None,
+            melt_options: None,
+            extra_json,
+            quote_id: cdk_common::QuoteId::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn custom_payment_methods_are_configurable() {
+        let settings = test_wallet()
+            .get_settings()
+            .await
+            .expect("fake wallet settings should load");
+        assert!(settings.custom.is_empty());
+
+        let wallet = test_wallet()
+            .with_custom_payment_methods(HashMap::from([("Venmo".to_string(), "{}".to_string())]));
+
+        let settings = wallet
+            .get_settings()
+            .await
+            .expect("fake wallet settings should load");
+        assert!(settings.custom.contains_key("venmo"));
+        assert!(!settings.custom.contains_key("paypal"));
+    }
+
+    #[tokio::test]
+    async fn configured_custom_incoming_payment_is_paid() {
+        let wallet = test_wallet()
+            .with_custom_payment_methods(HashMap::from([("venmo".to_string(), "{}".to_string())]));
+
+        let response = wallet
+            .create_incoming_payment_request(IncomingPaymentOptions::Custom(Box::new(
+                CustomIncomingPaymentOptions {
+                    method: "venmo".to_string(),
+                    description: None,
+                    amount: Some(Amount::new(10, CurrencyUnit::Sat)),
+                    unix_expiry: None,
+                    extra_json: None,
+                    quote_id: cdk_common::QuoteId::new(),
+                    pubkey: None,
+                },
+            )))
+            .await
+            .expect("configured custom method should create a request");
+
+        assert!(response.request.starts_with("venmo:"));
+        assert!(matches!(
+            response.request_lookup_id,
+            PaymentIdentifier::CustomId(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_delay_is_applied_to_outgoing_onchain_payment() {
+        let wallet = test_wallet_with_delay(2);
+        let quote_id = cdk_common::QuoteId::new();
+
+        let options = OutgoingPaymentOptions::Onchain(Box::new(OnchainOutgoingPaymentOptions {
+            address: "bcrt1qfakeaddress".to_string(),
+            amount: Amount::new(100, CurrencyUnit::Sat),
+            max_fee_amount: None,
+            quote_id: quote_id.clone(),
+            fee_index: None,
+            metadata: None,
+        }));
+
+        let payment = wallet.make_payment(&CurrencyUnit::Sat, options);
+        tokio::pin!(payment);
+
+        let early_result = tokio::time::timeout(time::Duration::from_secs(1), &mut payment).await;
+        assert!(
+            early_result.is_err(),
+            "outgoing fake payment completed before configured delay elapsed"
+        );
+
+        let pending_status = wallet
+            .check_outgoing_payment(&PaymentIdentifier::QuoteId(quote_id.clone()))
+            .await
+            .expect("checking pending fake onchain payment should succeed");
+        assert_eq!(pending_status.status, MeltQuoteState::Unknown);
+
+        time::advance(time::Duration::from_secs(1)).await;
+
+        let response = payment
+            .await
+            .expect("fake onchain payment should complete after configured delay");
+        assert_eq!(
+            response.payment_lookup_id,
+            PaymentIdentifier::QuoteId(quote_id)
+        );
+        assert_eq!(response.status, MeltQuoteState::Paid);
+    }
+
+    #[tokio::test]
+    async fn custom_outgoing_quote_prefers_typed_amount() {
+        let wallet = test_wallet()
+            .with_custom_payment_methods(HashMap::from([("venmo".to_string(), "{}".to_string())]));
+
+        let response = wallet
+            .get_payment_quote(
+                &CurrencyUnit::Sat,
+                custom_outgoing_options(
+                    Some(Amount::new(20, CurrencyUnit::Sat)),
+                    Some(r#"{"amount":30}"#.to_string()),
+                ),
+            )
+            .await
+            .expect("configured custom method should quote outgoing payment");
+
+        assert_eq!(response.amount, Amount::new(20, CurrencyUnit::Sat));
+    }
+
+    #[tokio::test]
+    async fn custom_outgoing_payment_prefers_typed_amount() {
+        let wallet = test_wallet()
+            .with_custom_payment_methods(HashMap::from([("venmo".to_string(), "{}".to_string())]));
+
+        let response = wallet
+            .make_payment(
+                &CurrencyUnit::Sat,
+                custom_outgoing_options(
+                    Some(Amount::new(20, CurrencyUnit::Sat)),
+                    Some(r#"{"amount":30}"#.to_string()),
+                ),
+            )
+            .await
+            .expect("configured custom method should make outgoing payment");
+
+        assert_eq!(response.total_spent, Amount::new(21, CurrencyUnit::Sat));
+    }
+
+    #[tokio::test]
+    async fn custom_payment_uses_persisted_quote_amount_after_reconstruction() {
+        let custom_payment_methods = HashMap::from([("venmo".to_string(), "{}".to_string())]);
+        let wallet = test_wallet().with_custom_payment_methods(custom_payment_methods.clone());
+        let quote_id = cdk_common::QuoteId::new();
+        let request = "test-payment-request".to_string();
+        let extra_json = serde_json::json!({"amount": 30, "memo": "keep-me"});
+
+        let quote = wallet
+            .get_payment_quote(
+                &CurrencyUnit::Sat,
+                OutgoingPaymentOptions::Custom(Box::new(CustomOutgoingPaymentOptions {
+                    method: "venmo".to_string(),
+                    request: request.clone(),
+                    amount: Some(Amount::new(20, CurrencyUnit::Sat)),
+                    max_fee_amount: None,
+                    timeout_secs: None,
+                    melt_options: None,
+                    extra_json: Some(extra_json.to_string()),
+                    quote_id: quote_id.clone(),
+                })),
+            )
+            .await
+            .expect("configured custom method should quote outgoing payment");
+
+        assert_eq!(quote.amount, Amount::new(20, CurrencyUnit::Sat));
+        assert_eq!(quote.extra_json, Some(extra_json.clone()));
+
+        let melt_quote = MeltQuote::new(
+            Some(quote_id),
+            MeltPaymentRequest::Custom {
+                method: "venmo".to_string(),
+                request,
+            },
+            CurrencyUnit::Sat,
+            quote.amount,
+            quote.fee,
+            0,
+            quote.request_lookup_id,
+            None,
+            PaymentMethod::Custom("venmo".to_string()),
+            quote.extra_json,
+            None,
+        );
+        let payment_options = OutgoingPaymentOptions::from_melt_quote_with_fee(melt_quote)
+            .expect("custom melt quote should reconstruct payment options");
+
+        let OutgoingPaymentOptions::Custom(custom_options) = &payment_options else {
+            panic!("custom melt quote should reconstruct custom payment options");
+        };
+        assert_eq!(
+            custom_options.amount,
+            Some(Amount::new(20, CurrencyUnit::Sat))
+        );
+        let reconstructed_extra_json: serde_json::Value = serde_json::from_str(
+            custom_options
+                .extra_json
+                .as_deref()
+                .expect("custom extra fields should survive reconstruction"),
+        )
+        .expect("reconstructed custom extra fields should be valid JSON");
+        assert_eq!(reconstructed_extra_json, extra_json);
+
+        // Recreate the backend to prove execution does not depend on process-local
+        // state retained by the instance that created the quote.
+        let payment_wallet = test_wallet().with_custom_payment_methods(custom_payment_methods);
+        let payment = payment_wallet
+            .make_payment(&CurrencyUnit::Sat, payment_options)
+            .await
+            .expect("quoted custom payment should execute");
+
+        assert_eq!(payment.total_spent, Amount::new(21, CurrencyUnit::Sat));
+    }
+
+    #[tokio::test]
+    async fn custom_outgoing_amount_falls_back_to_extra_json() {
+        let wallet = test_wallet()
+            .with_custom_payment_methods(HashMap::from([("venmo".to_string(), "{}".to_string())]));
+
+        let response = wallet
+            .get_payment_quote(
+                &CurrencyUnit::Sat,
+                custom_outgoing_options(None, Some(r#"{"amount":30}"#.to_string())),
+            )
+            .await
+            .expect("configured custom method should quote outgoing payment");
+
+        assert_eq!(response.amount, Amount::new(30, CurrencyUnit::Sat));
+
+        let response = wallet
+            .make_payment(
+                &CurrencyUnit::Sat,
+                custom_outgoing_options(None, Some(r#"{"amount":30}"#.to_string())),
+            )
+            .await
+            .expect("configured custom method should make outgoing payment");
+
+        assert_eq!(response.total_spent, Amount::new(31, CurrencyUnit::Sat));
+    }
 }

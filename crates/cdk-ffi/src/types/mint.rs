@@ -2,7 +2,6 @@
 
 use std::str::FromStr;
 
-use cdk::nuts::nut00::{KnownMethod, PaymentMethod as NutPaymentMethod};
 use serde::{Deserialize, Serialize};
 
 use super::amount::{Amount, CurrencyUnit};
@@ -167,9 +166,14 @@ impl From<SupportedSettings> for cdk::nuts::nut06::SupportedSettings {
 pub struct MintMethodSettings {
     pub method: PaymentMethod,
     pub unit: CurrencyUnit,
+    /// Human-readable name for the payment method.
+    ///
+    /// If null or omitted, wallets should derive it from `method` by replacing
+    /// `_` and `-` with spaces and title-casing each word.
+    pub method_name: Option<String>,
     pub min_amount: Option<Amount>,
     pub max_amount: Option<Amount>,
-    /// For bolt11, whether mint supports setting invoice description
+    /// For bolt11/bolt12, whether mint supports setting invoice/offer description
     pub description: Option<bool>,
 }
 
@@ -177,11 +181,13 @@ impl From<cdk::nuts::nut04::MintMethodSettings> for MintMethodSettings {
     fn from(s: cdk::nuts::nut04::MintMethodSettings) -> Self {
         let description = match s.options {
             Some(cdk::nuts::nut04::MintMethodOptions::Bolt11 { description }) => Some(description),
+            Some(cdk::nuts::nut04::MintMethodOptions::Bolt12 { description }) => Some(description),
             _ => None,
         };
         Self {
             method: s.method.into(),
             unit: s.unit.into(),
+            method_name: s.method_name,
             min_amount: s.min_amount.map(Into::into),
             max_amount: s.max_amount.map(Into::into),
             description,
@@ -197,12 +203,16 @@ impl TryFrom<MintMethodSettings> for cdk::nuts::nut04::MintMethodSettings {
             PaymentMethod::Bolt11 => s
                 .description
                 .map(|description| cdk::nuts::nut04::MintMethodOptions::Bolt11 { description }),
+            PaymentMethod::Bolt12 => s
+                .description
+                .map(|description| cdk::nuts::nut04::MintMethodOptions::Bolt12 { description }),
             PaymentMethod::Custom { .. } => Some(cdk::nuts::nut04::MintMethodOptions::Custom {}),
             _ => None,
         };
         Ok(Self {
             method: s.method.into(),
             unit: s.unit.into(),
+            method_name: s.method_name,
             min_amount: s.min_amount.map(Into::into),
             max_amount: s.max_amount.map(Into::into),
             options,
@@ -246,6 +256,11 @@ impl TryFrom<Nut04Settings> for cdk::nuts::nut04::Settings {
 pub struct MeltMethodSettings {
     pub method: PaymentMethod,
     pub unit: CurrencyUnit,
+    /// Human-readable name for the payment method.
+    ///
+    /// If null or omitted, wallets should derive it from `method` by replacing
+    /// `_` and `-` with spaces and title-casing each word.
+    pub method_name: Option<String>,
     pub min_amount: Option<Amount>,
     pub max_amount: Option<Amount>,
     /// For bolt11, whether mint supports amountless invoices
@@ -261,6 +276,7 @@ impl From<cdk::nuts::nut05::MeltMethodSettings> for MeltMethodSettings {
         Self {
             method: s.method.into(),
             unit: s.unit.into(),
+            method_name: s.method_name,
             min_amount: s.min_amount.map(Into::into),
             max_amount: s.max_amount.map(Into::into),
             amountless,
@@ -281,6 +297,7 @@ impl TryFrom<MeltMethodSettings> for cdk::nuts::nut05::MeltMethodSettings {
         Ok(Self {
             method: s.method.into(),
             unit: s.unit.into(),
+            method_name: s.method_name,
             min_amount: s.min_amount.map(Into::into),
             max_amount: s.max_amount.map(Into::into),
             options,
@@ -460,44 +477,10 @@ impl TryFrom<ProtectedEndpoint> for cdk::nuts::ProtectedEndpoint {
             }
         };
 
-        // Convert path string to RoutePath by matching against known paths
-        let route_path = match endpoint.path.as_str() {
-            "/v1/mint/quote/bolt11" => cdk::nuts::RoutePath::MintQuote(
-                NutPaymentMethod::Known(KnownMethod::Bolt11).to_string(),
-            ),
-            "/v1/mint/bolt11" => {
-                cdk::nuts::RoutePath::Mint(NutPaymentMethod::Known(KnownMethod::Bolt11).to_string())
-            }
-            "/v1/melt/quote/bolt11" => cdk::nuts::RoutePath::MeltQuote(
-                NutPaymentMethod::Known(KnownMethod::Bolt11).to_string(),
-            ),
-            "/v1/melt/bolt11" => {
-                cdk::nuts::RoutePath::Melt(NutPaymentMethod::Known(KnownMethod::Bolt11).to_string())
-            }
-            "/v1/swap" => cdk::nuts::RoutePath::Swap,
-            "/v1/ws" => cdk::nuts::RoutePath::Ws,
-            "/v1/checkstate" => cdk::nuts::RoutePath::Checkstate,
-            "/v1/restore" => cdk::nuts::RoutePath::Restore,
-            "/v1/auth/blind/mint" => cdk::nuts::RoutePath::MintBlindAuth,
-            "/v1/mint/quote/bolt12" => cdk::nuts::RoutePath::MintQuote(
-                NutPaymentMethod::Known(KnownMethod::Bolt12).to_string(),
-            ),
-            "/v1/mint/bolt12" => {
-                cdk::nuts::RoutePath::Mint(NutPaymentMethod::Known(KnownMethod::Bolt12).to_string())
-            }
-            "/v1/melt/quote/bolt12" => cdk::nuts::RoutePath::MeltQuote(
-                NutPaymentMethod::Known(KnownMethod::Bolt12).to_string(),
-            ),
-            "/v1/melt/bolt12" => {
-                cdk::nuts::RoutePath::Melt(NutPaymentMethod::Known(KnownMethod::Bolt12).to_string())
-            }
-            _ => {
-                return Err(FfiError::internal(format!(
-                    "Unknown route path: {}",
-                    endpoint.path
-                )))
-            }
-        };
+        let route_path = endpoint
+            .path
+            .parse()
+            .map_err(|err| FfiError::internal(format!("Unknown route path: {err}")))?;
 
         Ok(cdk::nuts::ProtectedEndpoint::new(method, route_path))
     }
@@ -658,6 +641,8 @@ pub struct MintInfo {
     pub time: Option<u64>,
     /// terms of url service of the mint
     pub tos_url: Option<String>,
+    /// max length the mint accepts for any array in a request
+    pub max_array_length: Option<u64>,
 }
 
 impl From<cdk::nuts::MintInfo> for MintInfo {
@@ -677,15 +662,16 @@ impl From<cdk::nuts::MintInfo> for MintInfo {
             motd: info.motd,
             time: info.time,
             tos_url: info.tos_url,
+            max_array_length: info.max_array_length,
         }
     }
 }
 
-impl From<MintInfo> for cdk::nuts::MintInfo {
-    fn from(info: MintInfo) -> Self {
-        // Convert FFI Nuts back to cdk::nuts::Nuts (best-effort)
-        let nuts_cdk: cdk::nuts::Nuts = info.nuts.clone().try_into().unwrap_or_default();
-        Self {
+impl TryFrom<MintInfo> for cdk::nuts::MintInfo {
+    type Error = FfiError;
+
+    fn try_from(info: MintInfo) -> Result<Self, Self::Error> {
+        Ok(Self {
             name: info.name,
             pubkey: info.pubkey.and_then(|p| p.parse().ok()),
             version: info.version.map(Into::into),
@@ -694,13 +680,14 @@ impl From<MintInfo> for cdk::nuts::MintInfo {
             contact: info
                 .contact
                 .map(|contacts| contacts.into_iter().map(Into::into).collect()),
-            nuts: nuts_cdk,
+            nuts: info.nuts.try_into()?,
             icon_url: info.icon_url,
             urls: info.urls,
             motd: info.motd,
             time: info.time,
             tos_url: info.tos_url,
-        }
+            max_array_length: info.max_array_length,
+        })
     }
 }
 
@@ -724,6 +711,8 @@ pub fn encode_mint_info(info: MintInfo) -> Result<String, FfiError> {
 }
 #[cfg(test)]
 mod tests {
+    use cdk::nuts::nut00::{KnownMethod, PaymentMethod as NutPaymentMethod};
+
     use super::*;
 
     /// Helper function to create a sample cdk::nuts::Nuts for testing
@@ -733,6 +722,7 @@ mod tests {
                 methods: vec![cdk::nuts::nut04::MintMethodSettings {
                     method: cdk::nuts::PaymentMethod::Known(KnownMethod::Bolt11),
                     unit: cdk::nuts::CurrencyUnit::Sat,
+                    method_name: Some("Lightning".to_string()),
                     min_amount: Some(cdk::Amount::from(1)),
                     max_amount: Some(cdk::Amount::from(100000)),
                     options: Some(cdk::nuts::nut04::MintMethodOptions::Bolt11 {
@@ -745,6 +735,7 @@ mod tests {
                 methods: vec![cdk::nuts::nut05::MeltMethodSettings {
                     method: cdk::nuts::PaymentMethod::Known(KnownMethod::Bolt11),
                     unit: cdk::nuts::CurrencyUnit::Sat,
+                    method_name: Some("Lightning".to_string()),
                     min_amount: Some(cdk::Amount::from(1)),
                     max_amount: Some(cdk::Amount::from(100000)),
                     options: Some(cdk::nuts::nut05::MeltMethodOptions::Bolt11 { amountless: true }),
@@ -1003,6 +994,7 @@ mod tests {
             .push(cdk::nuts::nut04::MintMethodSettings {
                 method: cdk::nuts::PaymentMethod::Known(KnownMethod::Bolt11),
                 unit: cdk::nuts::CurrencyUnit::Msat,
+                method_name: None,
                 min_amount: Some(cdk::Amount::from(1)),
                 max_amount: Some(cdk::Amount::from(100000)),
                 options: None,
@@ -1014,6 +1006,7 @@ mod tests {
             .push(cdk::nuts::nut05::MeltMethodSettings {
                 method: cdk::nuts::PaymentMethod::Known(KnownMethod::Bolt11),
                 unit: cdk::nuts::CurrencyUnit::Usd,
+                method_name: None,
                 min_amount: None,
                 max_amount: None,
                 options: None,
@@ -1060,6 +1053,72 @@ mod tests {
         };
 
         let result: Result<cdk::nuts::ProtectedEndpoint, _> = invalid_endpoint.try_into();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_protected_endpoint_custom_payment_method_path() {
+        let endpoint = ProtectedEndpoint {
+            method: "POST".to_string(),
+            path: "/v1/mint/custom-method".to_string(),
+        };
+
+        let converted: cdk::nuts::ProtectedEndpoint = endpoint
+            .try_into()
+            .expect("custom payment method routes should be accepted");
+        assert_eq!(
+            converted.path,
+            cdk::nuts::RoutePath::Mint("custom-method".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mint_info_unknown_endpoint_returns_error() {
+        let ffi_mint_info = MintInfo {
+            name: None,
+            pubkey: None,
+            version: None,
+            description: None,
+            description_long: None,
+            contact: None,
+            nuts: Nuts {
+                nut04: Nut04Settings {
+                    methods: vec![],
+                    disabled: false,
+                },
+                nut05: Nut05Settings {
+                    methods: vec![],
+                    disabled: false,
+                },
+                nut07_supported: true,
+                nut08_supported: false,
+                nut09_supported: false,
+                nut10_supported: false,
+                nut11_supported: false,
+                nut12_supported: true,
+                nut14_supported: false,
+                nut20_supported: false,
+                nut21: None,
+                nut22: Some(BlindAuthSettings {
+                    bat_max_mint: 10,
+                    protected_endpoints: vec![ProtectedEndpoint {
+                        method: "POST".to_string(),
+                        path: "/v1/unknown-custom-endpoint".to_string(),
+                    }],
+                }),
+                nut29: Nut29Settings::default(),
+                mint_units: vec![],
+                melt_units: vec![],
+            },
+            icon_url: None,
+            urls: None,
+            motd: None,
+            time: None,
+            tos_url: None,
+            max_array_length: None,
+        };
+
+        let result = cdk::nuts::MintInfo::try_from(ffi_mint_info);
         assert!(result.is_err());
     }
 }

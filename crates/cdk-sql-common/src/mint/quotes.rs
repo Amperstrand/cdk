@@ -11,6 +11,7 @@ use cdk_common::database::{
 use cdk_common::mint::{
     self, IncomingPayment, Issuance, MeltPaymentRequest, MeltQuote, MintQuote, Operation,
 };
+use cdk_common::nuts::nut30::MeltQuoteOnchainFeeOption;
 use cdk_common::payment::PaymentIdentifier;
 use cdk_common::quote_id::QuoteId;
 use cdk_common::state::check_melt_quote_state_transition;
@@ -19,7 +20,7 @@ use cdk_common::{
     Amount, BlindedMessage, CurrencyUnit, Id, MeltQuoteState, PaymentMethod, PublicKey,
 };
 #[cfg(feature = "prometheus")]
-use cdk_prometheus::METRICS;
+use cdk_prometheus::MintMetricGuard;
 use lightning_invoice::Bolt11Invoice;
 use tracing::instrument;
 
@@ -89,14 +90,10 @@ WHERE i.quote_id=:quote_id
     .await?
     .into_iter()
     .map(|row| {
+        let amount: u64 = column_as_number!(row[0].clone());
         let time: u64 = column_as_number!(row[1].clone());
         let unit = column_as_string!(&row[2], CurrencyUnit::from_str);
-        Ok(Issuance::new(
-            Amount::from_i64(column_as_number!(row[0].clone()))
-                .expect("Is amount when put into db")
-                .with_unit(unit),
-            time,
-        ))
+        Ok(Issuance::new(Amount::from(amount).with_unit(unit), time))
     })
     .collect()
 }
@@ -124,6 +121,8 @@ where
             created_time,
             amount_paid,
             amount_issued,
+            updated_at,
+            last_checked,
             payment_method,
             request_lookup_id_kind,
             extra_json
@@ -176,6 +175,8 @@ where
             created_time,
             amount_paid,
             amount_issued,
+            updated_at,
+            last_checked,
             payment_method,
             request_lookup_id_kind,
             extra_json
@@ -225,6 +226,8 @@ where
             created_time,
             amount_paid,
             amount_issued,
+            updated_at,
+            last_checked,
             payment_method,
             request_lookup_id_kind,
             extra_json
@@ -274,13 +277,16 @@ where
             expiry,
             state,
             payment_proof,
+            estimated_blocks,
             request_lookup_id,
             created_time,
             paid_time,
             payment_method,
             options,
             request_lookup_id_kind,
-            extra_json
+            extra_json,
+            fee_options,
+            selected_fee_index
         FROM
             melt_quote
         WHERE
@@ -319,12 +325,15 @@ where
             created_time,
             amount_paid,
             amount_issued,
+            updated_at,
+            last_checked,
             payment_method,
             request_lookup_id_kind,
             extra_json
         FROM
             mint_quote
         WHERE id IN (:quote_ids)
+        ORDER BY id
         {for_update_clause}
         "#
     );
@@ -382,18 +391,22 @@ where
             expiry,
             state,
             payment_proof,
+            estimated_blocks,
             request_lookup_id,
             created_time,
             paid_time,
             payment_method,
             options,
             request_lookup_id_kind,
-            extra_json
+            extra_json,
+            fee_options,
+            selected_fee_index
         FROM
             melt_quote
         WHERE
             request_lookup_id = :request_lookup_id
             AND request_lookup_id_kind = :request_lookup_id_kind
+        ORDER BY id
         {for_update_clause}
         "#
     );
@@ -436,13 +449,16 @@ where
             expiry,
             state,
             payment_proof,
+            estimated_blocks,
             request_lookup_id,
             created_time,
             paid_time,
             payment_method,
             options,
             request_lookup_id_kind,
-            extra_json
+            extra_json,
+            fee_options,
+            selected_fee_index
         FROM
             melt_quote
         WHERE
@@ -486,8 +502,9 @@ fn sql_row_to_mint_quote(
     unpack_into!(
         let (
             id, amount, unit, request, expiry, request_lookup_id,
-            pubkey, created_time, amount_paid, amount_issued, payment_method, request_lookup_id_kind,
-            extra_json
+            pubkey, created_time, amount_paid, amount_issued, updated_at, last_checked,
+            payment_method,
+            request_lookup_id_kind, extra_json
         ) = row
     );
 
@@ -507,12 +524,14 @@ fn sql_row_to_mint_quote(
     let amount: Option<u64> = column_as_nullable_number!(amount);
     let amount_paid: u64 = column_as_number!(amount_paid);
     let amount_issued: u64 = column_as_number!(amount_issued);
+    let updated_at: u64 = column_as_number!(updated_at);
+    let last_checked: u64 = column_as_number!(last_checked);
     let payment_method = column_as_string!(payment_method, PaymentMethod::from_str);
     let unit = column_as_string!(unit, CurrencyUnit::from_str);
     let extra_json = column_as_nullable_string!(&extra_json)
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
-    Ok(MintQuote::new(
+    let mut quote = MintQuote::new(
         Some(QuoteId::from_str(&id)?),
         request_str,
         unit.clone(),
@@ -525,10 +544,14 @@ fn sql_row_to_mint_quote(
         Amount::from(amount_issued).with_unit(unit),
         payment_method,
         column_as_number!(created_time),
+        updated_at,
         payments,
         issueances,
         extra_json,
-    ))
+    );
+    quote.set_last_checked(last_checked);
+
+    Ok(quote)
 }
 
 // FIXME: Replace unwrap with proper error handling
@@ -543,13 +566,16 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
                 expiry,
                 state,
                 payment_proof,
+                estimated_blocks,
                 request_lookup_id,
                 created_time,
                 paid_time,
                 payment_method,
                 options,
                 request_lookup_id_kind,
-                extra_json
+                extra_json,
+                fee_options,
+                selected_fee_index
         ) = row
     );
 
@@ -561,14 +587,19 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
     let payment_proof = column_as_nullable_string!(payment_proof);
     let options = column_as_nullable_string!(options);
     let options = options.and_then(|o| serde_json::from_str(&o).ok());
-    let created_time: i64 = column_as_number!(created_time);
+    let created_time: u64 = column_as_number!(created_time);
     let paid_time = column_as_nullable_number!(paid_time);
     let payment_method = PaymentMethod::from_str(&column_as_string!(payment_method))?;
     let extra_json = column_as_nullable_string!(&extra_json)
         .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+    let fee_options = column_as_nullable_string!(&fee_options)
+        .and_then(|value| serde_json::from_str::<Vec<MeltQuoteOnchainFeeOption>>(&value).ok())
+        .unwrap_or_default();
+    let selected_fee_index: Option<u32> = column_as_nullable_number!(selected_fee_index);
 
     let state =
         MeltQuoteState::from_str(&column_as_string!(&state)).map_err(ConversionError::from)?;
+    let estimated_blocks: Option<u32> = column_as_nullable_number!(estimated_blocks);
 
     let unit = column_as_string!(unit);
     let request = column_as_string!(request);
@@ -606,7 +637,7 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
     };
 
     let unit = CurrencyUnit::from_str(&unit)?;
-    Ok(MeltQuote::from_db(
+    MeltQuote::from_db(
         QuoteId::from_str(&id)?,
         unit,
         request,
@@ -617,11 +648,15 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
         payment_proof,
         request_lookup_id,
         options,
-        created_time as u64,
+        created_time,
         paid_time,
         payment_method,
         extra_json,
-    ))
+        estimated_blocks,
+        fee_options,
+        selected_fee_index,
+    )
+    .map_err(|e| Error::Internal(format!("Invalid onchain melt quote row: {e}")))
 }
 
 #[async_trait]
@@ -647,8 +682,8 @@ where
             "#,
         )?
         .bind("quote_id", quote_id.to_string())
-        .bind("inputs_amount", inputs_amount.to_i64())
-        .bind("inputs_fee", inputs_fee.to_i64())
+        .bind("inputs_amount", i64::try_from(inputs_amount.to_u64())?)
+        .bind("inputs_fee", i64::try_from(inputs_fee.to_u64())?)
         .execute(&self.inner)
         .await?;
 
@@ -663,27 +698,35 @@ where
     ) -> Result<(), Self::Err> {
         let current_time = unix_time();
 
+        let mut ordered_messages = blinded_messages.iter().enumerate().collect::<Vec<_>>();
+        ordered_messages.sort_unstable_by(|(_, left), (_, right)| {
+            left.blinded_secret
+                .to_bytes()
+                .cmp(&right.blinded_secret.to_bytes())
+        });
+
         // Insert blinded_messages directly into blind_signature with c = NULL
         // Let the database constraint handle duplicate detection
-        for message in blinded_messages {
+        for (i, message) in ordered_messages {
             match query(
                 r#"
                 INSERT INTO blind_signature
-                (blinded_message, amount, keyset_id, c, quote_id, created_time, operation_kind, operation_id)
+                (blinded_message, amount, keyset_id, c, quote_id, created_time, operation_kind, operation_id, order_index)
                 VALUES
-                (:blinded_message, :amount, :keyset_id, NULL, :quote_id, :created_time, :operation_kind, :operation_id)
+                (:blinded_message, :amount, :keyset_id, NULL, :quote_id, :created_time, :operation_kind, :operation_id, :order_index)
                 "#,
             )?
             .bind(
                 "blinded_message",
                 message.blinded_secret.to_bytes().to_vec(),
             )
-            .bind("amount", message.amount.to_i64())
+            .bind("amount", i64::try_from(message.amount.to_u64())?)
             .bind("keyset_id", message.keyset_id.to_string())
             .bind("quote_id", quote_id.map(|q| q.to_string()))
-            .bind("created_time", current_time as i64)
+            .bind("created_time", i64::try_from(current_time)?)
             .bind("operation_kind", operation.kind().to_string())
             .bind("operation_id", operation.id().to_string())
+            .bind("order_index", i64::try_from(i)?)
             .execute(&self.inner)
             .await
             {
@@ -706,6 +749,26 @@ where
         &mut self,
         blinded_secrets: &[PublicKey],
     ) -> Result<(), Self::Err> {
+        // Acquire all affected row locks in primary-key order before deleting.
+        query(
+            r#"
+            SELECT blinded_message
+            FROM blind_signature
+            WHERE blinded_message IN (:blinded_secrets) AND c IS NULL
+            ORDER BY blinded_message
+            FOR UPDATE
+            "#,
+        )?
+        .bind_vec(
+            "blinded_secrets",
+            blinded_secrets
+                .iter()
+                .map(|secret| secret.to_bytes().to_vec())
+                .collect(),
+        )?
+        .fetch_all(&self.inner)
+        .await?;
+
         // Delete blinded messages from blind_signature table where c IS NULL
         // (only delete unsigned blinded messages)
         query(
@@ -755,6 +818,7 @@ where
                 SELECT blinded_message, keyset_id, amount
                 FROM blind_signature
                 WHERE quote_id = :quote_id AND c IS NULL
+                ORDER BY order_index ASC, blinded_message ASC
                 FOR UPDATE
                 "#,
             )?
@@ -802,6 +866,21 @@ where
         .execute(&self.inner)
         .await?;
 
+        // Match the lock order used when change outputs are loaded for
+        // finalization before deleting any still-unsigned rows.
+        query(
+            r#"
+            SELECT blinded_message
+            FROM blind_signature
+            WHERE quote_id = :quote_id AND c IS NULL
+            ORDER BY order_index ASC, blinded_message ASC
+            FOR UPDATE
+            "#,
+        )?
+        .bind("quote_id", quote_id.to_string())
+        .fetch_all(&self.inner)
+        .await?;
+
         // Also delete blinded messages (where c IS NULL) from blind_signature table
         query(
             r#"
@@ -840,8 +919,8 @@ where
             )?
             .bind("quote_id", quote.id.to_string())
             .bind("payment_id", payment.payment_id)
-            .bind("amount", payment.amount.to_i64())
-            .bind("timestamp", payment.time as i64)
+            .bind("amount", i64::try_from(payment.amount.to_u64())?)
+            .bind("timestamp", i64::try_from(payment.time)?)
             .execute(&self.inner)
             .await
             .map_err(|err| {
@@ -861,8 +940,8 @@ where
                 "#,
             )?
             .bind("quote_id", quote.id.to_string())
-            .bind("amount", amount_issued.to_i64())
-            .bind("timestamp", current_time as i64)
+            .bind("amount", i64::try_from(amount_issued.to_u64())?)
+            .bind("timestamp", i64::try_from(current_time)?)
             .execute(&self.inner)
             .await?;
         }
@@ -873,19 +952,48 @@ where
                 mint_quote
             SET
                 amount_issued = :amount_issued,
-                amount_paid = :amount_paid
+                amount_paid = :amount_paid,
+                updated_at = CASE
+                    WHEN :current_time > updated_at + 1 THEN :current_time
+                    ELSE updated_at + 1
+                END
             WHERE
                 id = :quote_id
             "#,
         )?
         .bind("quote_id", quote.id.to_string())
-        .bind("amount_issued", quote.amount_issued().to_i64())
-        .bind("amount_paid", quote.amount_paid().to_i64())
+        .bind(
+            "amount_issued",
+            i64::try_from(quote.amount_issued().to_u64())?,
+        )
+        .bind("amount_paid", i64::try_from(quote.amount_paid().to_u64())?)
+        .bind("current_time", i64::try_from(current_time)?)
         .execute(&self.inner)
         .await
         .inspect_err(|err| {
-            tracing::error!("SQLite could not update mint quote amount_paid: {}", err);
+            tracing::error!("SQL could not update mint quote accounting: {}", err);
         })?;
+
+        let updated_at = query(
+            r#"
+            SELECT updated_at
+            FROM mint_quote
+            WHERE id = :quote_id
+            "#,
+        )?
+        .bind("quote_id", quote.id.to_string())
+        .pluck(&self.inner)
+        .await?
+        .map(|updated_at| Ok::<_, Error>(column_as_number!(updated_at)))
+        .transpose()?
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "mint quote {} missing after accounting update",
+                quote.id
+            ))
+        })?;
+
+        quote.set_updated_at(updated_at);
 
         Ok(())
     }
@@ -895,24 +1003,34 @@ where
         query(
             r#"
                 INSERT INTO mint_quote (
-                id, amount, unit, request, expiry, request_lookup_id, pubkey, created_time, payment_method, request_lookup_id_kind, extra_json
+                    id, amount, unit, request, expiry, request_lookup_id, pubkey,
+                    created_time, updated_at, last_checked, payment_method,
+                    request_lookup_id_kind, extra_json
                 )
                 VALUES (
-                :id, :amount, :unit, :request, :expiry, :request_lookup_id, :pubkey, :created_time, :payment_method, :request_lookup_id_kind, :extra_json
+                    :id, :amount, :unit, :request, :expiry, :request_lookup_id, :pubkey,
+                    :created_time, :updated_at, :last_checked, :payment_method,
+                    :request_lookup_id_kind, :extra_json
                 )
             "#,
         )?
         .bind("id", quote.id.to_string())
-        .bind("amount", quote.amount.clone().map(|a| a.to_i64()))
+        .bind(
+            "amount",
+            quote
+                .amount
+                .clone()
+                .map(|a| i64::try_from(a.to_u64()))
+                .transpose()?,
+        )
         .bind("unit", quote.unit.to_string())
         .bind("request", quote.request.clone())
-        .bind("expiry", quote.expiry as i64)
-        .bind(
-            "request_lookup_id",
-            quote.request_lookup_id.to_string(),
-        )
+        .bind("expiry", i64::try_from(quote.expiry)?)
+        .bind("request_lookup_id", quote.request_lookup_id.to_string())
         .bind("pubkey", quote.pubkey.map(|p| p.to_string()))
-        .bind("created_time", quote.created_time as i64)
+        .bind("created_time", i64::try_from(quote.created_time)?)
+        .bind("updated_at", i64::try_from(quote.updated_at())?)
+        .bind("last_checked", i64::try_from(quote.last_checked())?)
         .bind("payment_method", quote.payment_method.to_string())
         .bind("request_lookup_id_kind", quote.request_lookup_id.kind())
         .bind(
@@ -926,37 +1044,52 @@ where
     }
 
     async fn add_melt_quote(&mut self, quote: mint::MeltQuote) -> Result<(), Self::Err> {
+        // `fee_options` is captured by value here so the subsequent chained
+        // binds can move fields out of `quote` without a borrow conflict.
+        // It is also never rewritten after insert (see the UPDATE queries
+        // below) — the NUT rule "fixed for the lifetime of the quote" is
+        // enforced by never touching this column on update.
+        let fee_options_json = serde_json::to_string(quote.fee_options()).ok();
+
         // Now insert the new quote
         query(
             r#"
             INSERT INTO melt_quote
             (
                 id, unit, amount, request, fee_reserve, state,
-                expiry, payment_proof, request_lookup_id,
-                created_time, paid_time, options, request_lookup_id_kind, payment_method, extra_json
+                expiry, payment_proof, estimated_blocks, fee_options, selected_fee_index,
+                request_lookup_id, created_time, paid_time, options, request_lookup_id_kind,
+                payment_method, extra_json
             )
             VALUES
             (
                 :id, :unit, :amount, :request, :fee_reserve, :state,
-                :expiry, :payment_proof, :request_lookup_id,
-                :created_time, :paid_time, :options, :request_lookup_id_kind, :payment_method, :extra_json
+                :expiry, :payment_proof, :estimated_blocks, :fee_options, :selected_fee_index,
+                :request_lookup_id, :created_time, :paid_time, :options, :request_lookup_id_kind,
+                :payment_method, :extra_json
             )
         "#,
         )?
         .bind("id", quote.id.to_string())
         .bind("unit", quote.unit.to_string())
-        .bind("amount", quote.amount().to_i64())
+        .bind("amount", i64::try_from(quote.amount().to_u64())?)
         .bind("request", serde_json::to_string(&quote.request)?)
-        .bind("fee_reserve", quote.fee_reserve().to_i64())
+        .bind("fee_reserve", i64::try_from(quote.fee_reserve().to_u64())?)
         .bind("state", quote.state.to_string())
-        .bind("expiry", quote.expiry as i64)
+        .bind("expiry", i64::try_from(quote.expiry)?)
         .bind("payment_proof", quote.payment_proof)
+        .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
+        .bind("fee_options", fee_options_json)
+        .bind(
+            "selected_fee_index",
+            quote.selected_fee_index.map(i64::from),
+        )
         .bind(
             "request_lookup_id",
             quote.request_lookup_id.as_ref().map(|id| id.to_string()),
         )
-        .bind("created_time", quote.created_time as i64)
-        .bind("paid_time", quote.paid_time.map(|t| t as i64))
+        .bind("created_time", i64::try_from(quote.created_time)?)
+        .bind("paid_time", quote.paid_time.map(i64::try_from).transpose()?)
         .bind(
             "options",
             quote.options.map(|o| serde_json::to_string(&o).ok()),
@@ -1001,20 +1134,32 @@ where
 
         check_melt_quote_state_transition(old_state, state)?;
 
+        // NOTE: `fee_options` is intentionally omitted from both UPDATE
+        // queries below. Per the NUT spec the returned `fee_options` are
+        // fixed for the lifetime of the quote, so we never rewrite them
+        // after insert. Only state/paid_time/payment_proof/fee_reserve/
+        // estimated_blocks/selected_fee_index may change over the
+        // quote's lifetime.
         let rec = if state == MeltQuoteState::Paid {
             let current_time = unix_time();
             quote.paid_time = Some(current_time);
             quote.payment_proof = payment_proof.clone();
-            query(r#"UPDATE melt_quote SET state = :state, paid_time = :paid_time, payment_proof = :payment_proof WHERE id = :id"#)?
+            query(r#"UPDATE melt_quote SET state = :state, paid_time = :paid_time, payment_proof = :payment_proof, fee_reserve = :fee_reserve, estimated_blocks = :estimated_blocks, selected_fee_index = :selected_fee_index WHERE id = :id"#)?
                 .bind("state", state.to_string())
-                .bind("paid_time", current_time as i64)
+                .bind("paid_time", i64::try_from(current_time)?)
                 .bind("payment_proof", payment_proof)
+                .bind("fee_reserve", i64::try_from(quote.fee_reserve().value())?)
+                .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
+                .bind("selected_fee_index", quote.selected_fee_index.map(i64::from))
                 .bind("id", quote.id.to_string())
                 .execute(&self.inner)
                 .await
         } else {
-            query(r#"UPDATE melt_quote SET state = :state WHERE id = :id"#)?
+            query(r#"UPDATE melt_quote SET state = :state, fee_reserve = :fee_reserve, estimated_blocks = :estimated_blocks, selected_fee_index = :selected_fee_index WHERE id = :id"#)?
                 .bind("state", state.to_string())
+                .bind("fee_reserve", i64::try_from(quote.fee_reserve().value())?)
+                .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
+                .bind("selected_fee_index", quote.selected_fee_index.map(i64::from))
                 .bind("id", quote.id.to_string())
                 .execute(&self.inner)
                 .await
@@ -1113,32 +1258,53 @@ where
 
     async fn get_mint_quote(&self, quote_id: &QuoteId) -> Result<Option<MintQuote>, Self::Err> {
         #[cfg(feature = "prometheus")]
-        METRICS.inc_in_flight_requests("get_mint_quote");
+        let metrics = MintMetricGuard::new("get_mint_quote");
+
+        let result = async {
+            let conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| Error::Database(Box::new(e)))?;
+            get_mint_quote_inner(&*conn, quote_id, false).await
+        }
+        .await;
 
         #[cfg(feature = "prometheus")]
-        let start_time = std::time::Instant::now();
+        {
+            metrics.record(result.is_ok());
+        }
+
+        result
+    }
+
+    async fn try_update_mint_quote_last_checked(
+        &self,
+        quote_id: &QuoteId,
+        last_checked: u64,
+        min_interval: u64,
+    ) -> Result<bool, Self::Err> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
+        let threshold = last_checked.saturating_sub(min_interval);
+        let rows_affected = query(
+            r#"
+            UPDATE mint_quote
+            SET last_checked = :last_checked
+            WHERE id = :quote_id
+              AND last_checked < :threshold
+            "#,
+        )?
+        .bind("quote_id", quote_id.to_string())
+        .bind("last_checked", i64::try_from(last_checked)?)
+        .bind("threshold", i64::try_from(threshold)?)
+        .execute(&*conn)
+        .await?;
 
-        let result = get_mint_quote_inner(&*conn, quote_id, false).await;
-
-        #[cfg(feature = "prometheus")]
-        {
-            let success = result.is_ok();
-
-            METRICS.record_mint_operation("get_mint_quote", success);
-            METRICS.record_mint_operation_histogram(
-                "get_mint_quote",
-                success,
-                start_time.elapsed().as_secs_f64(),
-            );
-            METRICS.dec_in_flight_requests("get_mint_quote");
-        }
-
-        result
+        Ok(rows_affected > 0)
     }
 
     async fn get_mint_quotes_by_ids(
@@ -1196,6 +1362,8 @@ where
                 created_time,
                 amount_paid,
                 amount_issued,
+                updated_at,
+                last_checked,
                 payment_method,
                 request_lookup_id_kind,
                 extra_json
@@ -1224,29 +1392,21 @@ where
         quote_id: &QuoteId,
     ) -> Result<Option<mint::MeltQuote>, Self::Err> {
         #[cfg(feature = "prometheus")]
-        METRICS.inc_in_flight_requests("get_melt_quote");
+        let metrics = MintMetricGuard::new("get_melt_quote");
 
-        #[cfg(feature = "prometheus")]
-        let start_time = std::time::Instant::now();
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| Error::Database(Box::new(e)))?;
-
-        let result = get_melt_quote_inner(&*conn, quote_id, false).await;
+        let result = async {
+            let conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| Error::Database(Box::new(e)))?;
+            get_melt_quote_inner(&*conn, quote_id, false).await
+        }
+        .await;
 
         #[cfg(feature = "prometheus")]
         {
-            let success = result.is_ok();
-
-            METRICS.record_mint_operation("get_melt_quote", success);
-            METRICS.record_mint_operation_histogram(
-                "get_melt_quote",
-                success,
-                start_time.elapsed().as_secs_f64(),
-            );
-            METRICS.dec_in_flight_requests("get_melt_quote");
+            metrics.record(result.is_ok());
         }
 
         result
@@ -1269,13 +1429,16 @@ where
                 expiry,
                 state,
                 payment_proof,
+                estimated_blocks,
                 request_lookup_id,
                 created_time,
                 paid_time,
                 payment_method,
                 options,
                 request_lookup_id_kind,
-                extra_json
+                extra_json,
+                fee_options,
+                selected_fee_index
             FROM
                 melt_quote
             "#,

@@ -10,8 +10,12 @@ pub mod bip321;
 pub mod database;
 pub mod error;
 pub mod logging;
+#[cfg(feature = "nostr")]
+pub mod nostr;
 #[cfg(feature = "npubcash")]
 pub mod npubcash;
+#[cfg(feature = "nwc")]
+pub mod nwc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 mod runtime;
@@ -27,8 +31,12 @@ mod wallet_trait;
 pub use database::*;
 pub use error::*;
 pub use logging::*;
+#[cfg(feature = "nostr")]
+pub use nostr::*;
 #[cfg(feature = "npubcash")]
 pub use npubcash::*;
+#[cfg(feature = "nwc")]
+pub use nwc::*;
 pub use types::*;
 pub use wallet::*;
 pub use wallet_repository::*;
@@ -80,6 +88,11 @@ mod tests {
         assert!(!options.include_fee);
         assert!(options.max_proofs.is_none());
         assert!(options.metadata.is_empty());
+        assert!(options.p2pk_signing_keys.is_empty());
+        assert_eq!(
+            options.p2pk_locked_proof_send_mode,
+            P2PKLockedProofSendMode::Swap
+        );
     }
 
     #[test]
@@ -201,6 +214,8 @@ mod tests {
             max_proofs: Some(10),
             metadata,
             use_p2bk: false,
+            p2pk_signing_keys: Vec::new(),
+            p2pk_locked_proof_send_mode: P2PKLockedProofSendMode::Swap,
         };
 
         assert!(options.memo.is_some());
@@ -261,6 +276,142 @@ mod tests {
     }
 
     #[test]
+    fn test_send_options_invalid_secret_key_returns_error() {
+        let options = SendOptions {
+            p2pk_signing_keys: vec![SecretKey {
+                hex: "z".repeat(64),
+            }],
+            ..Default::default()
+        };
+
+        let result: Result<cdk::wallet::SendOptions, _> = options.try_into();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_send_options_invalid_conditions_returns_error() {
+        let options = SendOptions {
+            conditions: Some(SpendingConditions::P2PK {
+                pubkey: "not_a_valid_pubkey".to_string(),
+                conditions: None,
+            }),
+            ..Default::default()
+        };
+
+        let result: Result<cdk::wallet::SendOptions, _> = options.try_into();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_send_options_json_preserves_p2pk_signing_keys() {
+        let secret_hex =
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string();
+        let options = SendOptions {
+            p2pk_signing_keys: vec![SecretKey {
+                hex: secret_hex.clone(),
+            }],
+            ..Default::default()
+        };
+
+        let to_json = options.to_json().unwrap();
+        let encoded = crate::types::wallet::encode_send_options(options.clone()).unwrap();
+        let debug = format!("{:?}", options);
+
+        assert!(to_json.contains(&secret_hex));
+        assert!(to_json.contains("p2pk_signing_keys"));
+        assert!(encoded.contains(&secret_hex));
+        assert!(encoded.contains("p2pk_signing_keys"));
+        assert!(!debug.contains(&secret_hex));
+        assert!(debug.contains("[REDACTED]"));
+
+        let decoded = crate::types::wallet::decode_send_options(encoded).unwrap();
+
+        assert_eq!(decoded.p2pk_signing_keys.len(), 1);
+        assert_eq!(decoded.p2pk_signing_keys[0].hex, secret_hex);
+    }
+
+    #[test]
+    fn test_send_options_json_still_decodes_p2pk_signing_keys() {
+        let secret_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let json = format!(
+            r#"{{
+                "memo": null,
+                "conditions": null,
+                "amount_split_target": "None",
+                "send_kind": "OnlineExact",
+                "include_fee": false,
+                "use_p2bk": false,
+                "max_proofs": null,
+                "metadata": {{}},
+                "p2pk_signing_keys": ["{}"],
+                "p2pk_locked_proof_send_mode": "SignAndSend"
+            }}"#,
+            secret_hex
+        );
+
+        let options = crate::types::wallet::decode_send_options(json).unwrap();
+
+        assert_eq!(options.p2pk_signing_keys.len(), 1);
+        assert_eq!(options.p2pk_signing_keys[0].hex, secret_hex);
+        assert_eq!(
+            options.p2pk_locked_proof_send_mode,
+            P2PKLockedProofSendMode::SignAndSend
+        );
+    }
+
+    #[test]
+    fn test_receive_options_json_preserves_p2pk_signing_keys() {
+        let secret_hex =
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string();
+        let options = ReceiveOptions {
+            p2pk_signing_keys: vec![SecretKey {
+                hex: secret_hex.clone(),
+            }],
+            ..Default::default()
+        };
+
+        let to_json = options.to_json().unwrap();
+        let encoded = crate::types::wallet::encode_receive_options(options.clone()).unwrap();
+        let debug = format!("{:?}", options);
+
+        assert!(to_json.contains(&secret_hex));
+        assert!(to_json.contains("p2pk_signing_keys"));
+        assert!(encoded.contains(&secret_hex));
+        assert!(encoded.contains("p2pk_signing_keys"));
+        assert!(!debug.contains(&secret_hex));
+        assert!(debug.contains("[REDACTED]"));
+
+        let decoded = crate::types::wallet::decode_receive_options(encoded).unwrap();
+
+        assert_eq!(decoded.p2pk_signing_keys.len(), 1);
+        assert_eq!(decoded.p2pk_signing_keys[0].hex, secret_hex);
+    }
+
+    #[test]
+    fn test_send_options_json_defaults_new_p2pk_fields() {
+        let json = r#"{
+            "memo": null,
+            "conditions": null,
+            "amount_split_target": "None",
+            "send_kind": "OnlineExact",
+            "include_fee": false,
+            "use_p2bk": false,
+            "max_proofs": null,
+            "metadata": {}
+        }"#;
+
+        let options = crate::types::wallet::decode_send_options(json.to_string()).unwrap();
+
+        assert!(options.p2pk_signing_keys.is_empty());
+        assert_eq!(
+            options.p2pk_locked_proof_send_mode,
+            P2PKLockedProofSendMode::Swap
+        );
+    }
+
+    #[test]
     fn test_proof_with_invalid_dleq_returns_error() {
         let proof = Proof {
             amount: Amount::new(1),
@@ -294,14 +445,73 @@ mod tests {
     }
 
     #[test]
+    fn test_transaction_invalid_saga_id_returns_error() {
+        let transaction = Transaction {
+            id: TransactionId {
+                hex: "a".repeat(64),
+            },
+            mint_url: MintUrl {
+                url: "https://mint.example.com".to_string(),
+            },
+            direction: TransactionDirection::Outgoing,
+            amount: Amount::new(100),
+            fee: Amount::new(0),
+            unit: CurrencyUnit::Sat,
+            ys: vec![],
+            timestamp: 0,
+            memo: None,
+            metadata: Default::default(),
+            quote_id: None,
+            payment_request: None,
+            payment_proof: None,
+            payment_method: None,
+            saga_id: Some("not-a-valid-uuid".to_string()),
+            status: TransactionStatus::Completed,
+        };
+
+        let result: Result<cdk::wallet::types::Transaction, _> = transaction.try_into();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mint_quote_pending_state_does_not_inflate_mintable() {
+        let ffi_quote = MintQuote {
+            id: "test-quote".to_string(),
+            amount: Some(Amount::new(100)),
+            unit: CurrencyUnit::Sat,
+            request: "lnbc1...".to_string(),
+            state: QuoteState::Pending,
+            expiry: u64::MAX,
+            mint_url: MintUrl::new("https://mint.example.com".to_string())
+                .expect("valid mint URL should convert successfully"),
+            amount_issued: Amount::zero(),
+            amount_paid: Amount::zero(),
+            updated_at: 0,
+            estimated_blocks: None,
+            payment_method: PaymentMethod::Bolt11,
+            secret_key: None,
+            used_by_operation: None,
+            version: 0,
+        };
+
+        let mintable =
+            mint_quote_amount_mintable(&ffi_quote).expect("valid mint quote should convert");
+
+        assert_eq!(mintable.value, 0);
+    }
+
+    #[test]
     fn test_wallet_config() {
         let config = WalletConfig {
             target_proof_count: None,
+            rate_limit: None,
         };
         assert!(config.target_proof_count.is_none());
 
         let config_with_values = WalletConfig {
             target_proof_count: Some(5),
+            rate_limit: None,
         };
         assert_eq!(config_with_values.target_proof_count, Some(5));
     }

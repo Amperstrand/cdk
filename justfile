@@ -7,6 +7,41 @@ alias t := test
 default:
   @just --list
 
+# Enter a Nix development shell without copying ignored files from JJ workspaces.
+develop shell="stable":
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  shell_name={{quote(shell)}}
+  case "$shell_name" in
+    ""|*[!a-zA-Z0-9._-]*)
+      echo "Error: invalid development shell name: $shell_name" >&2
+      exit 2
+      ;;
+  esac
+
+  flake_ref=".#${shell_name}"
+  if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+    revision=$(jj log -r @ --no-graph -T commit_id)
+
+    if git_dir=$(jj git root 2>/dev/null); then
+      case "$git_dir" in
+        */.git)
+          git_source=${git_dir%/.git}
+          ;;
+        *)
+          git_source=$git_dir
+          ;;
+      esac
+
+      flake_ref="git+file://${git_source}?rev=${revision}#${shell_name}"
+    else
+      echo "Warning: JJ repository is not Git-backed; using the workspace path." >&2
+    fi
+  fi
+
+  exec nix develop "$flake_ref" -c "${SHELL:-bash}"
+
 # Create a new SQL migration file
 new-migration target name:
   #!/usr/bin/env bash
@@ -29,6 +64,30 @@ final-check: lint clippy test
 
 quick-check: lint clippy test-units
 
+# Compile the mint management RPC schemas.
+proto-build:
+  buf build
+
+# Check mint management RPC compatibility against a local Git revision.
+proto-breaking base="upstream/main":
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  base_ref={{quote(base)}}
+  if command -v jj >/dev/null 2>&1 && jj root --ignore-working-copy >/dev/null 2>&1; then
+    git_dir=$(jj git root --ignore-working-copy)
+  else
+    git_dir=$(git rev-parse --git-common-dir)
+  fi
+
+  if ! baseline=$(git --git-dir="$git_dir" rev-parse --verify --quiet --end-of-options "${base_ref}^{commit}"); then
+    echo "Error: baseline '$base_ref' is unavailable locally." >&2
+    echo "Set up and fetch the remote, or choose an existing ref: just proto-breaking <ref>" >&2
+    exit 1
+  fi
+
+  buf breaking --against "${git_dir}#format=git,ref=${baseline},subdir=crates/cdk-mint-rpc/src/proto"
+
 # run `cargo build` on everything
 build *ARGS="--workspace --all-targets":
   #!/usr/bin/env bash
@@ -37,6 +96,36 @@ build *ARGS="--workspace --all-targets":
     cd {{invocation_directory()}}
   fi
   cargo build {{ARGS}}
+
+# Build the default Nix package.
+nix-build:
+  nix build --accept-flake-config
+
+# Build and push the default package and reusable Crane dependency artifacts to Attic.
+attic-push:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  targets=(
+    '.#default'
+    '.#deps'
+    '.#deps-msrv'
+    '.#itest-archive'
+    '.#start-fake-mint'
+    '.#start-regtest-mints'
+    '.#start-fake-auth-mint'
+    '.#start-regtest'
+    '.#signatory'
+    '.#cdk-payment-processor'
+    '.#cdk-mintd-grpc'
+  )
+  system="$(nix eval --impure --raw --expr builtins.currentSystem)"
+  if [[ "$system" == *-linux ]]; then
+    targets+=('.#deps-static')
+  fi
+  nix build --accept-flake-config --json --no-link "${targets[@]}" \
+    | jq -r '.[].outputs | to_entries[].value' \
+    | attic push --stdin cashudevkit-cache:cashudevkit
 
 # Build a statically-linked binary by profile name (requires nix)
 # Profiles: cdk-mintd-static, cdk-mintd-ldk-static, cdk-cli-static
@@ -57,6 +146,41 @@ build-static-all: (build-static "cdk-mintd-static") (build-static "cdk-mintd-ldk
   sha256sum -- *-x86_64 > SHA256SUMS
   echo "Checksums:"
   cat SHA256SUMS
+
+# Build the CI cache warmup targets locally.
+ci-cache-build:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  nix build -L --no-link \
+    '.#deps' \
+    '.#deps-msrv' \
+    '.#checks.x86_64-linux.workspace-clippy-all-targets' \
+    '.#dart-bindings' \
+    '.#kotlin-bindings' \
+    '.#go-bindings'
+
+# Push the locally built CI cache warmup targets to Cachix.
+ci-cache-push:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  nix build --json --no-link \
+    '.#deps' \
+    '.#deps-msrv' \
+    '.#checks.x86_64-linux.workspace-clippy-all-targets' \
+    '.#dart-bindings' \
+    '.#kotlin-bindings' \
+    '.#go-bindings' \
+    | jq -r '.[].outputs | to_entries[].value' \
+    | cachix push cashudevkit
+
+# Build and push CI cache warmup targets as they complete.
+ci-cache-watch:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  cachix watch-exec cashudevkit -- just ci-cache-build
 
 # run `cargo check` on everything
 check *ARGS="--workspace --all-targets":
@@ -88,14 +212,10 @@ test:
   # Unit/lib tests always run from source (not included in the nextest archive)
   cargo test --lib --workspace --exclude cdk-postgres
 
-  # Run pure integration tests
-  if [ -n "${CDK_ITEST_ARCHIVE:-}" ] && [ -f "$CDK_ITEST_ARCHIVE" ]; then
-    # Run the mint integration test from the pre-built nextest archive
-    cargo nextest run --archive-file "$CDK_ITEST_ARCHIVE" --workspace-remap . -E "binary(/^mint$/)"
-  else
-    # Run pure integration tests
-    cargo test -p cdk-integration-tests --test mint
-  fi
+  # Run the mint integration test (from the pre-built nextest archive when
+  # CDK_ITEST_ARCHIVE is set, otherwise via cargo test)
+  source ./misc/itest_helpers.sh
+  run_test mint
 
 test-units:
   #!/usr/bin/env bash
@@ -125,6 +245,11 @@ coverage:
   echo "Running unit tests coverage..."
   cargo llvm-cov --no-report --lib --workspace --exclude cdk-integration-tests
 
+  # Run cdk-nostr tests with all features; its npubcash/nwc modules are
+  # feature-gated, so the default-feature workspace run does not execute them.
+  echo "Running cdk-nostr feature-gated tests coverage..."
+  cargo llvm-cov --no-report --lib -p cdk-nostr --all-features
+
   # Run pure integration tests with coverage (memory backend)
   echo "Running pure integration tests coverage (memory)..."
   CDK_TEST_DB_TYPE=memory cargo llvm-cov --no-report -p cdk-integration-tests --test integration_tests_pure
@@ -132,6 +257,14 @@ coverage:
   # Run pure integration tests with coverage (sqlite backend)
   echo "Running pure integration tests coverage (sqlite)..."
   CDK_TEST_DB_TYPE=sqlite cargo llvm-cov --no-report -p cdk-integration-tests --test integration_tests_pure
+
+  # Run NWC e2e tests with coverage (requires nostr-rs-relay on PATH)
+  echo "Running NWC e2e tests coverage (memory)..."
+  CDK_TEST_DB_TYPE=memory cargo llvm-cov --no-report -p cdk-integration-tests --test nwc_e2e
+
+  # Run NIP-17 inbox e2e tests with coverage (requires nostr-rs-relay on PATH)
+  echo "Running NIP-17 inbox e2e tests coverage..."
+  cargo llvm-cov --no-report -p cdk-integration-tests --test nip17_inbox_e2e
 
   # Generate report
   echo "Generating coverage report..."
@@ -145,10 +278,16 @@ test-pure db="memory":
   fi
 
   if [ -n "${CDK_ITEST_ARCHIVE:-}" ] && [ -f "$CDK_ITEST_ARCHIVE" ]; then
-    # Run pure integration tests from nextest archive
-    CDK_TEST_DB_TYPE={{db}} cargo nextest run --archive-file "$CDK_ITEST_ARCHIVE" --workspace-remap . -E "binary(~integration_tests_pure)" -j 1
-    CDK_TEST_DB_TYPE={{db}} cargo nextest run --archive-file "$CDK_ITEST_ARCHIVE" --workspace-remap . -E "binary(~test_swap_flow)" -j 1
-    CDK_TEST_DB_TYPE={{db}} cargo nextest run --archive-file "$CDK_ITEST_ARCHIVE" --workspace-remap . -E "binary(~wallet_saga)" -j 1
+    # Run pure integration tests from nextest archive (extracted once, reused)
+    source ./misc/itest_helpers.sh
+    export CDK_TEST_DB_TYPE={{db}}
+    run_test integration_tests_pure -j 1
+    run_test test_swap_flow -j 1
+    run_test wallet_saga -j 1
+    run_test nwc_e2e -j 1
+    if [ "{{db}}" = memory ]; then
+      run_test nip17_inbox_e2e -j 1
+    fi
   else
     # Run pure integration tests (cargo test will only build what's needed for the test)
     CDK_TEST_DB_TYPE={{db}} cargo test -p cdk-integration-tests --test integration_tests_pure -- --test-threads 1
@@ -158,7 +297,43 @@ test-pure db="memory":
 
     # Run wallet saga tests
     CDK_TEST_DB_TYPE={{db}} cargo test -p cdk-integration-tests --test wallet_saga -- --test-threads 1
+
+    # Run NWC (NIP-47) e2e tests (requires nostr-rs-relay on PATH; skipped locally if absent)
+    CDK_TEST_DB_TYPE={{db}} cargo test -p cdk-integration-tests --test nwc_e2e -- --test-threads 1
+    if [ "{{db}}" = memory ]; then
+      cargo test -p cdk-integration-tests --test nip17_inbox_e2e -- --test-threads 1
+    fi
   fi
+
+# Run Redis cache clippy and unit tests against both single-node and cluster Redis.
+# Starts a single-node Redis (port 6379) and a 3-node cluster (ports 7001-7003)
+# using Nix-managed scripts, mirrors both code paths in cdk-axum cache.
+test-redis:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ ! -f Cargo.toml ]; then
+    cd {{invocation_directory()}}
+  fi
+
+  # Start both Redis topologies and stop them on exit
+  trap 'stop-redis-single; stop-redis-cluster' EXIT
+  start-redis-single
+  start-redis-cluster
+
+  # Lint once (compile-time only, topology is irrelevant for clippy)
+  CDK_MINTD_CACHE_BACKEND=redis \
+  CDK_MINTD_CACHE_REDIS_USE_CLUSTER=false \
+  CDK_MINTD_CACHE_REDIS_URL=redis://127.0.0.1:6379 \
+    cargo clippy -p cdk-axum --features redis -- -D warnings
+
+  # Run the full lib test suite once with both endpoint vars present.
+  # Each test constructs its own topology explicitly so a single invocation
+  # exercises both the single-node and cluster paths.
+  CDK_MINTD_CACHE_BACKEND=redis \
+  CDK_MINTD_CACHE_REDIS_URL=redis://127.0.0.1:6379 \
+  CDK_MINTD_CACHE_REDIS_CLUSTER_NODES=redis://127.0.0.1:7001,redis://127.0.0.1:7002,redis://127.0.0.1:7003 \
+    cargo test -p cdk-axum --features redis,integration-tests --lib
+
 
 # Mutation Testing Commands
 
@@ -177,6 +352,13 @@ mutants-cashu:
   set -euo pipefail
   echo "Running mutation tests on cashu crate..."
   cargo mutants --package cashu -vV
+
+# Run mutation tests on NUT-27 with wallet+nostr features enabled
+mutants-cashu-nut27-nostr:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  echo "Running mutation tests on cashu NUT-27 with Nostr features..."
+  cargo mutants --package cashu --no-config --file crates/cashu/src/nuts/nut27.rs --features wallet,nostr -vV
 
 # Run mutation tests on the cdk crate
 mutants-cdk:
@@ -348,27 +530,30 @@ test-nutshell:
 
   # Set environment variables and run tests
   export CDK_TEST_MINT_URL=http://127.0.0.1:3338
-  export LN_BACKEND=FAKEWALLET
+  export PAYMENT_BACKEND=FAKEWALLET
 
   # Track test results
   test_exit_code=0
 
   # Run first test and capture exit code
+  # Serialize tests (--test-threads=1) to avoid concurrent writes against
+  # Nutshell's SQLite backend, which can cause transient lock-acquisition
+  # failures under parallel load.
   echo "Running happy_path_mint_wallet test..."
-  if ! cargo test -p cdk-integration-tests --test happy_path_mint_wallet; then
+  if ! cargo test -p cdk-integration-tests --test happy_path_mint_wallet -- --test-threads=1; then
     echo "ERROR: happy_path_mint_wallet test failed"
     test_exit_code=1
   fi
 
   # Run second test and capture exit code
   echo "Running test_fees test..."
-  if ! cargo test -p cdk-integration-tests --test test_fees; then
+  if ! cargo test -p cdk-integration-tests --test test_fees -- --test-threads=1; then
     echo "ERROR: test_fees test failed"
     test_exit_code=1
   fi
 
   unset CDK_TEST_MINT_URL
-  unset LN_BACKEND
+  unset PAYMENT_BACKEND
 
   # Exit with error code if any test failed
   if [ $test_exit_code -ne 0 ]; then
@@ -410,24 +595,61 @@ lint:
   typos
   echo "All checks passed!"
 
+# Refresh stable and MSRV lockfiles, excluding registry releases newer than seven days.
 update-msrv-lock:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    nix develop --ignore-environment .#msrv --command bash -c '
-        cp Cargo.lock Cargo.lock.msrv
-        echo "Copied Cargo.lock to Cargo.lock.msrv (MSRV 1.85.0)"
+    nix develop --ignore-environment .#nightly --command bash -c '
+        export CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="7 days"
+        cargo_update() {
+            cargo -Z min-publish-age update "$@"
+        }
+
+        cargo_update
+        echo "Updated Cargo.lock with a seven-day minimum publish age"
+
+        lock_dir=$(mktemp -d /data/rust/tmp/cdk-msrv-lock.XXXXXX)
+        cleanup() {
+            rm -f "$lock_dir/Cargo.lock"
+            rmdir "$lock_dir" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+
+        cp Cargo.lock "$lock_dir/Cargo.lock"
+        export CARGO_RESOLVER_LOCKFILE_PATH="$lock_dir/Cargo.lock"
+        export CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS="fallback"
+
+        cargo_update
+        cargo_update home --precise 0.5.11
+        cargo_update typed-index-collections --precise 3.3.0
+        cargo_update simple_asn1 --precise 0.6.3
+        cargo_update cookie_store --precise 0.22.0
+        cargo_update serde_with --precise 3.17.0
+        cargo_update time --precise 0.3.44
+        cargo_update unicode-segmentation --precise 1.12.0
+        cargo_update idna_adapter --precise 1.2.1
+        cargo_update icu_normalizer --precise 2.0.1
+        cargo_update icu_provider --precise 2.1.1
+        cargo_update icu_locale_core --precise 2.1.1
+        cp "$lock_dir/Cargo.lock" Cargo.lock.msrv
+        echo "Updated Cargo.lock.msrv for MSRV 1.85.0"
     '
 
-    nix develop --ignore-environment .#stable --command bash -c '
-        cargo update
-        echo "Updated Cargo.lock (stable)"
-    '
-
-itest db:
+itest db suite="all":
   #!/usr/bin/env bash
   set -euo pipefail
-  bash ./misc/itests.sh "{{db}}"
+  bash ./misc/itests.sh "{{db}}" "{{suite}}"
+
+itest-ln db:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  bash ./misc/itests.sh "{{db}}" ln
+
+itest-onchain db:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  bash ./misc/itests.sh "{{db}}" onchain
 
 fake-mint-itest db:
   #!/usr/bin/env bash
@@ -552,16 +774,58 @@ check-wasm *ARGS="--target wasm32-unknown-unknown":
     echo
   done
 
-release m="":
+# Publish release crates; --skip-ci overrides the green-CI requirement.
+release *ARGS:
   #!/usr/bin/env bash
   set -euo pipefail
+
+  skip_ci=false
+  publish_args=()
+  for arg in "$@"; do
+    case "$arg" in
+      --skip-ci) skip_ci=true ;;
+      *) publish_args+=("$arg") ;;
+    esac
+  done
+
+  # Extract version from the cdk-ffi crate
+  VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "cdk-ffi") | .version')
+
+  if ! git ls-remote --exit-code --tags upstream "refs/tags/v$VERSION" > /dev/null; then
+    echo "Tag v$VERSION does not exist on upstream. Push the release tag before publishing crates."
+    exit 1
+  fi
+
+  # Publish only a clean checkout of the release commit.
+  SOURCE_SHA=$(gh api "repos/cashubtc/cdk/commits/v$VERSION" --jq .sha)
+  # In a colocated JJ workspace, `jj new <release>` puts Git HEAD at the release.
+  WORKTREE_STATUS=$(git status --porcelain --untracked-files=all)
+  if [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ] || [ -n "$WORKTREE_STATUS" ]; then
+    echo "Check out the clean release commit $SOURCE_SHA before publishing."
+    echo "For a colocated JJ workspace, use: jj new $SOURCE_SHA"
+    exit 1
+  fi
+  if [ "$skip_ci" = true ]; then
+    echo "Skipping green-CI requirement for release commit $SOURCE_SHA (--skip-ci)."
+  else
+    for workflow in ci.yml nutshell_itest.yml; do
+      result=$(gh api --paginate --slurp \
+        "repos/cashubtc/cdk/actions/workflows/$workflow/runs?head_sha=$SOURCE_SHA&per_page=100" \
+        --jq '[.[].workflow_runs[] | select(.event == "workflow_dispatch" or .event == "release" or (.event == "push" and (.head_branch == "main" or ((.head_branch // "") | test("^v[0-9][^/]*[.][0-9][^/]*[.]x$")))))] | max_by(.id) | if . == null then "missing" else (.status + "/" + .conclusion) end')
+      if [ "$result" != completed/success ]; then
+        echo "$workflow must pass full CI on $SOURCE_SHA before publishing (latest: $result)."
+        echo "To override the green-CI requirement, use: just release --skip-ci"
+        exit 1
+      fi
+    done
+  fi
 
   args=(
     "-p cashu"
     "-p cdk-prometheus"
     "-p cdk-http-client"
     "-p cdk-common"
-    "-p cdk-npubcash"
+    "-p cdk-nostr"
     "-p cdk-sql-common"
     "-p cdk-sqlite"
     "-p cdk-postgres"
@@ -573,9 +837,9 @@ release m="":
     "-p cdk-ffi"
     "-p cdk-axum"
     "-p cdk-mint-rpc"
+    "-p cdk-bdk"
     "-p cdk-cln"
     "-p cdk-lnd"
-    "-p cdk-lnbits"
     "-p cdk-ldk-node"
     "-p cdk-payment-processor"
     "-p cdk-cli"
@@ -585,24 +849,15 @@ release m="":
   for arg in "${args[@]}";
   do
     echo "Publishing '$arg'"
-    cargo publish $arg {{m}}
+    cargo publish $arg "${publish_args[@]}"
     echo
   done
 
-  # Extract version from the cdk-ffi crate
-  VERSION=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "cdk-ffi") | .version')
-
-  # Trigger Swift package release after Rust crates are published
-  echo "📦 Triggering Swift package release for version $VERSION..."
-  just ffi-release-swift $VERSION
-
-  # Trigger Kotlin package release after Rust crates are published
-  echo "📦 Triggering Kotlin package release for version $VERSION..."
-  just ffi-release-kotlin $VERSION
-
-  # Trigger Golang package release after Rust crates are published
-  echo "📦 Triggering Golang package release for version $VERSION..."
-  just ffi-release-go $VERSION
+  # Trigger all FFI binding releases (Dart, Kotlin, Swift, Go). These build
+  # cdk-ffi from the tagged source, not from crates.io, so they do not depend
+  # on the publish loop above and can be re-run on their own.
+  echo "📦 Triggering all FFI binding releases for version $VERSION..."
+  just ffi-release-all $VERSION
 
 check-docs:
   #!/usr/bin/env bash
@@ -611,7 +866,7 @@ check-docs:
     "-p cashu"
     "-p cdk-common"
     "-p cdk-http-client"
-    "-p cdk-npubcash"
+    "-p cdk-nostr"
     "-p cdk-sql-common"
     "-p cdk-sqlite"
     "-p cdk-postgres"
@@ -624,7 +879,6 @@ check-docs:
     "-p cdk-mint-rpc"
     "-p cdk-cln"
     "-p cdk-lnd"
-    "-p cdk-lnbits"
     "-p cdk-ldk-node"
     "-p cdk-prometheus"
     "-p cdk-payment-processor"
@@ -646,7 +900,7 @@ docs-strict:
     "-p cashu"
     "-p cdk-common"
     "-p cdk-http-client"
-    "-p cdk-npubcash"
+    "-p cdk-nostr"
     "-p cdk-sql-common"
     "-p cdk-sqlite"
     "-p cdk-postgres"
@@ -659,7 +913,6 @@ docs-strict:
     "-p cdk-mint-rpc"
     "-p cdk-cln"
     "-p cdk-lnd"
-    "-p cdk-lnbits"
     "-p cdk-ldk-node"
     "-p cdk-prometheus"
     "-p cdk-payment-processor"
@@ -688,10 +941,21 @@ _ffi-lib-ext:
 
 # Build the FFI library
 ffi-build *ARGS="--release":
-  cargo build {{ARGS}} --package cdk-ffi --features postgres
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  if [[ "{{ARGS}}" == *"--debug"* ]]; then
+    cargo build --package cdk-ffi
+  else
+    cargo build {{ARGS}} --package cdk-ffi
+  fi
+
+# Check the FFI crate
+ffi-check:
+  cargo check --package cdk-ffi --all-targets
 
 # Generate bindings for a specific language
-ffi-generate LANGUAGE *ARGS="--release": ffi-build
+ffi-generate LANGUAGE *ARGS="--release":
   #!/usr/bin/env bash
   set -euo pipefail
   LANG="{{LANGUAGE}}"
@@ -719,8 +983,9 @@ ffi-generate LANGUAGE *ARGS="--release": ffi-build
     BUILD_TYPE="release"
   else
     BUILD_TYPE="debug"
-    cargo build --package cdk-ffi --features postgres
   fi
+
+  just ffi-build {{ARGS}}
 
   LIB_EXT=$(just _ffi-lib-ext)
 
@@ -730,7 +995,8 @@ ffi-generate LANGUAGE *ARGS="--release": ffi-build
   cargo run -p cdk-ffi --bin uniffi-bindgen generate \
     --library target/$BUILD_TYPE/libcdk_ffi.$LIB_EXT \
     --language $LANG \
-    --out-dir target/bindings/$LANG
+    --out-dir target/bindings/$LANG \
+    --no-format
 
   echo "✅ $LANG bindings generated in target/bindings/$LANG/"
 
@@ -738,16 +1004,85 @@ ffi-generate LANGUAGE *ARGS="--release": ffi-build
 ffi-generate-python *ARGS="--release":
   just ffi-generate python {{ARGS}}
 
-# Generate Swift bindings (shorthand)
+# Generate Swift bindings and set up SPM package for testing
 ffi-generate-swift *ARGS="--release":
+  #!/usr/bin/env bash
+  set -euo pipefail
   just ffi-generate swift {{ARGS}}
+
+  ROOT="{{justfile_directory()}}"
+
+  # Determine build type
+  if [[ "{{ARGS}}" == *"--release"* ]] || [[ "{{ARGS}}" == "" ]]; then
+    BUILD_TYPE="release"
+  else
+    BUILD_TYPE="debug"
+  fi
+
+  # Set up SPM-compatible directory structure for testing.
+  # Derive the FFI module name from the generated header so the on-disk
+  # directory matches the target path written into Package.swift below
+  # (the header name follows uniffi.toml's module_name, e.g. CashuDevKitFFI).
+  BINDINGS_DIR="$ROOT/target/bindings/swift"
+  SWIFT_SRC="$ROOT/Sources/Cdk"
+  HEADER_NAME=$(basename "$BINDINGS_DIR/"*FFI.h)
+  MODULE_NAME="${HEADER_NAME%.h}"
+  FFI_MODULE="$ROOT/Sources/${MODULE_NAME}"
+  mkdir -p "$SWIFT_SRC" "$FFI_MODULE"
+
+  # Copy generated Swift sources
+  cp "$BINDINGS_DIR/"*.swift "$SWIFT_SRC/"
+
+  # Copy generated FFI header and create modulemap.
+  # The modulemap generated by uniffi uses 'link' directives; replace with one
+  # that lets SPM link the dylib via Package.swift linkerSettings instead.
+  cp "$BINDINGS_DIR/"*FFI.h "$FFI_MODULE/"
+  printf 'module %s {\n    header "%s"\n    export *\n}\n' \
+    "${MODULE_NAME}" "${HEADER_NAME}" > "$FFI_MODULE/module.modulemap"
+
+  LIB_DIR="$ROOT/target/$BUILD_TYPE"
+
+  # Generate Package.swift for local testing
+  {
+    echo '// swift-tools-version: 5.9'
+    echo '// Auto-generated for local testing — do not commit'
+    echo 'import PackageDescription'
+    echo ''
+    echo 'let package = Package('
+    echo '    name: "cdk-swift",'
+    echo '    platforms: [.macOS(.v13)],'
+    echo '    products: ['
+    echo '        .library(name: "Cdk", targets: ["Cdk"]),'
+    echo '    ],'
+    echo '    targets: ['
+    echo '        .systemLibrary('
+    echo "            name: \"${MODULE_NAME}\","
+    echo "            path: \"Sources/${MODULE_NAME}\""
+    echo '        ),'
+    echo '        .target('
+    echo '            name: "Cdk",'
+    echo "            dependencies: [\"${MODULE_NAME}\"],"
+    echo '            path: "Sources/Cdk",'
+    echo '            linkerSettings: ['
+    echo "                .unsafeFlags([\"-L${LIB_DIR}\", \"-lcdk_ffi\"]),"
+    echo '            ]'
+    echo '        ),'
+    echo '        .testTarget('
+    echo '            name: "CdkTests",'
+    echo '            dependencies: ["Cdk"],'
+    echo '            path: "bindings/swift/Tests"'
+    echo '        ),'
+    echo '    ]'
+    echo ')'
+  } > "$ROOT/Package.swift"
+  echo "📦 SPM package ready for testing"
 
 # Generate Kotlin bindings (shorthand)
 ffi-generate-kotlin *ARGS="--release":
   just ffi-generate kotlin {{ARGS}}
 
 # Generate bindings for all supported languages
-ffi-generate-all *ARGS="--release": ffi-build
+ffi-generate-all *ARGS="--release":
   @echo "🔧 Generating UniFFI bindings for all languages..."
   just ffi-generate python {{ARGS}}
   just ffi-generate swift {{ARGS}}
@@ -761,6 +1096,7 @@ ffi-test: ffi-generate-python
   echo "🧪 Running Python FFI tests..."
   python3 crates/cdk-ffi/tests/test_transactions.py
   python3 crates/cdk-ffi/tests/test_kvstore.py
+  python3 crates/cdk-ffi/tests/test_rate_limit.py
   echo "✅ Tests completed!"
 
 # Build debug version and generate Python bindings quickly (for development)
@@ -808,20 +1144,66 @@ ffi-test-bindings LANGUAGE: (ffi-generate LANGUAGE "--debug")
 ffi-test-python:
   just ffi-test-bindings python
 
+# Run live Python FFI tests against testnut.cashudevkit.org
+ffi-test-live-python:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  just ffi-generate python --debug
+
+  LIB_EXT=$(just _ffi-lib-ext)
+  echo "📦 Copying debug library to Python bindings directory..."
+  cp target/debug/libcdk_ffi.$LIB_EXT target/bindings/python/
+
+  echo "🧪 Running live Python FFI tests..."
+  python3 crates/cdk-ffi/tests/test_live_async_onchain_melt.py
+
+# Trigger all FFI binding releases (Dart, Kotlin, Swift, Go)
+ffi-release-all VERSION:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  echo "🚀 Triggering all FFI binding releases..."
+  echo "   Version: {{VERSION}}"
+  echo "   Tag: v{{VERSION}}"
+
+  gh workflow run "FFI - Publish All Bindings" \
+    --repo cashubtc/cdk \
+    --ref "v{{VERSION}}" \
+    --field release_tag="v{{VERSION}}" \
+    --field cdk_ref="v{{VERSION}}"
+
+  echo "✅ All FFI binding workflows triggered successfully!"
+
+# Trigger Dart Package release workflow
+ffi-release-dart VERSION:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  echo "🚀 Triggering Dart bindings workflow..."
+  echo "   Version: {{VERSION}}"
+  echo "   Tag: v{{VERSION}}"
+
+  gh workflow run "FFI - Dart Bindings" \
+    --repo cashubtc/cdk \
+    --ref "v{{VERSION}}" \
+    --field release_tag="v{{VERSION}}"
+
+  echo "✅ Dart workflow triggered successfully!"
+
 # Trigger Swift Package release workflow
 ffi-release-swift VERSION:
   #!/usr/bin/env bash
   set -euo pipefail
 
-  echo "🚀 Triggering Publish Swift Package workflow..."
+  echo "🚀 Triggering FFI - Swift Bindings workflow..."
   echo "   Version: {{VERSION}}"
-  echo "   CDK Ref: v{{VERSION}}"
 
   # Trigger the workflow using GitHub CLI
-  gh workflow run "Publish Swift Package" \
-    --repo cashubtc/cdk-swift \
-    --field version="{{VERSION}}" \
-    --field cdk_repo="cashubtc/cdk" \
+  gh workflow run "FFI - Swift Bindings" \
+    --repo cashubtc/cdk \
+    --ref "v{{VERSION}}" \
+    --field release_tag="v{{VERSION}}" \
     --field cdk_ref="v{{VERSION}}"
 
   echo "✅ Swift workflow triggered successfully!"
@@ -831,38 +1213,66 @@ ffi-release-kotlin VERSION:
   #!/usr/bin/env bash
   set -euo pipefail
 
-  echo "🚀 Triggering Publish Kotlin Package workflow..."
+  echo "🚀 Triggering Kotlin bindings workflow..."
   echo "   Version: {{VERSION}}"
   echo "   CDK Ref: v{{VERSION}}"
 
   # Trigger the workflow using GitHub CLI
-  gh workflow run "Publish Kotlin Bindings" \
-    --repo cashubtc/cdk-kotlin \
-    --field version="{{VERSION}}" \
-    --field cdk_repo="cashubtc/cdk" \
+  gh workflow run "FFI - Kotlin Bindings" \
+    --repo cashubtc/cdk \
+    --ref "v{{VERSION}}" \
+    --field release_tag="v{{VERSION}}" \
     --field cdk_ref="v{{VERSION}}"
 
   echo "✅ Kotlin workflow triggered successfully!"
+
+# Generate Go FFI bindings
+binding-go:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  LIB_EXT=$(just _ffi-lib-ext)
+  result=$(nix build .#go-bindings --print-out-paths --no-link)
+  rm -rf target/bindings/go
+  mkdir -p target/bindings/go target/release
+  cp -r "$result"/bindings/* target/bindings/go/
+  cp "$result/lib/libcdk_ffi_go.${LIB_EXT}" target/release/
+  chmod -R u+w target/bindings/go target/release/libcdk_ffi_go.${LIB_EXT}
+
+# Run Go binding tests
+test-go:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  export CGO_ENABLED=1
+  export GO111MODULE=off
+  export CGO_LDFLAGS="-L{{justfile_directory()}}/target/release -lcdk_ffi_go"
+  export LD_LIBRARY_PATH="{{justfile_directory()}}/target/release"
+  BINDINGS_DIR="target/bindings/go/cdkffi"
+
+  echo "🧪 Testing Go bindings compile..."
+  cd "$BINDINGS_DIR"
+  go build .
+  echo "✅ Go bindings compile successfully!"
+
+  echo "🧪 Running Go binding tests..."
+  cp "{{justfile_directory()}}/bindings/go/cdk_test.go" .
+  go test -v -count=1 -timeout 120s .
+  echo "✅ Go binding tests passed!"
 
 # Trigger Go Bindings release workflow
 ffi-release-go VERSION:
   #!/usr/bin/env bash
   set -euo pipefail
 
-  CDK_GO_WORKFLOW_REF="${CDK_GO_WORKFLOW_REF:-$(git -C "{{justfile_directory()}}" branch --show-current)}"
-
-  echo "🚀 Triggering Publish Go Bindings workflow..."
+  echo "🚀 Triggering Go bindings workflow..."
   echo "   Version: {{VERSION}}"
-  echo "   CDK Ref: v{{VERSION}}"
-  echo "   cdk-go workflow ref: ${CDK_GO_WORKFLOW_REF}"
+  echo "   Tag: v{{VERSION}}"
 
-  # Use the workflow file name so the trigger works before and after the
-  # display name change, and allow the cdk-go workflow branch to be overridden.
-  gh workflow run release.yml \
-    --repo cashubtc/cdk-go \
-    --ref "${CDK_GO_WORKFLOW_REF}" \
-    --field version="{{VERSION}}" \
-    --field cdk_repo="cashubtc/cdk" \
+  gh workflow run "FFI - Go Bindings" \
+    --repo cashubtc/cdk \
+    --ref "v{{VERSION}}" \
+    --field release_tag="v{{VERSION}}" \
     --field cdk_ref="v{{VERSION}}"
 
   echo "✅ Go workflow triggered successfully!"
@@ -893,28 +1303,32 @@ binding-kotlin:
   cd "{{justfile_directory()}}"
   result=$(nix build .#kotlin-bindings --print-out-paths --no-link)
   cp -r "$result"/* bindings/kotlin/
-  chmod -R u+w bindings/kotlin/cdk-jvm/src/main/kotlin bindings/kotlin/cdk-jvm/src/main/resources
+  chmod -R u+w bindings/kotlin
 
 # Run Kotlin binding tests
 test-kotlin:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "{{justfile_directory()}}/bindings/kotlin"
-  ./gradlew :cdk-jvm:test
+  ./gradlew -PcdkJvmOnly=true :cdk-jvm:test
 
-
-# Generate Swift FFI bindings and XCFramework
-binding-swift:
-  #!/usr/bin/env bash
-  set -euo pipefail
-  cd "{{justfile_directory()}}/bindings/swift"
-  ./generate-bindings.sh
+# Generate Swift bindings and the local SPM package
+binding-swift *ARGS="--release":
+  just ffi-generate-swift {{ARGS}}
 
 # Run Swift binding tests
 test-swift:
   #!/usr/bin/env bash
   set -euo pipefail
   cd "{{justfile_directory()}}"
+
+  # Determine which build dir contains the dylib
+  if [[ -f target/release/libcdk_ffi.dylib ]] || [[ -f target/release/libcdk_ffi.so ]]; then
+    LIB_DIR="$PWD/target/release"
+  else
+    LIB_DIR="$PWD/target/debug"
+  fi
+
   if [[ "$(uname)" == "Darwin" ]]; then
     # Use env -i to fully escape the Nix environment. The Nix shell injects
     # SDK paths and compiler flags that conflict with the Xcode Swift compiler.
@@ -923,7 +1337,8 @@ test-swift:
       PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
       SDKROOT="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)" \
       DEVELOPER_DIR="$(/usr/bin/xcode-select -p)" \
+      DYLD_LIBRARY_PATH="$LIB_DIR" \
       /usr/bin/swift test
   else
-    swift test
+    DYLD_LIBRARY_PATH="$LIB_DIR" swift test
   fi

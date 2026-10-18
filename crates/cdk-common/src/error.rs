@@ -3,12 +3,16 @@
 use std::array::TryFromSliceError;
 use std::fmt;
 
+#[cfg(feature = "mint")]
+use cashu::quote_id::QuoteId;
 use cashu::{CurrencyUnit, PaymentMethod};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::nuts::Id;
+#[cfg(feature = "mint")]
+use crate::payment::PaymentIdentifier;
 use crate::util::hex;
 #[cfg(feature = "wallet")]
 use crate::wallet::WalletKey;
@@ -38,6 +42,62 @@ pub enum Error {
     /// Invalid payment request
     #[error("Invalid payment request")]
     InvalidPaymentRequest,
+    /// A payment-request token was created but transport delivery failed.
+    ///
+    /// The token remains a pending send. Callers can pass `operation_id` to
+    /// `Wallet::revoke_send` to reclaim it if the receiver has not claimed it.
+    #[cfg(feature = "wallet")]
+    #[error("Payment token created but delivery failed for operation {operation_id}: {source}")]
+    PaymentRequestDeliveryFailed {
+        /// Pending send operation that can be passed to `Wallet::revoke_send`.
+        operation_id: uuid::Uuid,
+        /// Transport error returned while delivering the created token.
+        #[source]
+        source: Box<Error>,
+    },
+    /// The wallet's mint connector cannot deliver payment requests.
+    ///
+    /// Delivery rides the wallet's configured transport so proxy and Tor
+    /// settings cover the recipient request; a connector without delivery
+    /// support fails here rather than falling back to a direct request.
+    /// Preparing a payment raises this before reserving any proofs, so there
+    /// is no pending send to revoke.
+    #[cfg(feature = "wallet")]
+    #[error("Mint connector does not support payment request delivery")]
+    PaymentRequestDeliveryUnsupported,
+    /// The receiver endpoint answered a payment request delivery with a redirect.
+    ///
+    /// Delivery does not follow redirects: a redirected POST can be replayed as
+    /// a GET, dropping the proofs while still answering success. The payer has
+    /// to obtain the receiver's final URL instead. The outcome is ambiguous
+    /// because the payload was already on the wire when the redirect came back.
+    #[cfg(feature = "wallet")]
+    #[error("Payment request endpoint redirected the delivery")]
+    PaymentRequestDeliveryRedirected {
+        /// Redirect status, when the transport surfaced the response itself.
+        status: Option<u16>,
+    },
+    /// A third-party endpoint was reached over an unverified TLS connection.
+    ///
+    /// `danger_accept_invalid_certs` disables verification for the whole
+    /// client, and it is configured for the mint, not for an LNURL service or
+    /// a receiver URL a payment request chose. A MITM there swaps the invoice
+    /// or redeems the proofs. Preparing a NUT-18 payment raises this before
+    /// reserving any proofs, so there is no pending send to revoke.
+    #[cfg(feature = "wallet")]
+    #[error("Refusing to reach {host} without TLS certificate verification")]
+    UnverifiedTlsEndpoint {
+        /// Receiver host that would have been trusted without verification.
+        host: String,
+    },
+    /// No Nostr relay accepted a published event.
+    #[error("No Nostr relay accepted event {event_id}")]
+    NostrPublishFailed {
+        /// Event that could not be published.
+        event_id: String,
+        /// Relays that failed to accept the event.
+        failed_relays: Vec<String>,
+    },
     /// Bolt11 invoice does not have amount
     #[error("Invoice Amount undefined")]
     InvoiceAmountUndefined,
@@ -101,6 +161,9 @@ pub enum Error {
     /// Pubkey required
     #[error("Pubkey required")]
     PubkeyRequired,
+    /// Missing Pubkey
+    #[error("Missing pubkey")]
+    MissingPubkey,
     /// Invalid payment method
     #[error("Invalid payment method")]
     InvalidPaymentMethod,
@@ -127,6 +190,57 @@ pub enum Error {
     /// Operation timeout
     #[error("Operation timeout")]
     Timeout,
+    /// Onchain backend returned a `request_lookup_id` that does not match the
+    /// mint-supplied `quote_id` (or omitted it entirely).
+    ///
+    /// Onchain backends MUST echo the `quote_id` from
+    /// [`OnchainOutgoingPaymentOptions`](crate::payment::OnchainOutgoingPaymentOptions)
+    /// verbatim as `PaymentIdentifier::QuoteId(...)` in
+    /// [`PaymentQuoteResponse::request_lookup_id`](crate::payment::PaymentQuoteResponse).
+    /// This error is returned when the mint layer detects a violation of that
+    /// contract during onchain melt quote construction.
+    #[cfg(feature = "mint")]
+    #[error(
+        "Onchain backend returned request_lookup_id {got:?} that does not match \
+         mint-supplied quote_id {expected}"
+    )]
+    OnchainQuoteLookupIdMismatch {
+        /// Mint-generated quote id sent to the backend.
+        expected: QuoteId,
+        /// Whatever the backend returned in `request_lookup_id`.
+        got: Option<PaymentIdentifier>,
+    },
+
+    /// Mint attempted to construct an onchain melt quote with zero
+    /// `fee_options`.
+    ///
+    /// Per NUT the mint MUST return at least one `fee_options` item on every
+    /// onchain melt quote. This error is returned when either the payment
+    /// backend failed to provide any confirmation-target data, or the mint
+    /// would have persisted a quote with an empty `fee_options` vec.
+    #[cfg(feature = "mint")]
+    #[error("Onchain melt quote must contain at least one fee_options entry")]
+    OnchainFeeOptionsEmpty,
+
+    /// `fee_options` contains two entries with the same `fee_index` value.
+    ///
+    /// Retained for callers that may still handle older validation behavior.
+    /// Current onchain fee option validation only rejects empty option lists.
+    #[cfg(feature = "mint")]
+    #[error("Duplicate fee_index {index} in onchain fee_options")]
+    OnchainFeeOptionsDuplicateIndex {
+        /// The duplicated `fee_index` value.
+        index: u32,
+    },
+
+    /// The wallet's melt request specified a `fee_index` that does not match
+    /// any entry in the quote's `fee_options`.
+    #[cfg(feature = "mint")]
+    #[error("Onchain melt request fee_index {index} not found in quote fee_options")]
+    OnchainFeeIndexNotFound {
+        /// The unmatched `fee_index` value sent by the wallet.
+        index: u32,
+    },
 
     /// BIP353 address resolution error
     #[error("Failed to resolve BIP353 address: {0}")]
@@ -183,7 +297,7 @@ pub enum Error {
     /// regardless since the quote remains `Pending`.
     #[error("Timed out waiting for pending melt to complete{}", .last_backend_error.as_ref().map(|e| format!(": last backend error: {}", e)).unwrap_or_default())]
     PendingMeltTimeout {
-        /// Last error observed from the LN backend status check, if any.
+        /// Last error observed from the payment backend status check, if any.
         last_backend_error: Option<String>,
     },
     /// ecash already issued for quote
@@ -207,6 +321,9 @@ pub enum Error {
     /// Inactive Keyset
     #[error("Inactive Keyset")]
     InactiveKeyset,
+    /// Keyset has expired
+    #[error("Keyset has expired")]
+    ExpiredKeyset,
     /// Transaction unbalanced
     #[error("Inputs: `{0}`, Outputs: `{1}`, Expected Fee: `{2}`")]
     TransactionUnbalanced(u64, u64, u64),
@@ -230,6 +347,17 @@ pub enum Error {
         /// Actual number of outputs provided
         actual: usize,
         /// Maximum allowed outputs
+        max: usize,
+    },
+    /// Duplicate quote IDs provided in a batch request (NUT-29)
+    #[error("Duplicate quote IDs")]
+    DuplicateQuoteIds,
+    /// Maximum batch size exceeded (NUT-29)
+    #[error("Maximum batch size exceeded: {actual} provided, max {max}")]
+    BatchSizeExceeded {
+        /// Actual batch size provided
+        actual: usize,
+        /// Maximum allowed batch size
         max: usize,
     },
     /// Proof content too large (secret or witness exceeds max length)
@@ -297,6 +425,14 @@ pub enum Error {
     /// Max Fee Ecxeded
     #[error("Max fee exceeded")]
     MaxFeeExceeded,
+    /// Invalid NUT-13 restore options
+    #[error("Invalid NUT-13 restore options: `{field}` {reason}")]
+    InvalidNut13Options {
+        /// Invalid option field.
+        field: &'static str,
+        /// Reason the option value is invalid.
+        reason: &'static str,
+    },
     /// Url path segments could not be joined
     #[error("Url path segments could not be joined")]
     UrlPathSegments,
@@ -354,6 +490,9 @@ pub enum Error {
     /// Invalid transaction direction
     #[error("Invalid transaction direction")]
     InvalidTransactionDirection,
+    /// Invalid transaction status
+    #[error("Invalid transaction status")]
+    InvalidTransactionStatus,
     /// Invalid transaction id
     #[error("Invalid transaction id")]
     InvalidTransactionId,
@@ -503,8 +642,9 @@ mod tests {
     fn test_is_definitive_failure() {
         // Test definitive failures
         assert!(Error::AmountOverflow.is_definitive_failure());
-        assert!(Error::TokenAlreadySpent.is_definitive_failure());
         assert!(Error::MintingDisabled.is_definitive_failure());
+        assert!(Error::MaxInputsExceeded { actual: 2, max: 1 }.is_definitive_failure());
+        assert!(Error::MaxOutputsExceeded { actual: 2, max: 1 }.is_definitive_failure());
 
         // Test HTTP client errors (4xx) - simulated
         assert!(Error::HttpError(Some(400), "Bad Request".to_string()).is_definitive_failure());
@@ -517,6 +657,25 @@ mod tests {
         assert!(!Error::Timeout.is_definitive_failure());
         assert!(!Error::Internal.is_definitive_failure());
         assert!(!Error::ConcurrentUpdate.is_definitive_failure());
+        assert!(!Error::BlindedMessageAlreadySigned.is_definitive_failure());
+        assert!(!Error::TokenAlreadySpent.is_definitive_failure());
+        #[cfg(feature = "wallet")]
+        assert!(!Error::PaymentRequestDeliveryFailed {
+            operation_id: uuid::Uuid::new_v4(),
+            source: Box::new(Error::Timeout),
+        }
+        .is_definitive_failure());
+        #[cfg(feature = "wallet")]
+        assert!(Error::PaymentRequestDeliveryUnsupported.is_definitive_failure());
+        #[cfg(feature = "wallet")]
+        assert!(Error::UnverifiedTlsEndpoint {
+            host: "receiver.example.com".to_string(),
+        }
+        .is_definitive_failure());
+        #[cfg(feature = "wallet")]
+        assert!(
+            !Error::PaymentRequestDeliveryRedirected { status: Some(302) }.is_definitive_failure()
+        );
 
         // Test HTTP server errors (5xx)
         assert!(
@@ -530,6 +689,51 @@ mod tests {
 
         // Test HTTP network errors (no status)
         assert!(!Error::HttpError(None, "Connection refused".to_string()).is_definitive_failure());
+    }
+
+    #[test]
+    fn test_pending_states_are_ambiguous_failures() {
+        // In-flight pending states are indeterminate: the mint may still
+        // settle the operation, so reverting reserved proofs to Unspent and
+        // reusing them risks a double-spend or loss of funds.
+        assert!(!Error::TokenPending.is_definitive_failure());
+        assert!(!Error::PendingQuote.is_definitive_failure());
+    }
+
+    #[test]
+    fn test_max_outputs_and_inputs_error_responses_decode() {
+        let max_inputs = Error::from(ErrorResponse {
+            code: ErrorCode::MaxInputsExceeded,
+            detail: "Maximum inputs exceeded: 2 provided, max 1".to_string(),
+        });
+        assert!(matches!(
+            max_inputs,
+            Error::MaxInputsExceeded { actual: 2, max: 1 }
+        ));
+        assert!(max_inputs.is_definitive_failure());
+
+        let max_outputs = Error::from(ErrorResponse {
+            code: ErrorCode::MaxOutputsExceeded,
+            detail: "Maximum outputs exceeded: 2 provided, max 1".to_string(),
+        });
+        assert!(matches!(
+            max_outputs,
+            Error::MaxOutputsExceeded { actual: 2, max: 1 }
+        ));
+        assert!(max_outputs.is_definitive_failure());
+    }
+
+    #[cfg(feature = "mint")]
+    #[test]
+    fn payment_backend_error_response_redacts_backend_detail() {
+        const BACKEND_DETAIL: &str = "backend secret: rpc-token-123";
+        let error = Error::Payment(crate::payment::Error::Custom(BACKEND_DETAIL.to_string()));
+
+        let response = ErrorResponse::from(error);
+
+        assert_eq!(response.code, ErrorCode::Unknown(50000));
+        assert_eq!(response.detail, "Payment backend error");
+        assert!(!response.detail.contains(BACKEND_DETAIL));
     }
 }
 
@@ -567,27 +771,29 @@ impl Error {
             | Self::ExpiredQuote(_, _)
             | Self::AmountOutofLimitRange(_, _, _)
             | Self::UnpaidQuote
-            | Self::PendingQuote
             | Self::IssuedQuote
             | Self::PaidQuote
             | Self::MeltingDisabled
             | Self::UnknownKeySet
-            | Self::BlindedMessageAlreadySigned
             | Self::InactiveKeyset
+            | Self::ExpiredKeyset
             | Self::TransactionUnbalanced(_, _, _)
             | Self::DuplicateInputs
             | Self::DuplicateOutputs
+            | Self::MaxInputsExceeded { .. }
+            | Self::MaxOutputsExceeded { .. }
+            | Self::DuplicateQuoteIds
+            | Self::BatchSizeExceeded { .. }
             | Self::MultipleUnits
             | Self::UnitMismatch
             | Self::SigAllUsedInMelt
-            | Self::TokenAlreadySpent
-            | Self::TokenPending
             | Self::P2PKConditionsNotMet(_)
             | Self::DuplicateSignatureError
             | Self::LocktimeNotProvided
             | Self::InvalidSpendConditions(_)
             | Self::IncorrectWallet(_)
             | Self::MaxFeeExceeded
+            | Self::InvalidNut13Options { .. }
             | Self::DleqProofNotProvided
             | Self::IncorrectMint
             | Self::MultiMintTokenNotSupported
@@ -598,6 +804,7 @@ impl Error {
             | Self::IncorrectQuoteAmount
             | Self::InvoiceDescriptionUnsupported
             | Self::InvalidTransactionDirection
+            | Self::InvalidTransactionStatus
             | Self::InvalidTransactionId
             | Self::InvalidOperationKind
             | Self::InvalidOperationState
@@ -608,6 +815,12 @@ impl Error {
             | Self::Bip321Parse(_)
             | Self::Bip321Encode(_)
             | Self::LightningAddressParse(_) => true,
+
+            #[cfg(feature = "mint")]
+            Self::OnchainQuoteLookupIdMismatch { .. }
+            | Self::OnchainFeeOptionsEmpty
+            | Self::OnchainFeeOptionsDuplicateIndex { .. }
+            | Self::OnchainFeeIndexNotFound { .. } => true,
 
             // HTTP Errors
             Self::HttpError(Some(status), _) => {
@@ -620,6 +833,8 @@ impl Error {
             Self::Timeout
             | Self::Internal
             | Self::UnknownPaymentState
+            | Self::PendingQuote
+            | Self::TokenPending
             | Self::CouldNotGetMintInfo
             | Self::UnknownErrorResponse(_)
             | Self::InvalidMintResponse(_)
@@ -630,10 +845,19 @@ impl Error {
             | Self::Bip353Resolve(_)
             | Self::LightningAddressRequest(_) => false,
 
+            #[cfg(feature = "wallet")]
+            Self::PaymentRequestDeliveryFailed { .. }
+            | Self::PaymentRequestDeliveryRedirected { .. } => false,
+
+            #[cfg(feature = "wallet")]
+            Self::PaymentRequestDeliveryUnsupported
+            | Self::UnverifiedTlsEndpoint { .. } => true,
+
             // Network/IO/Parsing Errors (Usually ambiguous as they could happen reading response)
             Self::HttpError(None, _) // No status code means network error
             | Self::SerdeJsonError(_) // Could be malformed success response
             | Self::Database(_)
+            | Self::NostrPublishFailed { .. }
             | Self::Custom(_) => false,
 
             // Auth Errors (Generally definitive if rejected)
@@ -702,7 +926,6 @@ impl From<crate::nuts::nut10::Error> for Error {
 ///
 /// See NUT definition in [00](https://github.com/cashubtc/nuts/blob/main/00.md)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct ErrorResponse {
     /// Error Code
     pub code: ErrorCode,
@@ -879,6 +1102,10 @@ impl From<Error> for ErrorResponse {
                 code: ErrorCode::KeysetInactive,
                 detail: err.to_string(),
             },
+            Error::ExpiredKeyset => ErrorResponse {
+                code: ErrorCode::KeysetExpired,
+                detail: err.to_string(),
+            },
             Error::AmountLessNotAllowed => ErrorResponse {
                 code: ErrorCode::AmountlessInvoiceNotSupported,
                 detail: err.to_string(),
@@ -960,6 +1187,14 @@ impl From<Error> for ErrorResponse {
                 code: ErrorCode::Unknown(50000),
                 detail: err.to_string(),
             },
+            #[cfg(feature = "mint")]
+            Error::Payment(payment_error) => {
+                tracing::error!(error = %payment_error, "Payment backend error");
+                ErrorResponse {
+                    code: ErrorCode::Unknown(50000),
+                    detail: "Payment backend error".to_string(),
+                }
+            }
 
             // Transaction/amount errors
             Error::SplitValuesGreater => ErrorResponse {
@@ -1006,6 +1241,14 @@ impl From<Error> for ErrorResponse {
                 code: ErrorCode::MaxOutputsExceeded,
                 detail: err.to_string()
             },
+            Error::DuplicateQuoteIds => ErrorResponse {
+                code: ErrorCode::DuplicateQuoteIds,
+                detail: err.to_string(),
+            },
+            Error::BatchSizeExceeded { .. } => ErrorResponse {
+                code: ErrorCode::BatchSizeExceeded,
+                detail: err.to_string(),
+            },
             // Fallback for any remaining errors - use Unknown(99999) instead of TokenNotVerified
             _ => ErrorResponse {
                 code: ErrorCode::Unknown(50000),
@@ -1041,6 +1284,13 @@ impl From<crate::database::Error> for Error {
     }
 }
 
+fn parse_limit_counts(detail: &str) -> Option<(usize, usize)> {
+    let (_, counts) = detail.rsplit_once(": ")?;
+    let (actual, max) = counts.split_once(" provided, max ")?;
+
+    Some((actual.trim().parse().ok()?, max.trim().parse().ok()?))
+}
+
 impl From<ErrorResponse> for Error {
     fn from(err: ErrorResponse) -> Error {
         match err.code {
@@ -1057,6 +1307,16 @@ impl From<ErrorResponse> for Error {
             }
             ErrorCode::DuplicateInputs => Self::DuplicateInputs,
             ErrorCode::DuplicateOutputs => Self::DuplicateOutputs,
+            ErrorCode::MaxInputsExceeded => {
+                let (actual, max) = parse_limit_counts(&err.detail).unwrap_or((0, 0));
+                Self::MaxInputsExceeded { actual, max }
+            }
+            ErrorCode::MaxOutputsExceeded => {
+                let (actual, max) = parse_limit_counts(&err.detail).unwrap_or((0, 0));
+                Self::MaxOutputsExceeded { actual, max }
+            }
+            ErrorCode::DuplicateQuoteIds => Self::DuplicateQuoteIds,
+            ErrorCode::BatchSizeExceeded => Self::BatchSizeExceeded { actual: 0, max: 0 },
             ErrorCode::MultipleUnits => Self::MultipleUnits,
             ErrorCode::UnitMismatch => Self::UnitMismatch,
             ErrorCode::AmountlessInvoiceNotSupported => Self::AmountLessNotAllowed,
@@ -1065,6 +1325,7 @@ impl From<ErrorResponse> for Error {
             // 12xxx - Keyset errors
             ErrorCode::KeysetNotFound => Self::UnknownKeySet,
             ErrorCode::KeysetInactive => Self::InactiveKeyset,
+            ErrorCode::KeysetExpired => Self::ExpiredKeyset,
             // 20xxx - Quote/Payment errors
             ErrorCode::QuoteNotPaid => Self::UnpaidQuote,
             ErrorCode::TokensAlreadyIssued => Self::IssuedQuote,
@@ -1088,9 +1349,20 @@ impl From<ErrorResponse> for Error {
     }
 }
 
+#[cfg(feature = "http")]
+impl From<crate::HttpError> for Error {
+    fn from(err: crate::HttpError) -> Self {
+        match &err {
+            crate::HttpError::Status { status, message } => {
+                Self::HttpError(Some(*status), message.clone())
+            }
+            _ => Self::HttpError(None, err.to_string()),
+        }
+    }
+}
+
 /// Possible Error Codes
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub enum ErrorCode {
     // 10xxx - Proof/Token verification errors
     /// Proof verification failed (10001)
@@ -1127,11 +1399,17 @@ pub enum ErrorCode {
     MaxInputsExceeded,
     /// The max number of outputs is exceeded
     MaxOutputsExceeded,
+    /// Duplicate quote IDs provided in a batch (11016)
+    DuplicateQuoteIds,
+    /// Batch size exceeds mint limit (11017)
+    BatchSizeExceeded,
     // 12xxx - Keyset errors
     /// Keyset is not known (12001)
     KeysetNotFound,
     /// Keyset is inactive, cannot sign messages (12002)
     KeysetInactive,
+    /// Keyset expired (12003)
+    KeysetExpired,
 
     // 20xxx - Quote/Payment errors
     /// Quote request is not paid (20001)
@@ -1198,9 +1476,12 @@ impl ErrorCode {
             11013 => Self::UnsupportedUnit,
             11014 => Self::MaxInputsExceeded,
             11015 => Self::MaxOutputsExceeded,
+            11016 => Self::DuplicateQuoteIds,
+            11017 => Self::BatchSizeExceeded,
             // 12xxx - Keyset errors
             12001 => Self::KeysetNotFound,
             12002 => Self::KeysetInactive,
+            12003 => Self::KeysetExpired,
             // 20xxx - Quote/Payment errors
             20001 => Self::QuoteNotPaid,
             20002 => Self::TokensAlreadyIssued,
@@ -1244,9 +1525,12 @@ impl ErrorCode {
             Self::UnsupportedUnit => 11013,
             Self::MaxInputsExceeded => 11014,
             Self::MaxOutputsExceeded => 11015,
+            Self::DuplicateQuoteIds => 11016,
+            Self::BatchSizeExceeded => 11017,
             // 12xxx - Keyset errors
             Self::KeysetNotFound => 12001,
             Self::KeysetInactive => 12002,
+            Self::KeysetExpired => 12003,
             // 20xxx - Quote/Payment errors
             Self::QuoteNotPaid => 20001,
             Self::TokensAlreadyIssued => 20002,

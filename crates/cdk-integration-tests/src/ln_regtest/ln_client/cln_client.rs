@@ -11,17 +11,17 @@ use cdk::util::hex;
 use cln_rpc::model::requests::{
     ConnectRequest, FetchinvoiceRequest, FundchannelRequest, GetinfoRequest, InvoiceRequest,
     ListchannelsRequest, ListfundsRequest, ListinvoicesRequest, ListpaysRequest,
-    ListtransactionsRequest, NewaddrRequest, OfferRequest, PayRequest,
+    ListtransactionsRequest, NewaddrRequest, OfferRequest, XpayRequest,
 };
 use cln_rpc::model::responses::{
     GetinfoResponse, ListchannelsResponse, ListfundsOutputsStatus, ListinvoicesInvoicesStatus,
-    ListpaysPaysStatus, PayStatus,
+    ListpaysPaysStatus,
 };
 use cln_rpc::primitives::{Amount, AmountOrAll, AmountOrAny, PublicKey};
 use cln_rpc::{ClnRpc, Request};
 use lightning::offers::offer::Offer;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 use super::types::{Balance, ConnectInfo};
@@ -35,7 +35,31 @@ pub struct ClnClient {
     pub rpc_path: PathBuf,
 }
 
+fn reconcile_outgoing_payment_status<I>(statuses: I) -> InvoiceStatus
+where
+    I: IntoIterator<Item = ListpaysPaysStatus>,
+{
+    let status = statuses.into_iter().min_by_key(|status| match status {
+        ListpaysPaysStatus::COMPLETE => 0_u8,
+        ListpaysPaysStatus::PENDING => 1,
+        ListpaysPaysStatus::FAILED => 2,
+    });
+
+    match status {
+        Some(ListpaysPaysStatus::COMPLETE) => InvoiceStatus::Paid,
+        Some(ListpaysPaysStatus::PENDING) => InvoiceStatus::Pending,
+        Some(ListpaysPaysStatus::FAILED) => InvoiceStatus::Failed,
+        None => InvoiceStatus::Unpaid,
+    }
+}
+
 impl ClnClient {
+    async fn reconnect(&self) -> Result<()> {
+        let cln_client = cln_rpc::ClnRpc::new(&self.rpc_path).await?;
+        *self.client.lock().await = cln_client;
+        Ok(())
+    }
+
     /// Open a private (unannounced) channel to a peer
     pub async fn open_private_channel(
         &self,
@@ -136,33 +160,110 @@ impl ClnClient {
         }
     }
 
+    pub async fn wait_channel_active_with_peer(&self, peer_id: &str) -> Result<()> {
+        let peer_id = PublicKey::from_str(peer_id)?.to_string();
+        let mut count = 0;
+        while count < 100 {
+            let channels = self.list_channels().await?;
+            let peer_channels = channels
+                .channels
+                .iter()
+                .filter(|channel| {
+                    channel.source.to_string() == peer_id
+                        || channel.destination.to_string() == peer_id
+                })
+                .collect::<Vec<_>>();
+
+            if peer_channels.iter().any(|channel| channel.active) {
+                tracing::info!("CLN channel with peer {peer_id} is active");
+                return Ok(());
+            }
+
+            if peer_channels.is_empty() {
+                tracing::warn!("No CLN channel found with peer {peer_id}");
+            } else {
+                tracing::warn!("CLN channel with peer {peer_id} is not active yet");
+            }
+
+            count += 1;
+            sleep(Duration::from_secs(2)).await;
+        }
+
+        bail!("Time out exceeded waiting for active CLN channel with peer {peer_id}")
+    }
+
     pub async fn pay_bolt12_offer(
         &self,
         amount_msat: Option<u64>,
         offer: String,
     ) -> Result<String> {
-        let mut cln_client = self.client.lock().await;
+        let max_attempts = 5;
+        let mut attempts_remaining = max_attempts;
+        let mut delay = Duration::from_millis(500);
 
-        let cln_response = cln_client
-            .call_typed(&FetchinvoiceRequest {
-                amount_msat: amount_msat.map(Amount::from_msat),
-                payer_note: None,
-                quantity: None,
-                recurrence_counter: None,
-                recurrence_label: None,
-                recurrence_start: None,
-                timeout: None,
-                offer,
-                bip353: None,
-                payer_metadata: None,
+        let invoice = loop {
+            let attempt = max_attempts - attempts_remaining + 1;
+            let cln_response = timeout(Duration::from_secs(15), async {
+                let mut cln_client = self.client.lock().await;
+                cln_client
+                    .call_typed(&FetchinvoiceRequest {
+                        amount_msat: amount_msat.map(Amount::from_msat),
+                        payer_note: None,
+                        quantity: None,
+                        recurrence_counter: None,
+                        recurrence_label: None,
+                        recurrence_start: None,
+                        timeout: None,
+                        offer: offer.clone(),
+                        bip353: None,
+                        payer_metadata: None,
+                    })
+                    .await
             })
-            .await?;
+            .await;
 
-        let invoice = cln_response.invoice;
+            match cln_response {
+                Ok(Ok(response)) => break response.invoice,
+                Ok(Err(err)) => {
+                    let err = anyhow!("CLN fetchinvoice for BOLT12 offer failed: {err}");
+                    tracing::warn!(
+                        "CLN fetchinvoice for BOLT12 offer failed on attempt {attempt}/{max_attempts}: {err}"
+                    );
 
-        drop(cln_client);
+                    attempts_remaining -= 1;
+                    if attempts_remaining == 0 {
+                        return Err(err);
+                    }
 
-        self.pay_invoice(invoice).await
+                    sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(5));
+                }
+                Err(_) => {
+                    let err =
+                        anyhow!("CLN fetchinvoice for BOLT12 offer timed out after 15 seconds");
+                    tracing::warn!(
+                        "CLN fetchinvoice for BOLT12 offer failed on attempt {attempt}/{max_attempts}: {err}"
+                    );
+                    if let Err(reconnect_err) = self.reconnect().await {
+                        tracing::warn!(
+                            "Failed to reconnect CLN RPC after fetchinvoice timeout: {reconnect_err}"
+                        );
+                    }
+
+                    attempts_remaining -= 1;
+                    if attempts_remaining == 0 {
+                        return Err(err);
+                    }
+
+                    sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, Duration::from_secs(5));
+                }
+            }
+        };
+
+        self.pay_invoice(invoice)
+            .await
+            .map_err(|err| anyhow!("CLN failed to pay fetched BOLT12 invoice: {err}"))
     }
 
     pub async fn get_bolt12_offer(
@@ -198,7 +299,9 @@ impl ClnClient {
                 recurrence_base: None,
                 recurrence_limit: None,
                 recurrence_paywindow: None,
-                recurrence_start_any_period: None,
+                optional_recurrence: None,
+                proportional_amount: None,
+                fronting_nodes: None,
             })
             .await?;
 
@@ -409,39 +512,23 @@ impl LightningClient for ClnClient {
     async fn pay_invoice(&self, bolt11: String) -> Result<String> {
         let mut cln_client = self.client.lock().await;
 
-        let cln_response = cln_client
-            .call(cln_rpc::Request::Pay(PayRequest {
-                bolt11,
+        let pay_response = cln_client
+            .call_typed(&XpayRequest {
+                invstring: bolt11,
                 amount_msat: None,
                 label: None,
-                riskfactor: None,
-                maxfeepercent: None,
-                retry_for: None,
+                dev_use_shadow: None,
+                retry_for: Some(10),
                 maxdelay: None,
-                exemptfee: None,
                 localinvreqid: None,
-                exclude: None,
                 maxfee: None,
-                description: None,
                 partial_msat: None,
-            }))
+                payer_note: None,
+                layers: None,
+            })
             .await?;
 
-        // match return_error {
-        //     true => {
-        //         bail!("Lighiting error");
-        //     }
-        //     false => response,
-        // }
-
-        match cln_response {
-            cln_rpc::Response::Pay(pay_response) => {
-                Ok(hex::encode(pay_response.payment_preimage.to_vec()))
-            }
-            _ => {
-                bail!("CLN returned wrong response kind");
-            }
-        }
+        Ok(hex::encode(pay_response.payment_preimage.to_vec()))
     }
 
     async fn wait_chain_sync(&self) -> Result<()> {
@@ -449,7 +536,7 @@ impl LightningClient for ClnClient {
         while count < 100 {
             let info = self.get_info().await?;
 
-            if info.warning_lightningd_sync.is_none() || info.warning_bitcoind_sync.is_none() {
+            if info.warning_lightningd_sync.is_none() && info.warning_bitcoind_sync.is_none() {
                 tracing::info!("CLN completed chain sync");
                 return Ok(());
             }
@@ -548,18 +635,9 @@ impl LightningClient for ClnClient {
             .await?;
 
         let state = match cln_response {
-            cln_rpc::Response::ListPays(pay_response) => {
-                let pay = pay_response.pays.first();
-
-                match pay {
-                    Some(pay) => match pay.status {
-                        ListpaysPaysStatus::COMPLETE => InvoiceStatus::Paid,
-                        ListpaysPaysStatus::PENDING => InvoiceStatus::Pending,
-                        ListpaysPaysStatus::FAILED => InvoiceStatus::Failed,
-                    },
-                    None => InvoiceStatus::Unpaid,
-                }
-            }
+            cln_rpc::Response::ListPays(pay_response) => reconcile_outgoing_payment_status(
+                pay_response.pays.into_iter().map(|pay| pay.status),
+            ),
             _ => {
                 bail!("Wrong cln response")
             }
@@ -602,33 +680,23 @@ impl LightningClient for ClnClient {
         };
 
         let cln_response = cln_client
-            .call(Request::Pay(PayRequest {
-                bolt11: invoice,
+            .call_typed(&XpayRequest {
+                invstring: invoice,
                 amount_msat: None,
                 label: None,
-                riskfactor: None,
-                maxfeepercent: None,
-                retry_for: None,
+                dev_use_shadow: None,
+                retry_for: Some(10),
                 maxdelay: None,
-                exemptfee: None,
                 localinvreqid: None,
-                exclude: None,
                 maxfee: None,
-                description: None,
                 partial_msat: None,
-            }))
+                payer_note: None,
+                layers: None,
+            })
             .await;
 
         let response = match cln_response {
-            Ok(cln_rpc::Response::Pay(pay_response)) => {
-                match pay_response.status {
-                    PayStatus::COMPLETE => (),
-                    PayStatus::PENDING => bail!("Invoice pending"),
-                    PayStatus::FAILED => bail!("Could not pay invoice"),
-                }
-
-                pay_response.payment_preimage
-            }
+            Ok(pay_response) => pay_response.payment_preimage,
             _ => {
                 tracing::error!("Error attempting to pay invoice");
                 bail!("Could not pay bolt12 offer")
@@ -652,5 +720,35 @@ pub fn amount_for_offer(offer: &Offer) -> Result<Amount> {
         } => {
             bail!("Unsupported unit")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outgoing_payment_status_prefers_complete_over_stale_failure() {
+        let status = reconcile_outgoing_payment_status([
+            ListpaysPaysStatus::FAILED,
+            ListpaysPaysStatus::COMPLETE,
+        ]);
+
+        assert_eq!(status, InvoiceStatus::Paid);
+    }
+
+    #[test]
+    fn outgoing_payment_status_prefers_pending_over_failure() {
+        let status = reconcile_outgoing_payment_status([
+            ListpaysPaysStatus::FAILED,
+            ListpaysPaysStatus::PENDING,
+        ]);
+
+        assert_eq!(status, InvoiceStatus::Pending);
+    }
+
+    #[test]
+    fn outgoing_payment_status_is_unpaid_without_attempts() {
+        assert_eq!(reconcile_outgoing_payment_status([]), InvoiceStatus::Unpaid);
     }
 }

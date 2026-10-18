@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
 use cdk_common::bitcoin;
+use cdk_common::rate_limit::RateLimitConfig;
 use cdk_common::wallet::Wallet as WalletTraitDef;
 
 use crate::error::FfiError;
@@ -23,9 +24,10 @@ impl WalletTraitDef for Wallet {
     type MintUrl = MintUrl;
     type CurrencyUnit = CurrencyUnit;
     type MintInfo = MintInfo;
-    type KeySetInfo = KeySetInfo;
+    type KeySetInfo = KeySet;
     type MintQuote = MintQuote;
     type MeltQuote = MeltQuote;
+    type CrossMintTransferQuote = CrossMintTransferQuote;
     type PaymentMethod = PaymentMethod;
     type MeltOptions = MeltOptions;
     type OperationId = String;
@@ -33,68 +35,53 @@ impl WalletTraitDef for Wallet {
     type PreparedMelt<'a> = PreparedMelt;
     type Subscription = Arc<crate::types::ActiveSubscription>;
     type SubscribeParams = crate::types::SubscribeParams;
+    type RecoveryReport = RecoveryReport;
 
     fn mint_url(&self) -> Self::MintUrl {
-        self.inner().mint_url.clone().into()
+        Wallet::mint_url(self)
     }
 
     fn unit(&self) -> Self::CurrencyUnit {
-        self.inner().unit.clone().into()
+        Wallet::unit(self)
     }
 
     async fn total_balance(&self) -> Result<Self::Amount, Self::Error> {
-        let balance = WalletTraitDef::total_balance(self.inner().as_ref()).await?;
-        Ok(balance.into())
+        Wallet::total_balance(self).await
     }
 
     async fn total_pending_balance(&self) -> Result<Self::Amount, Self::Error> {
-        let balance = WalletTraitDef::total_pending_balance(self.inner().as_ref()).await?;
-        Ok(balance.into())
+        Wallet::total_pending_balance(self).await
     }
 
     async fn total_reserved_balance(&self) -> Result<Self::Amount, Self::Error> {
-        let balance = WalletTraitDef::total_reserved_balance(self.inner().as_ref()).await?;
-        Ok(balance.into())
+        Wallet::total_reserved_balance(self).await
     }
 
     async fn fetch_mint_info(&self) -> Result<Option<Self::MintInfo>, Self::Error> {
-        let info = WalletTraitDef::fetch_mint_info(self.inner().as_ref()).await?;
-        Ok(info.map(Into::into))
+        Wallet::fetch_mint_info(self).await
     }
 
     async fn load_mint_info(&self) -> Result<Self::MintInfo, Self::Error> {
-        let info = WalletTraitDef::load_mint_info(self.inner().as_ref()).await?;
-        Ok(info.into())
+        Wallet::load_mint_info(self).await
     }
 
-    async fn refresh_keysets(&self) -> Result<Vec<Self::KeySetInfo>, Self::Error> {
-        let keysets = WalletTraitDef::refresh_keysets(self.inner().as_ref()).await?;
+    async fn keysets(
+        &self,
+        policy: cdk_common::wallet::KeysetLoadPolicy,
+    ) -> Result<Vec<Self::KeySetInfo>, Self::Error> {
+        let keysets = WalletTraitDef::keysets(self.inner().as_ref(), policy).await?;
         Ok(keysets.into_iter().map(Into::into).collect())
     }
 
-    async fn get_active_keyset(&self) -> Result<Self::KeySetInfo, Self::Error> {
-        let keyset = WalletTraitDef::get_active_keyset(self.inner().as_ref()).await?;
-        Ok(keyset.into())
+    async fn active_keyset(&self) -> Result<Self::KeySetInfo, Self::Error> {
+        Wallet::active_keyset(self).await
     }
 
-    async fn load_keyset_keys(
+    async fn keyset(
         &self,
         keyset_id: cdk_common::nuts::Id,
-    ) -> Result<cdk_common::nuts::Keys, Self::Error> {
-        let keys = WalletTraitDef::load_keyset_keys(self.inner().as_ref(), keyset_id).await?;
-        Ok(keys)
-    }
-
-    async fn get_mint_keysets(
-        &self,
-        filter: cdk_common::wallet::KeysetFilter,
-    ) -> Result<Vec<Self::KeySetInfo>, Self::Error> {
-        let keysets = WalletTraitDef::get_mint_keysets(self.inner().as_ref(), filter).await?;
-        Ok(keysets.into_iter().map(Into::into).collect())
-    }
-
-    async fn fetch_active_keyset(&self) -> Result<Self::KeySetInfo, Self::Error> {
-        let keyset = WalletTraitDef::fetch_active_keyset(self.inner().as_ref()).await?;
+    ) -> Result<Self::KeySetInfo, Self::Error> {
+        let keyset = WalletTraitDef::keyset(self.inner().as_ref(), keyset_id).await?;
         Ok(keyset.into())
     }
 
@@ -132,15 +119,7 @@ impl WalletTraitDef for Wallet {
         description: Option<String>,
         extra: Option<String>,
     ) -> Result<Self::MintQuote, Self::Error> {
-        let quote = WalletTraitDef::mint_quote(
-            self.inner().as_ref(),
-            method.into(),
-            amount.map(Into::into),
-            description,
-            extra,
-        )
-        .await?;
-        Ok(quote.into())
+        Wallet::mint_quote(self, method, amount, description, extra).await
     }
 
     async fn melt_quote(
@@ -150,12 +129,16 @@ impl WalletTraitDef for Wallet {
         options: Option<Self::MeltOptions>,
         extra: Option<String>,
     ) -> Result<Self::MeltQuote, Self::Error> {
-        let quote = WalletTraitDef::melt_quote(
+        Wallet::melt_quote(self, method, request, options, extra).await
+    }
+
+    async fn cross_mint_transfer_quote_max(
+        &self,
+        target_wallet: &Self,
+    ) -> Result<Self::CrossMintTransferQuote, Self::Error> {
+        let quote = WalletTraitDef::cross_mint_transfer_quote_max(
             self.inner().as_ref(),
-            method.into(),
-            request,
-            options.map(Into::into),
-            extra,
+            target_wallet.inner().as_ref(),
         )
         .await?;
         Ok(quote.into())
@@ -194,8 +177,11 @@ impl WalletTraitDef for Wallet {
     }
 
     async fn check_all_pending_proofs(&self) -> Result<Self::Amount, Self::Error> {
-        let amount = WalletTraitDef::check_all_pending_proofs(self.inner().as_ref()).await?;
-        Ok(amount.into())
+        Wallet::check_all_pending_proofs(self).await
+    }
+
+    async fn recover_incomplete_sagas(&self) -> Result<Self::RecoveryReport, Self::Error> {
+        Wallet::recover_incomplete_sagas(self).await
     }
 
     async fn check_proofs_spent(
@@ -256,22 +242,15 @@ impl WalletTraitDef for Wallet {
     }
 
     async fn get_pending_sends(&self) -> Result<Vec<String>, Self::Error> {
-        let ids = WalletTraitDef::get_pending_sends(self.inner().as_ref()).await?;
-        Ok(ids.into_iter().map(|id| id.to_string()).collect())
+        Wallet::get_pending_sends(self).await
     }
 
     async fn revoke_send(&self, operation_id: String) -> Result<Self::Amount, Self::Error> {
-        let uuid = uuid::Uuid::parse_str(&operation_id)
-            .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
-        let amount = WalletTraitDef::revoke_send(self.inner().as_ref(), uuid).await?;
-        Ok(amount.into())
+        Wallet::revoke_send(self, operation_id).await
     }
 
     async fn check_send_status(&self, operation_id: String) -> Result<bool, Self::Error> {
-        let uuid = uuid::Uuid::parse_str(&operation_id)
-            .map_err(|e| FfiError::internal(format!("Invalid operation ID: {}", e)))?;
-        let claimed = WalletTraitDef::check_send_status(self.inner().as_ref(), uuid).await?;
-        Ok(claimed)
+        Wallet::check_send_status(self, operation_id).await
     }
 
     async fn mint(
@@ -290,6 +269,12 @@ impl WalletTraitDef for Wallet {
         Ok(proofs)
     }
 
+    async fn mint_unissued_quotes(&self) -> Result<Self::Amount, Self::Error> {
+        Wallet::mint_unissued_quotes(self).await
+    }
+
+    /// Forwards the persisted quote, including its database version and ownership.
+    /// Propagates quote ID validation and database reload errors.
     async fn check_mint_quote_status(
         &self,
         quote_id: &str,
@@ -299,6 +284,7 @@ impl WalletTraitDef for Wallet {
         Ok(quote.into())
     }
 
+    /// Propagates quote ID validation errors before storing the fetched quote.
     async fn fetch_mint_quote(
         &self,
         quote_id: &str,
@@ -307,6 +293,22 @@ impl WalletTraitDef for Wallet {
         let method = payment_method.map(Into::into);
         let quote =
             WalletTraitDef::fetch_mint_quote(self.inner().as_ref(), quote_id, method).await?;
+        Ok(quote.into())
+    }
+
+    async fn fetch_mint_quote_with_key_search(
+        &self,
+        quote_id: &str,
+        payment_method: Option<Self::PaymentMethod>,
+        key_search_limit: u32,
+    ) -> Result<Self::MintQuote, Self::Error> {
+        let quote = WalletTraitDef::fetch_mint_quote_with_key_search(
+            self.inner().as_ref(),
+            quote_id,
+            payment_method.map(Into::into),
+            key_search_limit,
+        )
+        .await?;
         Ok(quote.into())
     }
 
@@ -332,6 +334,19 @@ impl WalletTraitDef for Wallet {
         Ok(PreparedMelt::new(self.inner().clone(), &prepared))
     }
 
+    async fn prepare_melt_proofs_with_options(
+        &self,
+        quote_id: &str,
+        proofs: cdk_common::Proofs,
+        options: cdk_common::wallet::MeltPrepareOptions,
+    ) -> Result<PreparedMelt, Self::Error> {
+        let prepared = self
+            .inner()
+            .prepare_melt_proofs_with_options(quote_id, proofs, options)
+            .await?;
+        Ok(PreparedMelt::new(self.inner().clone(), &prepared))
+    }
+
     async fn prepare_melt_token(
         &self,
         quote_id: &str,
@@ -341,6 +356,19 @@ impl WalletTraitDef for Wallet {
         let prepared = self
             .inner()
             .prepare_melt_token(quote_id, encoded_token, metadata)
+            .await?;
+        Ok(PreparedMelt::new(self.inner().clone(), &prepared))
+    }
+
+    async fn prepare_melt_token_with_options(
+        &self,
+        quote_id: &str,
+        encoded_token: &str,
+        options: cdk_common::wallet::MeltPrepareOptions,
+    ) -> Result<PreparedMelt, Self::Error> {
+        let prepared = self
+            .inner()
+            .prepare_melt_token_with_options(quote_id, encoded_token, options)
             .await?;
         Ok(PreparedMelt::new(self.inner().clone(), &prepared))
     }
@@ -368,18 +396,15 @@ impl WalletTraitDef for Wallet {
     }
 
     async fn set_cat(&self, cat: String) -> Result<(), Self::Error> {
-        WalletTraitDef::set_cat(self.inner().as_ref(), cat).await?;
-        Ok(())
+        Wallet::set_cat(self, cat).await
     }
 
     async fn set_refresh_token(&self, refresh_token: String) -> Result<(), Self::Error> {
-        WalletTraitDef::set_refresh_token(self.inner().as_ref(), refresh_token).await?;
-        Ok(())
+        Wallet::set_refresh_token(self, refresh_token).await
     }
 
     async fn refresh_access_token(&self) -> Result<(), Self::Error> {
-        WalletTraitDef::refresh_access_token(self.inner().as_ref()).await?;
-        Ok(())
+        Wallet::refresh_access_token(self).await
     }
 
     async fn mint_blind_auth(
@@ -402,22 +427,16 @@ impl WalletTraitDef for Wallet {
         Ok(restored)
     }
 
-    async fn verify_token_dleq(&self, token_str: &str) -> Result<(), Self::Error> {
-        WalletTraitDef::verify_token_dleq(self.inner().as_ref(), token_str).await?;
-        Ok(())
+    async fn restore_with_opts(
+        &self,
+        opts: cdk_common::wallet::NUT13Options,
+    ) -> Result<cdk_common::wallet::Restored, Self::Error> {
+        let restored = WalletTraitDef::restore_with_opts(self.inner().as_ref(), opts).await?;
+        Ok(restored)
     }
 
-    async fn pay_request(
-        &self,
-        request: cdk_common::nuts::nut18::PaymentRequest,
-        custom_amount: Option<Self::Amount>,
-    ) -> Result<(), Self::Error> {
-        WalletTraitDef::pay_request(
-            self.inner().as_ref(),
-            request,
-            custom_amount.map(Into::into),
-        )
-        .await?;
+    async fn verify_token_dleq(&self, token_str: &str) -> Result<(), Self::Error> {
+        WalletTraitDef::verify_token_dleq(self.inner().as_ref(), token_str).await?;
         Ok(())
     }
 
@@ -426,33 +445,30 @@ impl WalletTraitDef for Wallet {
         quote_ids: Vec<String>,
         method: Self::PaymentMethod,
     ) -> Result<Arc<crate::types::ActiveSubscription>, Self::Error> {
-        let cdk_sub = WalletTraitDef::subscribe_mint_quote_state(
-            self.inner().as_ref(),
-            quote_ids,
-            method.into(),
-        )
-        .await?;
-        let sub_id = uuid::Uuid::new_v4().to_string();
-        Ok(Arc::new(crate::types::ActiveSubscription::new(
-            cdk_sub, sub_id,
-        )))
+        Wallet::subscribe_mint_quote_state(self, quote_ids, method).await
     }
 
     fn set_metadata_cache_ttl(&self, ttl_secs: Option<u64>) {
-        let ttl = ttl_secs.map(std::time::Duration::from_secs);
-        self.inner().set_metadata_cache_ttl(ttl);
+        Wallet::set_metadata_cache_ttl(self, ttl_secs);
+    }
+
+    fn set_rate_limiting_config(&self, config: Option<RateLimitConfig>) {
+        WalletTraitDef::set_rate_limiting_config(self.inner().as_ref(), config);
+    }
+
+    fn is_rate_limited(&self) -> bool {
+        Wallet::is_rate_limited(self)
+    }
+
+    async fn flush_rate_limits(&self) {
+        Wallet::flush_rate_limits(self).await;
     }
 
     async fn subscribe(
         &self,
         params: crate::types::SubscribeParams,
     ) -> Result<Arc<crate::types::ActiveSubscription>, Self::Error> {
-        let cdk_params: cdk_common::subscription::WalletParams = params.into();
-        let sub_id = cdk_params.id.to_string();
-        let active_sub = WalletTraitDef::subscribe(self.inner().as_ref(), cdk_params).await?;
-        Ok(Arc::new(crate::types::ActiveSubscription::new(
-            active_sub, sub_id,
-        )))
+        Wallet::subscribe(self, params).await
     }
 
     #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]

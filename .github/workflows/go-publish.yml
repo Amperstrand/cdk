@@ -1,0 +1,447 @@
+name: "FFI - Go Bindings"
+
+permissions:
+  contents: read
+  actions: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to create for release (e.g. v0.17.0)"
+        required: true
+      cdk_ref:
+        description: "CDK git ref to publish from. Must match release_tag unless this is a nightly."
+        required: false
+      prerelease:
+        description: 'Mark the GitHub release as a pre-release'
+        type: boolean
+        default: false
+      nightly:
+        description: "Build an immutable nightly prerelease from an exact CDK commit."
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: true
+      cdk_ref:
+        type: string
+        required: false
+      prerelease:
+        type: boolean
+        required: false
+        default: false
+      nightly:
+        type: boolean
+        required: false
+        default: false
+env:
+  CARGO_TERM_COLOR: ${{ vars.CARGO_TERM_COLOR }}
+  TAG: ${{ inputs.release_tag }}
+  CDK_REF: ${{ inputs.cdk_ref || inputs.release_tag }}
+  CDK_CHECKOUT_REF: ${{ inputs.nightly && inputs.cdk_ref || format('refs/tags/{0}', inputs.release_tag) }}
+  RELEASE_BRANCH: release/${{ inputs.release_tag }}
+  UNIFFI_BINDGEN_GO_TAG: v0.6.0+v0.30.0
+  # One source for the toolchain that builds the check and the directive the
+  # module declares, so the cgo link check proves the minimum consumers get.
+  GO_VERSION: "1.22"
+
+jobs:
+  release-ci:
+    uses: ./.github/workflows/release-ci.yml
+    with:
+      ref: ${{ inputs.nightly && inputs.cdk_ref || inputs.release_tag }}
+
+  validate-release-ref:
+    needs: release-ci
+    name: "go: Validate release ref"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release ref
+        shell: bash
+        run: |
+          if [[ "${{ inputs.nightly }}" == "true" ]]; then
+            if [[ "${{ inputs.prerelease }}" != "true" ]]; then
+              echo "::error::Nightly releases must be marked as prereleases"
+              exit 1
+            fi
+
+            if [[ ! "${CDK_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Nightly cdk_ref must be an exact 40-character commit SHA; got ${CDK_REF}"
+              exit 1
+            fi
+
+            if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+-nightly[.][0-9]{8}[.]g[0-9a-f]{7}$ ]]; then
+              echo "::error::Nightly release_tag must look like v0.18.0-nightly.20260801.g1a2b3c4; got ${TAG}"
+              exit 1
+            fi
+          elif [[ "${CDK_REF}" != "${TAG}" ]]; then
+            echo "::error::cdk_ref must match release_tag (${TAG}); got ${CDK_REF}"
+            exit 1
+          fi
+
+          if [[ ! "${TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release_tag must be a version tag such as v0.17.0; got ${TAG}"
+            exit 1
+          fi
+
+      - name: Verify release source exists
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          fetch-depth: 1
+          persist-credentials: false
+
+  go-sync-sources:
+    name: "go: Sync sources to cdk-go"
+    needs: [validate-release-ref]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+
+      - name: Clone cdk-go
+        run: |
+          git clone https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_GO_REPO }}.git cdk-go
+
+      - name: Copy bindings/go to cdk-go
+        run: |
+          rsync -av \
+            --exclude='.github' \
+            --exclude='rust' \
+            --exclude='target' \
+            --exclude='.git' \
+            bindings/go/ cdk-go/
+
+          # The binding repo carries artifacts only. Nothing there is built, so
+          # the Rust crate and its toolchain pin are removed rather than synced.
+          rm -rf cdk-go/rust cdk-go/rust-toolchain.toml
+
+      - name: Push to cdk-go release branch
+        working-directory: cdk-go
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git show-ref --verify --quiet "refs/remotes/origin/${RELEASE_BRANCH}"; then
+            git checkout -B "${RELEASE_BRANCH}" "origin/${RELEASE_BRANCH}"
+          else
+            git checkout -b "${RELEASE_BRANCH}"
+          fi
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "sync: update sources for ${TAG}"
+          git push origin "${RELEASE_BRANCH}"
+
+  go-build-native:
+    name: "go: Build ${{ matrix.target }}"
+    needs: [validate-release-ref]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            artifact: libcdk_ffi_go.so
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            artifact: libcdk_ffi_go.so
+
+          # macOS
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            artifact: libcdk_ffi_go.dylib
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            artifact: libcdk_ffi_go.dylib
+
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            artifact: cdk_ffi_go.dll
+
+    steps:
+      - name: Checkout monorepo
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CDK_CHECKOUT_REF }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build cdk-ffi-go
+        run: |
+          cargo build --locked --profile release-ffi --package cdk-ffi-go \
+            --target ${{ matrix.target }}
+
+      - name: Fix dylib install name
+        if: endsWith(matrix.artifact, '.dylib')
+        run: |
+          install_name_tool -id @rpath/libcdk_ffi_go.dylib \
+            target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}
+
+      - name: Install uniffi-bindgen-go
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo install uniffi-bindgen-go \
+            --git https://github.com/NordSecurity/uniffi-bindgen-go \
+            --tag ${{ env.UNIFFI_BINDGEN_GO_TAG }} \
+            --locked --force
+
+      - name: Generate Go bindings
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          mkdir -p generated-bindings
+          uniffi-bindgen-go \
+            "target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}" \
+            --library \
+            --config bindings/go/uniffi.toml \
+            --out-dir generated-bindings
+
+      - name: Upload generated bindings
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-bindings-generated
+          path: generated-bindings/
+          if-no-files-found: error
+
+      - name: Strip debug symbols (MSVC keeps them in a separate .pdb)
+        if: "!contains(matrix.target, 'windows')"
+        run: |
+          FILE="target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}"
+          case "${{ matrix.target }}" in
+            *apple*)    strip -S "$FILE" ;;
+            *)          strip --strip-all "$FILE" ;;
+          esac
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release-ffi/${{ matrix.artifact }}" \
+             "dist/${{ matrix.target }}-${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-native-${{ matrix.target }}
+          path: dist/
+
+  go-publish:
+    name: "go: Publish to cdk-go"
+    runs-on: ubuntu-latest
+    needs: [go-sync-sources, go-build-native]
+    steps:
+      - name: Clone cdk-go
+        run: |
+          git clone --branch "${RELEASE_BRANCH}" \
+            https://x-access-token:${{ secrets.FFI_DEPLOY_KEY }}@github.com/${{ vars.CDK_GO_REPO }}.git cdk-go
+
+      # Without this the job builds against whatever Go the runner image ships,
+      # so an image refresh can change what the cgo link check below verifies.
+      - name: Install Go toolchain
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts
+          pattern: go-native-*
+          merge-multiple: true
+
+      - name: Download generated Go bindings
+        uses: actions/download-artifact@v8
+        with:
+          name: go-bindings-generated
+          path: ./generated-bindings
+
+      - name: Organize native libraries
+        run: |
+          NATIVE_DIR="cdk-go/bindings/cdkffi/native"
+
+          declare -A TARGET_MAP
+          TARGET_MAP[x86_64-unknown-linux-gnu]="linux_amd64"
+          TARGET_MAP[aarch64-unknown-linux-gnu]="linux_arm64"
+          TARGET_MAP[aarch64-apple-darwin]="darwin_arm64"
+          TARGET_MAP[x86_64-apple-darwin]="darwin_amd64"
+          TARGET_MAP[x86_64-pc-windows-msvc]="windows_amd64"
+
+          declare -A ARTIFACT_MAP
+          ARTIFACT_MAP[x86_64-unknown-linux-gnu]="libcdk_ffi_go.so"
+          ARTIFACT_MAP[aarch64-unknown-linux-gnu]="libcdk_ffi_go.so"
+          ARTIFACT_MAP[aarch64-apple-darwin]="libcdk_ffi_go.dylib"
+          ARTIFACT_MAP[x86_64-apple-darwin]="libcdk_ffi_go.dylib"
+          ARTIFACT_MAP[x86_64-pc-windows-msvc]="cdk_ffi_go.dll"
+
+          for target in "${!TARGET_MAP[@]}"; do
+            go_dir="${TARGET_MAP[$target]}"
+            artifact="${ARTIFACT_MAP[$target]}"
+            mkdir -p "${NATIVE_DIR}/${go_dir}"
+            cp "artifacts/${target}-${artifact}" "${NATIVE_DIR}/${go_dir}/${artifact}"
+          done
+
+          echo "Native libraries organized:"
+          find "${NATIVE_DIR}" -type f
+
+      - name: Generate go.mod
+        working-directory: cdk-go
+        run: |
+          MAJOR_VER="${TAG#v}"
+          MAJOR_VER="${MAJOR_VER%%.*}"
+          MODULE="github.com/${{ vars.CDK_GO_REPO }}"
+          if [ "$MAJOR_VER" -ge 2 ] 2>/dev/null; then
+            MODULE="${MODULE}/v${MAJOR_VER}"
+          fi
+          if [ ! -f go.mod ]; then
+            go mod init "${MODULE}"
+          else
+            go mod edit -module "${MODULE}"
+          fi
+          go mod edit -go "${GO_VERSION}"
+
+      - name: Copy generated Go bindings
+        run: |
+          PACKAGE_DIR="cdk-go/bindings/cdkffi"
+          cp generated-bindings/cdkffi/cdk_ffi.go "${PACKAGE_DIR}/cdk_ffi.go"
+          cp generated-bindings/cdkffi/cdk_ffi.h "${PACKAGE_DIR}/cdk_ffi.h"
+
+      - name: Generate link files
+        run: |
+          PACKAGE_DIR="cdk-go/bindings/cdkffi"
+
+          cat > "${PACKAGE_DIR}/link_linux_amd64.go" <<'EOF'
+          //go:build linux && amd64
+
+          package cdk_ffi
+
+          // #cgo LDFLAGS: -L${SRCDIR}/native/linux_amd64 -lcdk_ffi_go -Wl,-rpath,${SRCDIR}/native/linux_amd64 -lm -ldl
+          import "C"
+          EOF
+
+          cat > "${PACKAGE_DIR}/link_linux_arm64.go" <<'EOF'
+          //go:build linux && arm64
+
+          package cdk_ffi
+
+          // #cgo LDFLAGS: -L${SRCDIR}/native/linux_arm64 -lcdk_ffi_go -Wl,-rpath,${SRCDIR}/native/linux_arm64 -lm -ldl
+          import "C"
+          EOF
+
+          cat > "${PACKAGE_DIR}/link_darwin_amd64.go" <<'EOF'
+          //go:build darwin && amd64
+
+          package cdk_ffi
+
+          // #cgo LDFLAGS: -L${SRCDIR}/native/darwin_amd64 -lcdk_ffi_go -Wl,-rpath,${SRCDIR}/native/darwin_amd64 -lm
+          import "C"
+          EOF
+
+          cat > "${PACKAGE_DIR}/link_darwin_arm64.go" <<'EOF'
+          //go:build darwin && arm64
+
+          package cdk_ffi
+
+          // #cgo LDFLAGS: -L${SRCDIR}/native/darwin_arm64 -lcdk_ffi_go -Wl,-rpath,${SRCDIR}/native/darwin_arm64 -lm
+          import "C"
+          EOF
+
+          cat > "${PACKAGE_DIR}/link_windows_amd64.go" <<'EOF'
+          //go:build windows && amd64
+
+          package cdk_ffi
+
+          // #cgo LDFLAGS: -L${SRCDIR}/native/windows_amd64 -lcdk_ffi_go
+          import "C"
+          EOF
+
+      - name: Verify the published package links and compiles
+        working-directory: cdk-go
+        run: go build ./bindings/cdkffi
+
+      - name: Update checksums
+        run: |
+          NATIVE_DIR="cdk-go/bindings/cdkffi/native"
+          CHECKSUM_FILE="${NATIVE_DIR}/checksums.sha256"
+          LIBS=()
+          while IFS= read -r -d '' f; do
+            LIBS+=("${f}")
+          done < <(find "${NATIVE_DIR}" -type f \( -name "*.so" -o -name "*.dylib" -o -name "*.dll" \) -print0 | sort -z)
+          {
+            for abs_path in "${LIBS[@]}"; do
+              rel_path="${abs_path#"${NATIVE_DIR}/"}"
+              hash="$(sha256sum "${abs_path}" | awk '{print $1}')"
+              echo "${hash}  ${rel_path}"
+            done
+          } > "${CHECKSUM_FILE}"
+          echo "Updated ${CHECKSUM_FILE}:"
+          cat "${CHECKSUM_FILE}"
+
+      - name: Commit to release branch
+        working-directory: cdk-go
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "release: ${TAG} — add bindings and native libraries"
+
+      - name: Push release branch
+        working-directory: cdk-go
+        run: git push origin "${RELEASE_BRANCH}"
+
+      - name: Build release archive
+        run: |
+          tar -czf "cdk-go-bindings-${TAG}.tar.gz" -C cdk-go bindings/cdkffi
+
+      - name: Create release on cdk-go (creates tag and uploads asset atomically)
+        working-directory: cdk-go
+        env:
+          GH_TOKEN: ${{ secrets.FFI_DEPLOY_KEY }}
+        run: |
+          COMMIT_SHA=$(git rev-parse HEAD)
+          RELEASE_OPTIONS=(--generate-notes)
+          if [[ "${{ inputs.nightly }}" == "true" ]]; then
+            RELEASE_OPTIONS+=(
+              --prerelease
+              --latest=false
+              --notes "Nightly bindings built from CDK commit ${CDK_REF}: https://github.com/${GITHUB_REPOSITORY}/commit/${CDK_REF}"
+            )
+          elif [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            RELEASE_OPTIONS+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" \
+            --repo ${{ vars.CDK_GO_REPO }} \
+            --target "${COMMIT_SHA}" \
+            --title "Release ${TAG}" \
+            "${RELEASE_OPTIONS[@]}" \
+            "../cdk-go-bindings-${TAG}.tar.gz"
+
+      - name: Merge to default branch
+        if: ${{ !inputs.nightly }}
+        working-directory: cdk-go
+        run: |
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+          echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}" >> "$GITHUB_ENV"
+          git checkout "${DEFAULT_BRANCH}"
+          git merge "${RELEASE_BRANCH}" --squash
+          git commit -m "release: ${TAG}"
+          git push origin "${DEFAULT_BRANCH}"
+
+      - name: Clean up release branch
+        working-directory: cdk-go
+        run: git push origin --delete "${RELEASE_BRANCH}"

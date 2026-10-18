@@ -1,5 +1,9 @@
 //! SQLite storage backend for cdk
 
+#[cfg(test)]
+#[path = "../migration_name.rs"]
+mod migration_name;
+
 mod common;
 pub mod database;
 mod keyvalue;
@@ -15,6 +19,17 @@ pub use common::{migrate, run_db_operation, run_db_operation_sync};
 pub mod mint;
 #[cfg(feature = "wallet")]
 pub mod wallet;
+
+#[cfg(all(test, feature = "prometheus"))]
+mod metrics_test_lock {
+    use tokio::sync::{Mutex, MutexGuard};
+
+    static METRICS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    pub(crate) async fn lock() -> MutexGuard<'static, ()> {
+        METRICS_TEST_LOCK.lock().await
+    }
+}
 
 #[cfg(feature = "mint")]
 pub use mint::SQLMintDatabase;

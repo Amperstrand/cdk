@@ -36,8 +36,8 @@ pub enum Error {
     #[error(transparent)]
     Bip32(#[from] bitcoin::bip32::Error),
     /// HMAC Error
-    #[error(transparent)]
-    Hmac(#[from] bitcoin::secp256k1::hashes::FromSliceError),
+    #[error("HMAC error: {0}")]
+    Hmac(bitcoin::secp256k1::hashes::FromSliceError),
     /// SecretKey Error
     #[error(transparent)]
     SecpError(#[from] bitcoin::secp256k1::Error),
@@ -146,6 +146,7 @@ impl PreMintSecrets {
                 secret: secret.clone(),
                 r,
                 amount,
+                derivation_index: Some(counter),
             };
 
             pre_mint_secrets.secrets.push(pre_mint);
@@ -182,6 +183,7 @@ impl PreMintSecrets {
                 secret: secret.clone(),
                 r,
                 amount,
+                derivation_index: Some(counter),
             };
 
             pre_mint_secrets.secrets.push(pre_mint);
@@ -213,6 +215,7 @@ impl PreMintSecrets {
                 secret: secret.clone(),
                 r,
                 amount: Amount::ZERO,
+                derivation_index: Some(i),
             };
 
             pre_mint_secrets.secrets.push(pre_mint);
@@ -302,6 +305,39 @@ mod tests {
                 "Path derivation failed for ID {id_hex}"
             );
         }
+    }
+
+    #[test]
+    fn test_from_seed_blank_zero_amount_returns_empty_batch() {
+        let seed =
+            "half depart obvious quality work element tank gorilla view sugar picture humble";
+        let mnemonic = Mnemonic::from_str(seed).unwrap();
+        let seed: [u8; 64] = mnemonic.to_seed("");
+        let keyset_id = Id::from_str("009a1f293253e41e").unwrap();
+
+        let pre_mint = PreMintSecrets::from_seed_blank(keyset_id, 5, &seed, Amount::ZERO).unwrap();
+
+        assert!(pre_mint.is_empty());
+    }
+
+    #[test]
+    fn test_from_seed_blank_uses_expected_counter_range() {
+        let seed =
+            "half depart obvious quality work element tank gorilla view sugar picture humble";
+        let mnemonic = Mnemonic::from_str(seed).unwrap();
+        let seed: [u8; 64] = mnemonic.to_seed("");
+        let keyset_id = Id::from_str("009a1f293253e41e").unwrap();
+
+        let pre_mint =
+            PreMintSecrets::from_seed_blank(keyset_id, 5, &seed, Amount::from(3)).unwrap();
+        let restored = PreMintSecrets::restore_batch(keyset_id, &seed, 5, 7).unwrap();
+
+        assert_eq!(pre_mint.len(), 2);
+        assert_eq!(pre_mint.secrets, restored.secrets);
+        assert!(pre_mint
+            .secrets
+            .iter()
+            .all(|secret| secret.amount == Amount::ZERO));
     }
 
     #[test]

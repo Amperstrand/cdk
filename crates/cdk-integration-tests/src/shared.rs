@@ -1,9 +1,11 @@
+#![allow(clippy::needless_update)]
 //! Shared utilities for mint integration tests
 //!
 //! This module provides common functionality used across different
 //! integration test binaries to reduce code duplication.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use cdk_mintd::config::{Database, DatabaseEngine};
 use tokio::signal;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::cli::{init_logging, CommonArgs};
 
@@ -32,6 +35,31 @@ pub async fn wait_for_mint_ready_with_shutdown(
     port: u16,
     timeout_secs: u64,
     shutdown_notify: Arc<CancellationToken>,
+) -> Result<()> {
+    wait_for_mint_ready(port, timeout_secs, shutdown_notify, None).await
+}
+
+/// Wait for a mint with the expected description to be ready.
+pub async fn wait_for_mint_ready_with_description_and_shutdown(
+    port: u16,
+    timeout_secs: u64,
+    shutdown_notify: Arc<CancellationToken>,
+    expected_description: &str,
+) -> Result<()> {
+    wait_for_mint_ready(
+        port,
+        timeout_secs,
+        shutdown_notify,
+        Some(expected_description),
+    )
+    .await
+}
+
+async fn wait_for_mint_ready(
+    port: u16,
+    timeout_secs: u64,
+    shutdown_notify: Arc<CancellationToken>,
+    expected_description: Option<&str>,
 ) -> Result<()> {
     let url = format!("http://127.0.0.1:{port}/v1/info");
     let start_time = std::time::Instant::now();
@@ -55,8 +83,33 @@ pub async fn wait_for_mint_ready_with_shutdown(
                 match result {
                     Ok(response) => {
                         if response.is_success() {
-                            println!("Mint on port {port} is ready");
-                            return Ok(());
+                            match expected_description {
+                                Some(expected_description) => {
+                                    match response.json::<cdk::nuts::MintInfo>().await {
+                                        Ok(info)
+                                            if info.description.as_deref()
+                                                == Some(expected_description) =>
+                                        {
+                                            println!("Mint on port {port} is ready");
+                                            return Ok(());
+                                        }
+                                        Ok(_) => {
+                                            println!(
+                                                "Service on port {port} is not the expected mint"
+                                            );
+                                        }
+                                        Err(err) => {
+                                            println!(
+                                                "Could not decode mint info from port {port}: {err}"
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    println!("Mint on port {port} is ready");
+                                    return Ok(());
+                                }
+                            }
                         } else {
                             println!(
                                 "Mint on port {} returned status: {}",
@@ -98,75 +151,73 @@ pub fn init_working_directory(work_dir: &str) -> Result<PathBuf> {
 /// Write environment variables to .env file
 pub fn write_env_file(temp_dir: &Path, env_vars: &[(&str, &str)]) -> Result<()> {
     let mut env_content = String::new();
+
     for (key, value) in env_vars {
-        env_content.push_str(&format!("{key}={value}\n"));
+        env_content.push_str(&format!("{}={}\n", key, shell_quote(value)));
     }
 
-    let env_file_path = temp_dir.join(".env");
+    let env_path = temp_dir.join(".env");
+    let temporary_path = temp_dir.join(format!(".env.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)?;
+        file.write_all(env_content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary_path, env_path)?;
+        Ok(())
+    })();
 
-    fs::write(&env_file_path, &env_content)
-        .map(|_| {
-            println!(
-                "Environment variables written to: {}",
-                env_file_path.display()
-            );
-        })
-        .map_err(|e| anyhow::anyhow!("Could not write .env file: {}", e))
-}
-
-/// Wait for .env file to be created
-pub async fn wait_for_env_file(temp_dir: &Path, timeout_secs: u64) -> Result<()> {
-    let env_file_path = temp_dir.join(".env");
-    let start_time = std::time::Instant::now();
-
-    println!(
-        "Waiting for .env file to be created at: {}",
-        env_file_path.display()
-    );
-
-    loop {
-        // Check if timeout has been reached
-        if start_time.elapsed().as_secs() > timeout_secs {
-            return Err(anyhow::anyhow!(
-                "Timeout waiting for .env file at {}",
-                env_file_path.display()
-            ));
-        }
-
-        // Check if the file exists
-        if env_file_path.exists() {
-            println!(".env file found at: {}", env_file_path.display());
-            return Ok(());
-        }
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    if write_result.is_err() {
+        let _ = fs::remove_file(temporary_path);
     }
+
+    write_result
 }
 
-/// Setup common logging based on CLI arguments
-pub fn setup_logging(common_args: &CommonArgs) {
-    init_logging(common_args.enable_logging, common_args.log_level);
+/// Quote a string for safe use as one POSIX shell word.
+pub fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+
+    for ch in value.chars() {
+        match ch {
+            '\'' => quoted.push_str("'\\''"),
+            _ => quoted.push(ch),
+        }
+    }
+
+    quoted.push('\'');
+    quoted
 }
 
-/// Create shutdown handler for graceful termination
+/// Create a shutdown handler that listens for Ctrl+C
 pub fn create_shutdown_handler() -> Arc<Notify> {
-    Arc::new(Notify::new())
+    let notify = Arc::new(Notify::new());
+    let notify_clone = notify.clone();
+
+    tokio::spawn(async move {
+        signal::ctrl_c().await.expect("failed to listen for event");
+        println!("\nShutdown signal received");
+        notify_clone.notify_waiters();
+    });
+
+    notify
 }
 
-/// Wait for Ctrl+C signal
+/// Wait for shutdown signal
 pub async fn wait_for_shutdown_signal(shutdown: Arc<Notify>) {
-    signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C handler");
-
-    println!("\nReceived Ctrl+C, shutting down...");
-    shutdown.notify_waiters();
+    shutdown.notified().await;
+    println!("Shutting down...");
 }
 
-/// Common mint information display
-pub fn display_mint_info(port: u16, temp_dir: &Path, database_type: &str) {
-    println!("Mint started successfully!");
-    println!("Mint URL: http://127.0.0.1:{port}");
+/// Display mint information
+pub fn display_mint_info(port: u16, work_dir: &Path, database_type: &str) {
+    let temp_dir = work_dir.to_path_buf();
+    println!("\nMint is running!");
+    println!("Port: {}", port);
     println!("Temp directory: {temp_dir:?}");
     println!("Database type: {database_type}");
 }
@@ -176,8 +227,9 @@ pub fn create_fake_wallet_settings(
     port: u16,
     database: &str,
     mnemonic: Option<String>,
-    signatory_config: Option<(String, String)>, // (url, certs_dir)
+    signatory_config: Option<cdk_mintd::config::Signatory>,
     fake_wallet_config: Option<cdk_mintd::config::FakeWallet>,
+    onchain_config: Option<cdk_mintd::config::Onchain>,
 ) -> cdk_mintd::config::Settings {
     let engine = DatabaseEngine::from_str(database).expect("valid database");
 
@@ -202,11 +254,7 @@ pub fn create_fake_wallet_settings(
             listen_host: "127.0.0.1".to_string(),
             listen_port: port,
             seed: None,
-            mnemonic,
-            signatory_url: signatory_config.as_ref().map(|(url, _)| url.clone()),
-            signatory_certs: signatory_config
-                .as_ref()
-                .map(|(_, certs_dir)| certs_dir.clone()),
+            mnemonic: mnemonic.clone(),
             input_fee_ppk: None,
             use_keyset_v2: None,
             http_cache: cache::Config::default(),
@@ -215,23 +263,37 @@ pub fn create_fake_wallet_settings(
                 console_level: Some("debug".to_string()),
                 file_level: Some("debug".to_string()),
             },
-            enable_swagger_ui: None,
             enable_info_page: None,
         },
+        signatory: signatory_config,
         mint_info: cdk_mintd::config::MintInfo::default(),
         limits: cdk_mintd::config::Limits::default(),
-        ln: cdk_mintd::config::Ln {
-            ln_backend: cdk_mintd::config::LnBackend::FakeWallet,
-            invoice_description: None,
-            min_mint: DEFAULT_MIN_MINT.into(),
-            max_mint: DEFAULT_MAX_MINT.into(),
-            min_melt: DEFAULT_MIN_MELT.into(),
-            max_melt: DEFAULT_MAX_MELT.into(),
-        },
+        payment_backend: vec![
+            cdk_mintd::config::PaymentBackend {
+                backend: cdk_mintd::config::PaymentBackendType::FakeWallet,
+                unit: cdk::nuts::CurrencyUnit::Sat,
+                invoice_description: None,
+                min_mint: DEFAULT_MIN_MINT.into(),
+                max_mint: DEFAULT_MAX_MINT.into(),
+                min_melt: DEFAULT_MIN_MELT.into(),
+                max_melt: DEFAULT_MAX_MELT.into(),
+                ..Default::default()
+            },
+            cdk_mintd::config::PaymentBackend {
+                backend: cdk_mintd::config::PaymentBackendType::FakeWallet,
+                unit: cdk::nuts::CurrencyUnit::Usd,
+                invoice_description: None,
+                min_mint: DEFAULT_MIN_MINT.into(),
+                max_mint: DEFAULT_MAX_MINT.into(),
+                min_melt: DEFAULT_MIN_MELT.into(),
+                max_melt: DEFAULT_MAX_MELT.into(),
+                ..Default::default()
+            },
+        ],
         cln: None,
-        lnbits: None,
         lnd: None,
         ldk_node: None,
+        onchain: onchain_config,
         fake_wallet: fake_wallet_config,
         grpc_processor: None,
         database: Database {
@@ -239,9 +301,12 @@ pub fn create_fake_wallet_settings(
             postgres: postgres_config,
         },
         auth_database: None,
+        #[cfg(feature = "bdk")]
+        bdk: None,
         mint_management_rpc: None,
         auth: None,
         prometheus: Some(Default::default()),
+        ..Default::default()
     }
 }
 
@@ -261,8 +326,6 @@ pub fn create_cln_settings(
             listen_port: port,
             seed: None,
             mnemonic: Some(mnemonic),
-            signatory_url: None,
-            signatory_certs: None,
             input_fee_ppk: None,
             use_keyset_v2: None,
             http_cache: cache::Config::default(),
@@ -271,30 +334,34 @@ pub fn create_cln_settings(
                 console_level: Some("debug".to_string()),
                 file_level: Some("debug".to_string()),
             },
-            enable_swagger_ui: None,
             enable_info_page: None,
         },
         mint_info: cdk_mintd::config::MintInfo::default(),
         limits: cdk_mintd::config::Limits::default(),
-        ln: cdk_mintd::config::Ln {
-            ln_backend: cdk_mintd::config::LnBackend::Cln,
+        payment_backend: vec![cdk_mintd::config::PaymentBackend {
+            backend: cdk_mintd::config::PaymentBackendType::Cln,
+            unit: cdk::nuts::CurrencyUnit::Sat,
             invoice_description: None,
             min_mint: DEFAULT_MIN_MINT.into(),
             max_mint: DEFAULT_MAX_MINT.into(),
             min_melt: DEFAULT_MIN_MELT.into(),
             max_melt: DEFAULT_MAX_MELT.into(),
-        },
+            ..Default::default()
+        }],
+        onchain: None,
         cln: Some(cln_config),
-        lnbits: None,
         lnd: None,
         ldk_node: None,
         fake_wallet: None,
         grpc_processor: None,
         database: cdk_mintd::config::Database::default(),
         auth_database: None,
+        #[cfg(feature = "bdk")]
+        bdk: None,
         mint_management_rpc: None,
         auth: None,
         prometheus: Some(Default::default()),
+        ..Default::default()
     }
 }
 
@@ -312,8 +379,6 @@ pub fn create_lnd_settings(
             listen_port: port,
             seed: None,
             mnemonic: Some(mnemonic),
-            signatory_url: None,
-            signatory_certs: None,
             input_fee_ppk: None,
             use_keyset_v2: None,
             http_cache: cache::Config::default(),
@@ -322,29 +387,129 @@ pub fn create_lnd_settings(
                 console_level: Some("debug".to_string()),
                 file_level: Some("debug".to_string()),
             },
-            enable_swagger_ui: None,
             enable_info_page: None,
         },
         mint_info: cdk_mintd::config::MintInfo::default(),
         limits: cdk_mintd::config::Limits::default(),
-        ln: cdk_mintd::config::Ln {
-            ln_backend: cdk_mintd::config::LnBackend::Lnd,
+        payment_backend: vec![cdk_mintd::config::PaymentBackend {
+            backend: cdk_mintd::config::PaymentBackendType::Lnd,
+            unit: cdk::nuts::CurrencyUnit::Sat,
             invoice_description: None,
             min_mint: DEFAULT_MIN_MINT.into(),
             max_mint: DEFAULT_MAX_MINT.into(),
             min_melt: DEFAULT_MIN_MELT.into(),
             max_melt: DEFAULT_MAX_MELT.into(),
-        },
-        cln: None,
-        lnbits: None,
-        ldk_node: None,
+            ..Default::default()
+        }],
+        onchain: None,
         lnd: Some(lnd_config),
         fake_wallet: None,
         grpc_processor: None,
         database: cdk_mintd::config::Database::default(),
         auth_database: None,
+        #[cfg(feature = "bdk")]
+        bdk: None,
         mint_management_rpc: None,
         auth: None,
         prometheus: Some(Default::default()),
+        ..Default::default()
+    }
+}
+
+pub fn setup_logging(common: &CommonArgs) {
+    init_logging(common.enable_logging, common.log_level);
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "cdk_write_env_{name}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("test temp dir should be created");
+        dir
+    }
+
+    #[test]
+    fn write_env_file_shell_quotes_plain_values() {
+        let dir = test_temp_dir("plain");
+
+        write_env_file(&dir, &[("CDK_TEST_MINT_URL", "http://127.0.0.1:8085")])
+            .expect("env file should be written");
+
+        let content = fs::read_to_string(dir.join(".env")).expect("env file should be readable");
+        fs::remove_dir_all(&dir).expect("test temp dir should be removed");
+
+        assert_eq!(content, "CDK_TEST_MINT_URL='http://127.0.0.1:8085'\n");
+    }
+
+    #[test]
+    fn write_env_file_neutralizes_shell_injection() {
+        let dir = test_temp_dir("injection");
+        let marker = dir.join("command_was_executed");
+        let malicious = format!(
+            "127.0.0.1\"\nINJECTED_SECRET=\"pwned\n$(touch {})`date`'\\",
+            marker.display()
+        );
+
+        write_env_file(&dir, &[("CDK_TEST_MINT_URL", &malicious)])
+            .expect("env file should be written");
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg("source \"$1\" && test \"${INJECTED_SECRET-unset}\" = unset")
+            .arg("bash")
+            .arg(dir.join(".env"))
+            .output()
+            .expect("bash should run");
+
+        assert!(
+            output.status.success(),
+            "sourcing env file allowed an injected variable: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "sourcing env file executed command substitution"
+        );
+
+        fs::remove_dir_all(&dir).expect("test temp dir should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_env_file_replaces_symlink_without_overwriting_target() {
+        let dir = test_temp_dir("symlink");
+        let target = dir.join("target");
+        fs::write(&target, "preserve me").expect("target should be written");
+        symlink(&target, dir.join(".env")).expect("env symlink should be created");
+
+        write_env_file(&dir, &[("CDK_TEST_MINT_URL", "http://127.0.0.1:8085")])
+            .expect("env file should replace the symlink");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("target should remain readable"),
+            "preserve me"
+        );
+        assert!(!fs::symlink_metadata(dir.join(".env"))
+            .expect("env file should exist")
+            .file_type()
+            .is_symlink());
+
+        fs::remove_dir_all(&dir).expect("test temp dir should be removed");
     }
 }

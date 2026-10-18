@@ -7,10 +7,12 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use cashu::util::hex;
+use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use fedimint_tonic_lnd::lnrpc::{
     ConnectPeerRequest, GetInfoRequest, GetInfoResponse, LightningAddress, ListChannelsRequest,
     NewAddressRequest, OpenChannelRequest, WalletBalanceRequest,
 };
+use fedimint_tonic_lnd::routerrpc::SendPaymentRequest;
 use fedimint_tonic_lnd::Client;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -18,6 +20,8 @@ use tokio::time::sleep;
 use super::types::{Balance, ConnectInfo};
 use super::LightningClient;
 use crate::ln_regtest::InvoiceStatus;
+
+const PAYMENT_TIMEOUT_SECONDS: i32 = 60;
 
 /// Lnd
 #[derive(Clone)]
@@ -31,6 +35,11 @@ pub struct LndClient {
 impl LndClient {
     /// Create rpc client
     pub async fn new(addr: String, cert_file: PathBuf, macaroon_file: PathBuf) -> Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+
         let client =
             fedimint_tonic_lnd::connect(addr.clone(), cert_file.clone(), macaroon_file.clone())
                 .await
@@ -73,6 +82,7 @@ impl LndClient {
                 public_only: false,
                 private_only: false,
                 peer: vec![],
+                ..Default::default()
             })
             .await?
             .into_inner();
@@ -96,6 +106,7 @@ impl LndClient {
                 public_only: false,
                 private_only: false,
                 peer: vec![],
+                ..Default::default()
             })
             .await?
             .into_inner();
@@ -108,17 +119,96 @@ impl LndClient {
 
         Ok(balance as u64)
     }
+
+    pub async fn wait_channel_active_with_peer_attempts(
+        &self,
+        peer_id: &str,
+        max_checks: u32,
+    ) -> Result<()> {
+        let peer = hex::decode(peer_id)?;
+        let mut count = 0;
+        while count < max_checks {
+            let channels = self
+                .client
+                .lock()
+                .await
+                .lightning()
+                .list_channels(ListChannelsRequest {
+                    active_only: true,
+                    inactive_only: false,
+                    public_only: false,
+                    private_only: false,
+                    peer: peer.clone(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+
+            if !channels.channels.is_empty() {
+                tracing::info!("LND channel with peer {peer_id} is active");
+                return Ok(());
+            }
+
+            tracing::warn!("LND channel with peer {peer_id} is not active yet");
+            count += 1;
+            sleep(Duration::from_secs(2)).await;
+        }
+
+        let channels = self
+            .client
+            .lock()
+            .await
+            .lightning()
+            .list_channels(ListChannelsRequest {
+                active_only: false,
+                inactive_only: false,
+                public_only: false,
+                private_only: false,
+                peer,
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        let channel_summary = channels
+            .channels
+            .iter()
+            .map(|channel| {
+                format!(
+                    "remote_pubkey={} active={} capacity={} local_balance={}",
+                    channel.remote_pubkey, channel.active, channel.capacity, channel.local_balance
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let channel_summary = if channel_summary.is_empty() {
+            "none".to_string()
+        } else {
+            channel_summary
+        };
+
+        bail!("Timeout waiting for active LND channel with peer {peer_id}; channels: {channel_summary}")
+    }
+
+    pub async fn wait_channel_active_with_peer(&self, peer_id: &str) -> Result<()> {
+        self.wait_channel_active_with_peer_attempts(peer_id, 100)
+            .await
+    }
 }
 
 #[async_trait]
 impl LightningClient for LndClient {
     async fn get_connect_info(&self) -> Result<ConnectInfo> {
         let info = self.get_info().await?;
-        let uri = info.uris.first().unwrap();
+        let uri = info
+            .uris
+            .first()
+            .ok_or_else(|| anyhow!("LND did not report a connect URI"))?;
 
-        let parsed = parse_uri(uri);
+        let mut parsed =
+            parse_uri(uri).ok_or_else(|| anyhow!("Could not parse LND connect URI: {uri}"))?;
+        parsed.pubkey = info.identity_pubkey;
 
-        Ok(parsed.unwrap())
+        Ok(parsed)
     }
 
     async fn get_new_onchain_address(&self) -> Result<String> {
@@ -201,7 +291,7 @@ impl LightningClient for LndClient {
             .lock()
             .await
             .lightning()
-            .wallet_balance(WalletBalanceRequest {})
+            .wallet_balance(WalletBalanceRequest::default())
             .await?
             .into_inner();
 
@@ -215,25 +305,37 @@ impl LightningClient for LndClient {
     }
 
     async fn pay_invoice(&self, bolt11: String) -> Result<String> {
-        let pay_req = fedimint_tonic_lnd::lnrpc::SendRequest {
+        let pay_req = SendPaymentRequest {
             payment_request: bolt11,
+            timeout_seconds: PAYMENT_TIMEOUT_SECONDS,
+            fee_limit_msat: i64::MAX,
+            no_inflight_updates: true,
             ..Default::default()
         };
 
-        let payment_response = self
-            .client
-            .lock()
-            .await
-            .lightning()
-            .send_payment_sync(fedimint_tonic_lnd::tonic::Request::new(pay_req))
-            .await?
-            .into_inner();
+        let mut client = self.client.lock().await;
+        let mut payment_stream = client.router().send_payment_v2(pay_req).await?.into_inner();
 
-        if !payment_response.payment_error.is_empty() {
-            bail!("Lnd payment error: {}", payment_response.payment_error);
+        while let Some(payment) = payment_stream.message().await? {
+            match PaymentStatus::try_from(payment.status) {
+                Ok(PaymentStatus::InFlight | PaymentStatus::Initiated) => continue,
+                Ok(PaymentStatus::Succeeded) => {
+                    return Ok(payment.payment_preimage);
+                }
+                Ok(PaymentStatus::Failed) => {
+                    bail!(
+                        "Lnd payment failed with failure reason {}",
+                        payment.failure_reason
+                    );
+                }
+                Ok(PaymentStatus::Unknown) => {
+                    bail!("Lnd payment status unknown");
+                }
+                Err(_) => bail!("Lnd payment status unknown: {}", payment.status),
+            }
         }
 
-        Ok(hex::encode(payment_response.payment_preimage))
+        bail!("Lnd payment stream ended without a terminal payment status")
     }
 
     async fn create_invoice(&self, amount_sat: Option<u64>) -> Result<String> {
@@ -271,6 +373,7 @@ impl LightningClient for LndClient {
                     public_only: false,
                     private_only: false,
                     peer: vec![],
+                    ..Default::default()
                 })
                 .await?
                 .into_inner();
@@ -341,6 +444,7 @@ impl LightningClient for LndClient {
             max_payments: 1000,
             reversed: false,
             count_total_payments: false,
+            ..Default::default()
         };
 
         let invoices = self

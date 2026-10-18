@@ -53,10 +53,13 @@ async fn start_fake_mint(
 ) -> Result<tokio::task::JoinHandle<()>> {
     let signatory_config = if external_signatory {
         println!("Configuring external signatory");
-        Some((
-            "https://127.0.0.1:15060".to_string(),  // Default signatory URL
-            temp_dir.to_string_lossy().to_string(), // Certs directory as string
-        ))
+        Some(cdk_mintd::config::Signatory {
+            enabled: true,
+            address: "127.0.0.1".to_string(),
+            port: 15060,
+            tls_dir: Some(temp_dir.to_path_buf()),
+            allow_insecure: false,
+        })
     } else {
         None
     };
@@ -74,6 +77,9 @@ async fn start_fake_mint(
         supported_units: vec![CurrencyUnit::Sat, CurrencyUnit::Usd],
         fee_percent: 0.0,
         reserve_fee_min: 1.into(),
+        custom_payment_methods: vec![cdk_mintd::config::FakeWalletCustomPaymentMethod::Method(
+            "paypal".to_string(),
+        )],
         min_delay_time: 1,
         max_delay_time: 3,
         keyset_rotations: vec![
@@ -89,6 +95,12 @@ async fn start_fake_mint(
                 version: "v2".into(),
                 expired: false,
             },
+            cdk_mintd::config::FakeWalletKeysetRotation {
+                unit: CurrencyUnit::Usd,
+                input_fee_ppk: 0,
+                version: "v1".into(),
+                expired: false,
+            },
         ],
     });
 
@@ -99,6 +111,7 @@ async fn start_fake_mint(
         mnemonic,
         signatory_config,
         fake_wallet_config,
+        None,
     );
 
     println!("Starting fake mintd on port {port}");
@@ -180,7 +193,10 @@ async fn main() -> Result<()> {
         temp_dir.display()
     );
     println!("You can source these variables with:");
-    println!("  source {}/.env", temp_dir.display());
+    println!(
+        "  source {}",
+        shared::shell_quote(&temp_dir.join(".env").display().to_string())
+    );
     println!();
     println!("Environment variables set:");
     println!("  CDK_TEST_MINT_URL=http://127.0.0.1:{}", args.port);

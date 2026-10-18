@@ -12,6 +12,7 @@ use cdk_common::wallet::WalletKey;
 use clap::{Args, ValueEnum};
 use lightning::offers::offer::Offer;
 
+use crate::terminal::escape_control;
 use crate::utils::{get_number_input, get_or_create_wallet, get_user_input};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -22,6 +23,8 @@ pub enum PaymentType {
     Bolt12,
     /// Bip353
     Bip353,
+    /// Onchain Bitcoin address
+    Onchain,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -55,7 +58,7 @@ pub struct MeltSubCommand {
     /// Mint URL to use for melting
     #[arg(long, conflicts_with = "mpp")]
     mint_url: Option<String>,
-    /// Payment method (bolt11, bolt12, or bip353)
+    /// Payment method (bolt11, bolt12, bip353, or onchain)
     #[arg(long, default_value = "bolt11")]
     method: PaymentType,
     /// BOLT11 invoice to pay (for bolt11 method)
@@ -64,13 +67,13 @@ pub struct MeltSubCommand {
     /// BOLT12 offer to pay (for bolt12 method)
     #[arg(long, conflicts_with_all = ["invoice", "address"])]
     offer: Option<String>,
-    /// BIP353 address to pay (for bip353 method)
+    /// BIP353 or onchain address to pay
     #[arg(long, conflicts_with_all = ["invoice", "offer"])]
     address: Option<String>,
     /// Bitcoin network to use for BIP353 (bitcoin, testnet, signet, regtest)
     #[arg(long, default_value = "bitcoin")]
     network: BitcoinNetwork,
-    /// Amount in sats for amountless payments (bolt11 amountless, bolt12 amountless, bip353)
+    /// Amount in sats for amountless payments or onchain melts
     #[arg(long)]
     amount: Option<u64>,
     /// MPP split entry in the form <mint_url>=<amount_sats>; repeat for multiple mints
@@ -134,6 +137,40 @@ fn parse_mpp_split(entry: &str) -> Result<(MintUrl, Amount)> {
     Ok((mint_url, Amount::from(amount_sat)))
 }
 
+fn select_onchain_quote(
+    quotes: &[cdk_common::wallet::MeltQuote],
+) -> Result<cdk_common::wallet::MeltQuote> {
+    if quotes.is_empty() {
+        bail!("No onchain melt quotes available");
+    }
+
+    if quotes.len() == 1 {
+        return Ok(quotes[0].clone());
+    }
+
+    println!("\nAvailable onchain melt quotes:");
+    for (index, quote) in quotes.iter().enumerate() {
+        println!(
+            "  {}: amount={} fee={} expiry={} estimated_blocks={}",
+            index,
+            quote.amount,
+            quote.fee_reserve,
+            quote.expiry,
+            quote.estimated_blocks.unwrap_or_default()
+        );
+    }
+
+    loop {
+        let selection: usize = get_number_input("Enter onchain quote number to use")?;
+
+        if let Some(quote) = quotes.get(selection) {
+            return Ok(quote.clone());
+        }
+
+        println!("Invalid selection, please try again.");
+    }
+}
+
 pub async fn pay(
     wallet_repository: &WalletRepository,
     sub_command_args: &MeltSubCommand,
@@ -155,8 +192,8 @@ pub async fn pay(
     let selected_mint = if let Some(mint_url) = &sub_command_args.mint_url {
         Some(MintUrl::from_str(mint_url)?)
     } else {
-        // Display all mints with their balances and let user select
-        let balances_map = wallet_repository.get_balances().await?;
+        // Display all mints with their balances for the selected unit and let user select
+        let balances_map = wallet_repository.get_balances_for_unit(unit).await?;
         if balances_map.is_empty() {
             bail!("No mints available in the wallet");
         }
@@ -172,7 +209,11 @@ pub async fn pay(
             for (index, (key, balance)) in balances_vec.iter().enumerate() {
                 println!(
                     "  {}: {} ({}) - {} {}",
-                    index, key.mint_url, key.unit, balance, unit
+                    index,
+                    escape_control(&key.mint_url.to_string()),
+                    escape_control(&key.unit.to_string()),
+                    balance,
+                    unit
                 );
             }
             println!("  {}: Any mint (auto-select best)", balances_vec.len());
@@ -223,15 +264,21 @@ pub async fn pay(
                 specific_mint
             } else {
                 // Auto-select the first mint with sufficient balance
-                let balances = wallet_repository.get_balances().await?;
-                let required_amount = bolt11
-                    .amount_milli_satoshis()
-                    .map(|a| Amount::from(a / MSAT_IN_SAT))
+                let balances = wallet_repository.get_balances_for_unit(unit).await?;
+                let required_amount = options
+                    .map(|options| options.amount_msat().into())
+                    .or_else(|| bolt11.amount_milli_satoshis())
+                    .map(|amount| {
+                        Amount::new(amount, CurrencyUnit::Msat)
+                            .convert_to_ceil(unit)
+                            .map(Into::into)
+                    })
+                    .transpose()?
                     .unwrap_or(Amount::ZERO);
 
                 balances
                     .into_iter()
-                    .find(|(_, balance)| *balance >= required_amount)
+                    .find(|(key, balance)| &key.unit == unit && *balance >= required_amount)
                     .map(|(key, _)| key.mint_url)
                     .ok_or_else(|| anyhow::anyhow!("No mint with sufficient balance"))?
             };
@@ -249,7 +296,7 @@ pub async fn pay(
                 .await?;
 
             println!("Melt quote created:");
-            println!("  Quote ID: {}", quote.id);
+            println!("  Quote ID: {}", escape_control(&quote.id));
             println!("  Amount: {}", quote.amount);
             println!("  Fee Reserve: {}", quote.fee_reserve);
 
@@ -267,7 +314,7 @@ pub async fn pay(
                 melted.fee_paid()
             );
             if let Some(preimage) = melted.payment_proof() {
-                println!("Payment preimage: {}", preimage);
+                println!("Payment preimage: {}", escape_control(preimage));
             }
         }
         PaymentType::Bolt12 => {
@@ -298,7 +345,7 @@ pub async fn pay(
                 specific_mint
             } else {
                 // User selected "Any" - just pick the first mint with any balance
-                let balances = wallet_repository.get_balances().await?;
+                let balances = wallet_repository.get_balances_for_unit(unit).await?;
 
                 balances
                     .into_iter()
@@ -321,7 +368,7 @@ pub async fn pay(
 
             // Display quote info
             println!("Melt quote created:");
-            println!("  Quote ID: {}", quote.id);
+            println!("  Quote ID: {}", escape_control(&quote.id));
             println!("  Amount: {}", quote.amount);
             println!("  Fee Reserve: {}", quote.fee_reserve);
             println!("  State: {}", quote.state);
@@ -339,7 +386,7 @@ pub async fn pay(
                 melted.fee_paid()
             );
             if let Some(preimage) = melted.payment_proof() {
-                println!("Payment preimage: {}", preimage);
+                println!("Payment preimage: {}", escape_control(preimage));
             }
         }
         PaymentType::Bip353 => {
@@ -359,7 +406,7 @@ pub async fn pay(
                 specific_mint
             } else {
                 // User selected "Any" - just pick the first mint with any balance
-                let balances = wallet_repository.get_balances().await?;
+                let balances = wallet_repository.get_balances_for_unit(unit).await?;
 
                 balances
                     .into_iter()
@@ -381,7 +428,7 @@ pub async fn pay(
 
             // Display quote info
             println!("Melt quote created:");
-            println!("  Quote ID: {}", quote.id);
+            println!("  Quote ID: {}", escape_control(&quote.id));
             println!("  Amount: {}", quote.amount);
             println!("  Fee Reserve: {}", quote.fee_reserve);
             println!("  State: {}", quote.state);
@@ -399,7 +446,68 @@ pub async fn pay(
                 melted.fee_paid()
             );
             if let Some(preimage) = melted.payment_proof() {
-                println!("Payment preimage: {}", preimage);
+                println!("Payment preimage: {}", escape_control(preimage));
+            }
+        }
+        PaymentType::Onchain => {
+            let onchain_address =
+                input_or_prompt(sub_command_args.address.as_ref(), "Enter onchain address")?;
+
+            let amount_sat = match sub_command_args.amount {
+                Some(amount_sat) if amount_sat > 0 => amount_sat,
+                Some(_) => bail!("Onchain melt amount must be greater than zero"),
+                None => get_number_input::<u64>("Enter the amount you would like to melt in sats")?,
+            };
+
+            let melt_amount = Amount::from(amount_sat);
+
+            // Get wallet for onchain using the selected mint
+            let mint_url = if let Some(specific_mint) = selected_mint {
+                specific_mint
+            } else {
+                let balances = wallet_repository.get_balances_for_unit(unit).await?;
+
+                balances
+                    .into_iter()
+                    .find(|(_, balance)| *balance >= melt_amount)
+                    .map(|(key, _)| key.mint_url)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("No mint with sufficient balance for onchain melt")
+                    })?
+            };
+
+            let wallet = get_or_create_wallet(wallet_repository, &mint_url, unit).await?;
+
+            let quote_options = wallet
+                .quote_onchain_melt_options(&onchain_address, melt_amount, None)
+                .await?;
+
+            let selected_quote = select_onchain_quote(&quote_options)?;
+            let quote = wallet.select_onchain_melt_quote(selected_quote).await?;
+
+            println!("Melt quote selected:");
+            println!("  Quote ID: {}", escape_control(&quote.id));
+            println!("  Amount: {}", quote.amount);
+            println!("  Fee Reserve: {}", quote.fee_reserve);
+            println!("  Expiry: {}", quote.expiry);
+            if let Some(estimated_blocks) = quote.estimated_blocks {
+                println!("  Estimated Blocks: {}", estimated_blocks);
+            }
+
+            let melted = wallet
+                .prepare_melt(&quote.id, HashMap::new())
+                .await?
+                .confirm()
+                .await?;
+
+            println!(
+                "Payment successful: state={}, amount={}, fee_paid={}",
+                melted.state(),
+                melted.amount(),
+                melted.fee_paid()
+            );
+            if let Some(payment_proof) = melted.payment_proof() {
+                println!("Payment proof: {}", escape_control(payment_proof));
             }
         }
     }
@@ -421,8 +529,8 @@ async fn pay_mpp(
     // Validate invoice format
     let _bolt11 = Bolt11Invoice::from_str(&bolt11_str)?;
 
-    // Show available mints and balances
-    let balances = wallet_repository.get_balances().await?;
+    // Show available mints and balances for the selected unit
+    let balances = wallet_repository.get_balances_for_unit(unit).await?;
     let balances_vec: Vec<(WalletKey, Amount)> = balances.into_iter().collect();
 
     // Collect mint selections and amounts from CLI when provided, otherwise prompt interactively.
@@ -431,7 +539,11 @@ async fn pay_mpp(
         for (i, (key, balance)) in balances_vec.iter().enumerate() {
             println!(
                 "  {}: {} ({}) - {} {}",
-                i, key.mint_url, key.unit, balance, unit
+                i,
+                escape_control(&key.mint_url.to_string()),
+                escape_control(&key.unit.to_string()),
+                balance,
+                unit
             );
         }
 
@@ -467,8 +579,12 @@ async fn pay_mpp(
     }
 
     for (mint_url, amount) in &mint_amounts {
-        if !wallet_repository.has_mint(mint_url).await {
-            bail!("MPP split mint {} is not in the wallet", mint_url);
+        if !wallet_repository.has_wallet(mint_url, unit).await {
+            bail!(
+                "MPP split mint {} is not in the wallet for unit {}",
+                mint_url,
+                unit
+            );
         }
 
         let key = WalletKey::new(mint_url.clone(), unit.clone());
@@ -509,7 +625,11 @@ async fn pay_mpp(
             )
             .await?;
 
-        println!("  {} - Quote ID: {}", mint_url, quote.id);
+        println!(
+            "  {} - Quote ID: {}",
+            escape_control(&mint_url.to_string()),
+            escape_control(&quote.id)
+        );
         println!("    Amount: {}, Fee: {}", quote.amount, quote.fee_reserve);
         quotes.push((mint_url.clone(), wallet, quote));
     }
@@ -528,7 +648,7 @@ async fn pay_mpp(
 
         println!(
             "  {} - Paid: {}, Fee: {}",
-            mint_url,
+            escape_control(&mint_url.to_string()),
             melted.amount(),
             melted.fee_paid()
         );
@@ -536,12 +656,20 @@ async fn pay_mpp(
         total_fees += melted.fee_paid();
 
         if let Some(preimage) = melted.payment_proof() {
-            println!("    Preimage: {}", preimage);
+            println!("    Preimage: {}", escape_control(preimage));
         }
     }
 
-    println!("\nTotal paid: {} {}", total_paid, unit);
-    println!("Total fees: {} {}", total_fees, unit);
+    println!(
+        "\nTotal paid: {} {}",
+        total_paid,
+        escape_control(&unit.to_string())
+    );
+    println!(
+        "Total fees: {} {}",
+        total_fees,
+        escape_control(&unit.to_string())
+    );
 
     Ok(())
 }

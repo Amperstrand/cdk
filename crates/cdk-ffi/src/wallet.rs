@@ -4,16 +4,25 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bip39::Mnemonic;
-use cdk::wallet::{Wallet as CdkWallet, WalletBuilder as CdkWalletBuilder};
+use cdk::wallet::{RateLimitConfig, Wallet as CdkWallet, WalletBuilder as CdkWalletBuilder};
 
 use crate::error::FfiError;
+#[cfg(feature = "npubcash")]
+use crate::npubcash::NpubCashUserResponse;
 use crate::token::Token;
+#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
 use crate::types::bip321::BitcoinNetwork;
-use crate::types::payment_request::PaymentRequest;
+use crate::types::payment_request::{PaymentRequest, PreparedPaymentRequest};
 use crate::types::*;
 
-/// FFI-compatible Wallet
-
+/// FFI-compatible wallet.
+///
+/// Wallet methods can write to the configured local store while they perform
+/// mint, receive, recovery, subscription, and status operations. Mobile host
+/// apps own platform lifecycle handling around these calls: pause or cancel work
+/// when moving to the background unless background network and storage activity
+/// is intended, and use platform facilities such as iOS `beginBackgroundTask`
+/// when an operation must finish after a lifecycle transition.
 #[derive(uniffi::Object)]
 pub struct Wallet {
     inner: Arc<CdkWallet>,
@@ -33,7 +42,13 @@ impl Wallet {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Wallet {
-    /// Create a new Wallet
+    /// Create a new wallet.
+    ///
+    /// The returned wallet uses `store` for local state. FFI wallet methods may
+    /// write to that store later, so mobile host apps are responsible for
+    /// choosing durable storage locations and coordinating lifecycle transitions
+    /// around wallet calls. For example, use iOS `beginBackgroundTask` if a
+    /// write-capable operation must continue after the app backgrounds.
     ///
     /// Accepts a `WalletStore` which can be:
     /// - `Sqlite { path }` — built-in Rust SQLite backend
@@ -54,16 +69,32 @@ impl Wallet {
             .map_err(|e| FfiError::internal(format!("Invalid mnemonic: {}", e)))?;
         let seed = m.to_seed_normalized("");
 
-        let wallet = CdkWalletBuilder::new()
+        let requested = config
+            .rate_limit
+            .as_ref()
+            .map(RateLimit::to_config)
+            .transpose()?;
+        let pace_with = requested.map(|config| config.unwrap_or_default());
+        let start_disabled = matches!(requested, Some(None));
+
+        let mut builder = CdkWalletBuilder::new()
             .mint_url(mint_url.parse().map_err(|e: cdk::mint_url::Error| {
                 FfiError::internal(format!("Invalid URL: {}", e))
             })?)
             .unit(unit.into())
             .localstore(localstore)
             .seed(seed)
-            .target_proof_count(config.target_proof_count.unwrap_or(3) as usize)
-            .build()
-            .map_err(FfiError::from)?;
+            .target_proof_count(config.target_proof_count.unwrap_or(3) as usize);
+
+        if let Some(config) = pace_with {
+            builder = builder.with_rate_limiting_config(config);
+        }
+
+        let wallet = builder.build().map_err(FfiError::from)?;
+
+        if start_disabled {
+            wallet.disable_rate_limiting();
+        }
 
         Ok(Self {
             inner: Arc::new(wallet),
@@ -103,6 +134,42 @@ impl Wallet {
         self.inner.set_metadata_cache_ttl(ttl);
     }
 
+    /// Change client-side request rate limiting on this wallet.
+    ///
+    /// A new wallet starts with whatever `WalletConfig.rate_limit` selected. Use
+    /// this to disable pacing, restore the default, or set a custom burst and
+    /// refill. It takes effect immediately and covers every host the wallet's
+    /// limiter paces, so it reaches the main and blind-auth clients as well as
+    /// any third-party host their transport reaches. For a wallet built through
+    /// a wallet repository the limiter is shared, so the change is
+    /// repository-wide.
+    ///
+    /// Returns an error if a `Custom` value has a zero field.
+    pub fn set_rate_limit(&self, rate_limit: RateLimit) -> Result<(), FfiError> {
+        match rate_limit.to_config()? {
+            Some(config) => self.inner.set_rate_limiting_config(config),
+            None => self.inner.disable_rate_limiting(),
+        }
+        Ok(())
+    }
+
+    /// Whether this wallet's requests are being paced right now.
+    ///
+    /// Also false when the wallet paces nothing at all, which is the case
+    /// [`Wallet::set_rate_limit`] silently ignores.
+    pub fn is_rate_limited(&self) -> bool {
+        self.inner.is_rate_limited()
+    }
+
+    /// Wait until the rate-limit budget this wallet drew down has been stored.
+    ///
+    /// Await this before dropping the wallet on shutdown. Without it,
+    /// persistence is best effort and a rebuild can outrun the detached writer,
+    /// so the rebuilt wallet starts with a full burst against the mint's cap.
+    pub async fn flush_rate_limits(&self) {
+        self.inner.flush_rate_limits().await;
+    }
+
     /// Get total balance
     pub async fn total_balance(&self) -> Result<Amount, FfiError> {
         let balance = self.inner.total_balance().await?;
@@ -135,7 +202,11 @@ impl Wallet {
         Ok(info.into())
     }
 
-    /// Receive tokens
+    /// Receive tokens.
+    ///
+    /// This verifies and persists received proofs in the local store. Mobile
+    /// hosts should avoid starting it during app background transitions unless
+    /// background network and storage activity is intended.
     pub async fn receive(
         &self,
         token: std::sync::Arc<Token>,
@@ -154,6 +225,12 @@ impl Wallet {
         Ok(restored.into())
     }
 
+    /// Restore wallet from seed with custom NUT-13 options
+    pub async fn restore_with_opts(&self, opts: NUT13Options) -> Result<Restored, FfiError> {
+        let restored = self.inner.restore_with_opts(opts.try_into()?).await?;
+        Ok(restored.into())
+    }
+
     /// Verify token DLEQ proofs
     pub async fn verify_token_dleq(&self, token: std::sync::Arc<Token>) -> Result<(), FfiError> {
         let cdk_token = token.inner.clone();
@@ -161,7 +238,11 @@ impl Wallet {
         Ok(())
     }
 
-    /// Receive proofs directly
+    /// Receive proofs directly.
+    ///
+    /// This verifies and persists received proofs in the local store. Mobile
+    /// hosts should avoid starting it during app background transitions unless
+    /// background network and storage activity is intended.
     pub async fn receive_proofs(
         &self,
         proofs: Proofs,
@@ -210,7 +291,7 @@ impl Wallet {
     ) -> Result<std::sync::Arc<PreparedSend>, FfiError> {
         let prepared = self
             .inner
-            .prepare_send(amount.into(), options.into())
+            .prepare_send(amount.into(), options.try_into()?)
             .await?;
         Ok(std::sync::Arc::new(PreparedSend::new(
             self.inner.clone(),
@@ -244,6 +325,9 @@ impl Wallet {
     /// Updates local store with current state from mint.
     /// If there was a crashed mid-mint (pending saga), attempts to complete it.
     /// Does NOT mint tokens directly - use mint() for that.
+    /// This may perform network requests and write recovery/status updates to
+    /// the local store, so mobile hosts should coordinate it with app lifecycle
+    /// transitions.
     ///
     /// **Note:** The mint quote must be known to the wallet (stored locally) for this
     /// function to work. If the quote is not stored locally, use `fetch_mint_quote`
@@ -258,24 +342,43 @@ impl Wallet {
     /// Updates local store with current state from mint.
     /// If there was a crashed mid-mint (pending saga), attempts to complete it.
     /// Does NOT mint tokens directly - use mint() for that.
+    /// This may perform network requests and write recovery/status updates to
+    /// the local store, so mobile hosts should coordinate it with app lifecycle
+    /// transitions.
     ///
     /// **Note:** The mint quote must be known to the wallet (stored locally) for this
     /// function to work. If the quote is not stored locally, use `fetch_mint_quote`
     /// instead.
+    ///
+    /// Returns the persisted database version and ownership after status/recovery writes.
+    ///
+    /// # Errors
+    /// Returns an error for a mismatched response quote ID or a failed database reload.
     pub async fn check_mint_quote_status(&self, quote_id: String) -> Result<MintQuote, FfiError> {
         let quote = self.inner.check_mint_quote_status(&quote_id).await?;
         Ok(quote.into())
     }
 
-    /// Fetch a mint quote from the mint and store it locally
+    /// Fetch a mint quote from the mint and store it locally.
+    ///
+    /// This performs network I/O and writes the fetched quote to the local store.
+    /// Mobile hosts should avoid starting it during app background transitions
+    /// unless background network and storage activity is intended.
     ///
     /// Works with all payment methods (Bolt11, Bolt12, and custom payment methods).
+    ///
+    /// A quote not created by this wallet instance, such as one fetched after
+    /// restoring from seed, is stored without its NUT-20 signing key. Use
+    /// `fetch_mint_quote_with_key_search` to recover that key.
     ///
     /// # Arguments
     /// * `quote_id` - The ID of the quote to fetch
     /// * `payment_method` - The payment method for the quote. Required if the quote
     ///   is not already stored locally. If the quote exists locally, the stored
     ///   payment method will be used and this parameter is ignored.
+    ///
+    /// # Errors
+    /// Returns an error for a mismatched response quote ID before storing the quote.
     pub async fn fetch_mint_quote(
         &self,
         quote_id: String,
@@ -286,7 +389,43 @@ impl Wallet {
         Ok(quote.into())
     }
 
-    /// Mint tokens
+    /// Fetch a mint quote and try to recover its NUT-20 signing key from the seed.
+    ///
+    /// Use after restoring a wallet from seed to claim a quote whose ID is known
+    /// but whose signing key was lost. Searches the wallet's NUT-20 keys at
+    /// counters `0..key_search_limit` for the public key the mint reports and
+    /// stores the match, advancing the wallet's NUT-20 counter past it.
+    ///
+    /// Succeeds even if no key matched. Check `secret_key` on the returned quote:
+    /// if set, call `mint`; if not, retry with a larger limit. The limit must
+    /// exceed the index the original wallet used, which is below the number of
+    /// locked quotes it created. Zero disables the search. Existing keys and
+    /// NpubCash quotes are left unchanged, and random keys cannot be recovered.
+    ///
+    /// This performs network I/O and writes the quote and counter to the local store.
+    pub async fn fetch_mint_quote_with_key_search(
+        &self,
+        quote_id: String,
+        payment_method: Option<PaymentMethod>,
+        key_search_limit: u32,
+    ) -> Result<MintQuote, FfiError> {
+        let quote = self
+            .inner
+            .fetch_mint_quote_with_key_search(
+                &quote_id,
+                payment_method.map(Into::into),
+                key_search_limit,
+            )
+            .await?;
+        Ok(quote.into())
+    }
+
+    /// Mint tokens.
+    ///
+    /// This writes newly issued proofs and saga state to the local store while
+    /// communicating with the mint. Mobile hosts should coordinate it with app
+    /// lifecycle transitions, using platform background-task support when the
+    /// operation must finish after backgrounding.
     pub async fn mint(
         &self,
         quote_id: String,
@@ -301,6 +440,15 @@ impl Wallet {
             .mint(&quote_id, amount_split_target.into(), conditions)
             .await?;
         Ok(proofs.into_iter().map(|p| p.into()).collect())
+    }
+
+    /// Check and mint any paid but unissued mint quotes.
+    ///
+    /// This is useful during startup or recovery after incomplete mint quote flows.
+    /// It may perform network requests and write newly issued proofs to the wallet store.
+    pub async fn mint_unissued_quotes(&self) -> Result<Amount, FfiError> {
+        let minted = self.inner.mint_unissued_quotes().await?;
+        Ok(minted.into())
     }
 
     /// Prepare a melt operation
@@ -344,6 +492,39 @@ impl Wallet {
         Ok(PreparedMelt::new(Arc::clone(&self.inner), &prepared))
     }
 
+    /// Prepare a melt operation with specific proofs and additional options
+    ///
+    /// Same as `prepare_melt_proofs`, with P2PK/HTLC-locked proofs signed
+    /// using `options.p2pk_signing_keys` plus any signing keys known to the
+    /// wallet, and HTLC preimages from `options.preimages` attached, before
+    /// the proofs are reserved.
+    ///
+    /// # Arguments
+    ///
+    /// * `quote_id` - The melt quote ID (obtained from `melt_quote`)
+    /// * `proofs` - The proofs to melt (can be external proofs not in the wallet's database)
+    /// * `options` - Signing keys, preimages, and metadata for the prepare step
+    ///
+    /// # Returns
+    ///
+    /// A `PreparedMelt` that can be confirmed or cancelled
+    pub async fn prepare_melt_proofs_with_options(
+        &self,
+        quote_id: String,
+        proofs: Proofs,
+        options: MeltPrepareOptions,
+    ) -> Result<PreparedMelt, FfiError> {
+        let cdk_proofs: Result<Vec<cdk::nuts::Proof>, _> =
+            proofs.into_iter().map(|p| p.try_into()).collect();
+        let cdk_proofs = cdk_proofs?;
+
+        let prepared = self
+            .inner
+            .prepare_melt_proofs_with_options(&quote_id, cdk_proofs, options.try_into()?)
+            .await?;
+        Ok(PreparedMelt::new(Arc::clone(&self.inner), &prepared))
+    }
+
     /// Prepare a melt operation from an encoded token
     ///
     /// Decodes the token internally (handling keyset state for v2 keysets),
@@ -369,6 +550,39 @@ impl Wallet {
         Ok(PreparedMelt::new(Arc::clone(&self.inner), &prepared))
     }
 
+    /// Prepare a melt operation from an encoded token with additional options
+    ///
+    /// Same as `prepare_melt_token`, with locked inputs handled as described
+    /// in `prepare_melt_proofs_with_options`.
+    ///
+    /// # Arguments
+    ///
+    /// * `quote_id` - The melt quote ID (obtained from `melt_quote`)
+    /// * `encoded_token` - The encoded token string (cashuA or cashuB format)
+    /// * `options` - Signing keys, preimages, and metadata for the prepare step
+    ///
+    /// # Returns
+    ///
+    /// A `PreparedMelt` that can be confirmed or cancelled
+    pub async fn prepare_melt_token_with_options(
+        &self,
+        quote_id: String,
+        encoded_token: String,
+        options: MeltPrepareOptions,
+    ) -> Result<PreparedMelt, FfiError> {
+        let prepared = self
+            .inner
+            .prepare_melt_token_with_options(&quote_id, &encoded_token, options.try_into()?)
+            .await?;
+        Ok(PreparedMelt::new(Arc::clone(&self.inner), &prepared))
+    }
+
+    /// Mint tokens using the unified payment-method interface.
+    ///
+    /// This writes newly issued proofs and saga state to the local store while
+    /// communicating with the mint. Mobile hosts should coordinate it with app
+    /// lifecycle transitions, using platform background-task support when the
+    /// operation must finish after backgrounding.
     pub async fn mint_unified(
         &self,
         quote_id: String,
@@ -409,6 +623,69 @@ impl Wallet {
             .await?;
         Ok(quote.into())
     }
+
+    /// Create quotes for transferring the maximum amount allowed by the source
+    /// balance and both mints' advertised BOLT11 limits.
+    ///
+    /// The returned input fee assumes all currently unspent source proofs are
+    /// used. Prepare the returned melt quote with those proofs and confirm it
+    /// with `skip_swap` to preserve that accounting.
+    ///
+    /// This search may create multiple quote pairs at the remote mints. Only the
+    /// returned pair is persisted locally; unused remote quotes cannot be
+    /// cancelled and remain until they expire.
+    pub async fn cross_mint_transfer_quote_max(
+        &self,
+        target_wallet: std::sync::Arc<Wallet>,
+    ) -> Result<CrossMintTransferQuote, FfiError> {
+        let quote = self
+            .inner
+            .cross_mint_transfer_quote_max(target_wallet.inner.as_ref())
+            .await?;
+        Ok(quote.into())
+    }
+
+    /// Fetch available onchain melt quote options.
+    ///
+    /// Each returned quote represents one selectable confirmation target/fee reserve.
+    /// Pass the chosen quote to `select_onchain_melt_quote`, then prepare and confirm
+    /// the returned quote ID through the normal melt flow.
+    pub async fn quote_onchain_melt_options(
+        &self,
+        address: String,
+        amount: Amount,
+        max_fee_amount: Option<Amount>,
+    ) -> Result<Vec<MeltQuote>, FfiError> {
+        let quotes = self
+            .inner
+            .quote_onchain_melt_options(&address, amount.into(), max_fee_amount.map(Into::into))
+            .await?;
+
+        Ok(quotes.into_iter().map(Into::into).collect())
+    }
+
+    /// Persist the selected onchain melt quote before preparing it.
+    pub async fn select_onchain_melt_quote(&self, quote: MeltQuote) -> Result<MeltQuote, FfiError> {
+        let quote = self
+            .inner
+            .select_onchain_melt_quote(quote.try_into()?)
+            .await?;
+        Ok(quote.into())
+    }
+
+    /// Check melt quote status and attempt to complete any in-progress saga.
+    /// Returns the persisted database version and ownership after status/recovery writes.
+    pub async fn check_melt_quote_status(&self, quote_id: String) -> Result<MeltQuote, FfiError> {
+        let quote = self.inner.check_melt_quote_status(&quote_id).await?;
+        Ok(quote.into())
+    }
+
+    /// Finalize pending melt operations for this wallet.
+    pub async fn finalize_pending_melts(&self) -> Result<Vec<FinalizedMelt>, FfiError> {
+        let finalized = self.inner.finalize_pending_melts().await?;
+        Ok(finalized.into_iter().map(Into::into).collect())
+    }
+
     /// Swap proofs
     pub async fn swap(
         &self,
@@ -525,12 +802,17 @@ impl Wallet {
         Ok(())
     }
 
-    /// Subscribe to wallet events
+    /// Subscribe to wallet events.
+    ///
+    /// The returned subscription may keep polling or receiving network events
+    /// until it is dropped or closed. Mobile hosts should cancel, drop, or stop
+    /// waiting on subscriptions during app background transitions when
+    /// background network or storage activity is not desired.
     pub async fn subscribe(
         &self,
         params: SubscribeParams,
     ) -> Result<std::sync::Arc<ActiveSubscription>, FfiError> {
-        let cdk_params: cdk::nuts::nut17::Params<Arc<String>> = params.clone().into();
+        let cdk_params: cdk::nuts::nut17::Params<Arc<String>> = params.into();
         let sub_id = cdk_params.id.to_string();
         let active_sub = self.inner.subscribe(cdk_params).await?;
         Ok(std::sync::Arc::new(ActiveSubscription::new(
@@ -545,6 +827,10 @@ impl Wallet {
     ///
     /// Use `recv()` on the returned `ActiveSubscription` to receive updates as
     /// `NotificationPayload::MintQuoteUpdate`.
+    /// The returned subscription may keep polling or receiving network events
+    /// until it is dropped or closed. Mobile hosts should cancel, drop, or stop
+    /// waiting on subscriptions during app background transitions when
+    /// background network or storage activity is not desired.
     ///
     /// All quote IDs must belong to the same payment method.
     ///
@@ -567,15 +853,26 @@ impl Wallet {
         )))
     }
 
-    /// Refresh keysets from the mint
-    pub async fn refresh_keysets(&self) -> Result<Vec<KeySetInfo>, FfiError> {
-        let keysets = self.inner.refresh_keysets().await?;
+    /// Get all keysets for this wallet's unit
+    pub async fn keysets(
+        &self,
+        policy: Option<crate::types::wallet::KeysetLoadPolicy>,
+    ) -> Result<Vec<KeySet>, FfiError> {
+        let cdk_policy: cdk_common::wallet::KeysetLoadPolicy = policy.unwrap_or_default().into();
+        let keysets = self.inner.keysets(cdk_policy).await?;
         Ok(keysets.into_iter().map(Into::into).collect())
     }
 
-    /// Get the active keyset for the wallet's unit
-    pub async fn get_active_keyset(&self) -> Result<KeySetInfo, FfiError> {
-        let keyset = self.inner.get_active_keyset().await?;
+    /// Get the active keyset with the lowest fees
+    pub async fn active_keyset(&self) -> Result<KeySet, FfiError> {
+        let keyset = self.inner.active_keyset().await?;
+        Ok(keyset.into())
+    }
+
+    /// Get a single keyset by ID
+    pub async fn keyset(&self, keyset_id: String) -> Result<KeySet, FfiError> {
+        let id = cdk::nuts::Id::from_str(&keyset_id).map_err(FfiError::internal)?;
+        let keyset = self.inner.keyset(id).await?;
         Ok(keyset.into())
     }
 
@@ -583,34 +880,6 @@ impl Wallet {
     pub async fn get_keyset_fees_by_id(&self, keyset_id: String) -> Result<u64, FfiError> {
         let id = cdk::nuts::Id::from_str(&keyset_id).map_err(FfiError::internal)?;
         Ok(self.inner.get_keyset_fees_by_id(id).await?)
-    }
-
-    /// Load keys for a specific keyset
-    pub async fn load_keyset_keys(&self, keyset_id: String) -> Result<Keys, FfiError> {
-        let id = cdk::nuts::Id::from_str(&keyset_id).map_err(FfiError::internal)?;
-        let keys = self.inner.load_keyset_keys(id).await?;
-        Ok(keys.into())
-    }
-
-    /// Get keysets for this wallet's unit with filter
-    pub async fn get_mint_keysets(
-        &self,
-        filter: KeysetFilter,
-    ) -> Result<Vec<KeySetInfo>, FfiError> {
-        let keysets = self.inner.get_mint_keysets(filter.into()).await?;
-        Ok(keysets.into_iter().map(Into::into).collect())
-    }
-
-    /// Load active keysets
-    pub async fn load_mint_keysets(&self) -> Result<Vec<KeySetInfo>, FfiError> {
-        let keysets = self.inner.load_mint_keysets().await?;
-        Ok(keysets.into_iter().map(Into::into).collect())
-    }
-
-    /// Fetch active keyset with lowest fees
-    pub async fn fetch_active_keyset(&self) -> Result<KeySetInfo, FfiError> {
-        let keyset = self.inner.fetch_active_keyset().await?;
-        Ok(keyset.into())
     }
 
     /// Get fees and amounts for all keysets
@@ -649,9 +918,25 @@ impl Wallet {
     ///
     /// This function checks orphaned pending proofs (not managed by active sagas)
     /// with the mint and marks spent proofs accordingly.
+    /// It may perform network requests and write proof-state updates to the
+    /// local store, so mobile hosts should coordinate it with app lifecycle
+    /// transitions.
     pub async fn check_all_pending_proofs(&self) -> Result<Amount, FfiError> {
         let amount = self.inner.check_all_pending_proofs().await?;
         Ok(amount.into())
+    }
+
+    /// Recover from incomplete wallet sagas after a crash
+    ///
+    /// Handles interrupted swap, send, receive, issue, and melt operations. Requires
+    /// network access to the mint for states that need external status checks.
+    /// Recovery writes saga, proof, quote, and transaction updates to the local
+    /// store. Mobile hosts should run it only when background network and storage
+    /// activity is acceptable, or wrap it in platform background-task support
+    /// such as iOS `beginBackgroundTask`.
+    pub async fn recover_incomplete_sagas(&self) -> Result<RecoveryReport, FfiError> {
+        let report = self.inner.recover_incomplete_sagas().await?;
+        Ok(report.into())
     }
 
     /// Calculate fee for a given number of proofs with the specified keyset
@@ -665,32 +950,87 @@ impl Wallet {
         Ok(fee.into())
     }
 
-    /// Pay a NUT-18 payment request
+    /// Prepare a NUT-18 payment request so its method and input fees can be reviewed.
     ///
-    /// This method prepares and sends a payment for the given payment request.
-    /// It will use the Nostr or HTTP transport specified in the request.
-    ///
-    /// # Arguments
-    ///
-    /// * `payment_request` - The NUT-18 payment request to pay
-    /// * `custom_amount` - Optional amount to pay (required if request has no amount)
-    pub async fn pay_request(
+    /// Call `confirm` or `cancel` on the returned object to complete the flow.
+    pub async fn prepare_pay_request(
         &self,
         payment_request: std::sync::Arc<PaymentRequest>,
         custom_amount: Option<Amount>,
-    ) -> Result<(), FfiError> {
-        self.inner
-            .pay_request(
+    ) -> Result<std::sync::Arc<PreparedPaymentRequest>, FfiError> {
+        let prepared = self
+            .inner
+            .prepare_pay_request(
                 payment_request.inner().clone(),
                 custom_amount.map(Into::into),
             )
             .await?;
+        Ok(std::sync::Arc::new(PreparedPaymentRequest::new(prepared)))
+    }
+}
+
+/// NpubCash methods for Wallet
+#[cfg(feature = "npubcash")]
+#[uniffi::export(async_runtime = "tokio")]
+impl Wallet {
+    /// Enable NpubCash integration for this wallet
+    ///
+    /// Derives the NpubCash Nostr keys from the wallet seed, creates the
+    /// API client, sets this wallet's mint URL on the server, and enables
+    /// NUT-20 quote locking for newly created quotes. The integration is
+    /// only activated once locking has been enabled and confirmed.
+    ///
+    /// Returns an error if quote locking cannot be established — for
+    /// example when the configured mint does not support NUT-20.
+    pub async fn enable_npubcash(&self, npubcash_url: String) -> Result<(), FfiError> {
+        self.inner.enable_npubcash(npubcash_url).await?;
         Ok(())
+    }
+
+    /// Reconcile the wallet with NpubCash by resolving quotes missing locally
+    ///
+    /// Fetches all quote IDs from the NpubCash server, resolves full data for
+    /// quotes missing from the local store, and refreshes NUT-20 lock
+    /// provenance for quotes already known locally. Unlike
+    /// `claim_npubcash_quotes`, this does not mint anything; it only
+    /// reconciles the local quote store with the server.
+    ///
+    /// Returns the quotes that were missing locally and have now been added.
+    ///
+    /// Requires NpubCash to be enabled on this wallet first.
+    pub async fn sync_missing_npubcash_quotes(&self) -> Result<Vec<MintQuote>, FfiError> {
+        let quotes = self.inner.sync_missing_npubcash_quotes().await?;
+        Ok(quotes.into_iter().map(Into::into).collect())
+    }
+
+    /// Claim all pending NpubCash quotes
+    ///
+    /// Syncs quotes from the NpubCash server (including reconciliation of
+    /// quotes missing locally) and mints every paid NpubCash quote that has
+    /// not been issued yet. Only quotes attributable to the wallet's NpubCash
+    /// accounts are claimed; unrelated mint quotes created through normal
+    /// wallet flows are left untouched. Mints that advertise NUT-29 are
+    /// claimed with batch minting automatically; other mints fall back to
+    /// individual minting.
+    ///
+    /// Returns the total amount minted across all claimed quotes.
+    pub async fn claim_npubcash_quotes(&self) -> Result<Amount, FfiError> {
+        let minted = self.inner.claim_npubcash_quotes().await?;
+        Ok(minted.into())
+    }
+
+    /// Fetch this wallet's NpubCash account settings
+    ///
+    /// Returns the configured mint URL and whether quote locking is enabled.
+    /// Requires NpubCash to be enabled on this wallet first.
+    pub async fn get_npubcash_user_info(&self) -> Result<NpubCashUserResponse, FfiError> {
+        let response = self.inner.get_npubcash_user_info().await?;
+        Ok(response.into())
     }
 }
 
 /// BIP353 methods for Wallet
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
 #[uniffi::export(async_runtime = "tokio")]
 impl Wallet {
     /// Get a quote for a BIP353 melt
@@ -807,10 +1147,75 @@ impl Wallet {
     }
 }
 
+/// Client-side request pacing for a wallet's mint traffic.
+///
+/// A wallet starts with whatever [`WalletConfig::rate_limit`] selected, which
+/// defaults to the built-in pacing so it stays under a mint's per-minute request
+/// cap. Pass one of these to [`Wallet::set_rate_limit`] to change it on a live
+/// wallet.
+///
+/// # Example
+///
+/// ```ignore
+/// // Turn pacing off (e.g. a mint with no request cap).
+/// wallet.set_rate_limit(RateLimit::Disabled)?;
+///
+/// // Restore the built-in default pacing.
+/// wallet.set_rate_limit(RateLimit::Default)?;
+///
+/// // Allow a burst of 20 requests, refilling 60 per minute.
+/// wallet.set_rate_limit(RateLimit::Custom {
+///     capacity: 20,
+///     refill_per_minute: 60,
+/// })?;
+/// ```
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum RateLimit {
+    /// Built-in default pacing (capacity 20, refill 20/min).
+    Default,
+    /// No client-side pacing.
+    Disabled,
+    /// Custom burst capacity and per-minute refill. Both must be non-zero.
+    Custom {
+        /// Maximum burst: requests allowed back-to-back before pacing kicks in.
+        capacity: u32,
+        /// Sustained rate: requests earned back per minute.
+        refill_per_minute: u32,
+    },
+}
+
+impl RateLimit {
+    /// Translate into the native config, where `None` means pacing is off.
+    ///
+    /// The only place a zero-valued `Custom` is rejected, since the native
+    /// config's fields are non-zero by construction.
+    pub(crate) fn to_config(&self) -> Result<Option<RateLimitConfig>, FfiError> {
+        match self {
+            RateLimit::Default => Ok(Some(RateLimitConfig::default())),
+            RateLimit::Disabled => Ok(None),
+            RateLimit::Custom {
+                capacity,
+                refill_per_minute,
+            } => RateLimitConfig::try_new(*capacity, *refill_per_minute)
+                .map(Some)
+                .ok_or_else(|| {
+                    FfiError::internal("rate limit capacity and refill_per_minute must be non-zero")
+                }),
+        }
+    }
+}
+
 /// Configuration for creating wallets
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WalletConfig {
     pub target_proof_count: Option<u32>,
+    /// Client-side request pacing to start with. Omit it to keep the built-in
+    /// default, which paces the wallet under a mint's per-minute request cap.
+    ///
+    /// `Disabled` builds the limiter but leaves it off, so a later
+    /// [`Wallet::set_rate_limit`] can turn pacing back on.
+    #[uniffi(default = None)]
+    pub rate_limit: Option<RateLimit>,
 }
 
 /// Generates a new random mnemonic phrase
@@ -827,4 +1232,194 @@ pub fn mnemonic_to_entropy(mnemonic: String) -> Result<Vec<u8>, FfiError> {
     let m = Mnemonic::parse(&mnemonic)
         .map_err(|e| FfiError::internal(format!("Invalid mnemonic: {}", e)))?;
     Ok(m.to_entropy())
+}
+
+#[cfg(test)]
+mod tests {
+    use cdk_common::wallet::Wallet as WalletTrait;
+
+    use super::*;
+    use crate::database::custom_wallet_store;
+    use crate::sqlite::WalletSqliteDatabase;
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn wallet_with(rate_limit: Option<RateLimit>) -> Result<Wallet, FfiError> {
+        let db = WalletSqliteDatabase::new_in_memory().expect("in-memory wallet db should open");
+        Wallet::new(
+            "https://mint.example.com".to_string(),
+            CurrencyUnit::Sat,
+            MNEMONIC.to_string(),
+            custom_wallet_store(db),
+            WalletConfig {
+                target_proof_count: None,
+                rate_limit,
+            },
+        )
+    }
+
+    fn test_wallet() -> Wallet {
+        wallet_with(None).expect("wallet should be created")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mint_unissued_quotes_is_available_on_wallet_and_trait() {
+        let wallet = test_wallet();
+
+        let minted = wallet
+            .mint_unissued_quotes()
+            .await
+            .expect("empty quote store should mint zero");
+        assert!(minted.is_zero());
+
+        let trait_minted = <Wallet as WalletTrait>::mint_unissued_quotes(&wallet)
+            .await
+            .expect("trait call should mint zero from empty quote store");
+        assert!(trait_minted.is_zero());
+    }
+
+    #[test]
+    fn set_rate_limit_accepts_default_disabled_and_custom() {
+        let wallet = test_wallet();
+
+        wallet
+            .set_rate_limit(RateLimit::Default)
+            .expect("default is always valid");
+        wallet
+            .set_rate_limit(RateLimit::Disabled)
+            .expect("disabled is always valid");
+        wallet
+            .set_rate_limit(RateLimit::Custom {
+                capacity: 20,
+                refill_per_minute: 60,
+            })
+            .expect("non-zero custom is valid");
+    }
+
+    #[test]
+    fn set_rate_limit_rejects_zero_custom() {
+        let wallet = test_wallet();
+
+        assert!(wallet
+            .set_rate_limit(RateLimit::Custom {
+                capacity: 0,
+                refill_per_minute: 60,
+            })
+            .is_err());
+        assert!(wallet
+            .set_rate_limit(RateLimit::Custom {
+                capacity: 10,
+                refill_per_minute: 0,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn to_config_maps_every_variant() {
+        assert_eq!(
+            RateLimit::Default.to_config().expect("default is valid"),
+            Some(RateLimitConfig::default())
+        );
+        assert_eq!(
+            RateLimit::Disabled.to_config().expect("disabled is valid"),
+            None
+        );
+        assert_eq!(
+            RateLimit::Custom {
+                capacity: 5,
+                refill_per_minute: 30,
+            }
+            .to_config()
+            .expect("non-zero custom is valid"),
+            RateLimitConfig::try_new(5, 30)
+        );
+        assert!(RateLimit::Custom {
+            capacity: 0,
+            refill_per_minute: 30,
+        }
+        .to_config()
+        .is_err());
+        assert!(RateLimit::Custom {
+            capacity: 5,
+            refill_per_minute: 0,
+        }
+        .to_config()
+        .is_err());
+    }
+
+    #[test]
+    fn wallet_config_selects_the_starting_rate_limit() {
+        for rate_limit in [
+            None,
+            Some(RateLimit::Default),
+            Some(RateLimit::Custom {
+                capacity: 5,
+                refill_per_minute: 30,
+            }),
+        ] {
+            let wallet = wallet_with(rate_limit).expect("wallet should be created");
+            assert!(wallet.is_rate_limited());
+        }
+    }
+
+    #[test]
+    fn wallet_config_disabled_is_reversible() {
+        let wallet = wallet_with(Some(RateLimit::Disabled)).expect("wallet should be created");
+        assert!(!wallet.is_rate_limited());
+
+        wallet
+            .set_rate_limit(RateLimit::Default)
+            .expect("default is always valid");
+        assert!(
+            wallet.is_rate_limited(),
+            "a wallet built disabled still has a limiter to turn back on"
+        );
+    }
+
+    #[test]
+    fn wallet_config_rejects_zero_custom() {
+        assert!(wallet_with(Some(RateLimit::Custom {
+            capacity: 0,
+            refill_per_minute: 30,
+        }))
+        .is_err());
+        assert!(wallet_with(Some(RateLimit::Custom {
+            capacity: 5,
+            refill_per_minute: 0,
+        }))
+        .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_rate_limits_is_available_on_wallet_and_trait() {
+        let wallet = test_wallet();
+
+        wallet.flush_rate_limits().await;
+        <Wallet as WalletTrait>::flush_rate_limits(&wallet).await;
+    }
+
+    #[test]
+    fn rate_limiting_round_trips_through_the_trait() {
+        let wallet = test_wallet();
+        assert!(<Wallet as WalletTrait>::is_rate_limited(&wallet));
+
+        <Wallet as WalletTrait>::set_rate_limiting_config(&wallet, None);
+        assert!(!<Wallet as WalletTrait>::is_rate_limited(&wallet));
+
+        <Wallet as WalletTrait>::set_rate_limiting_config(
+            &wallet,
+            Some(RateLimitConfig::default()),
+        );
+        assert!(<Wallet as WalletTrait>::is_rate_limited(&wallet));
+    }
+
+    #[cfg(feature = "npubcash")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn npubcash_methods_require_an_enabled_client() {
+        let wallet = test_wallet();
+
+        assert!(wallet.sync_missing_npubcash_quotes().await.is_err());
+        assert!(wallet.claim_npubcash_quotes().await.is_err());
+        assert!(wallet.get_npubcash_user_info().await.is_err());
+    }
 }

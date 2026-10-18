@@ -14,13 +14,22 @@
 //!   - If successful: The wallet completes the local state update (e.g. marking proofs spent).
 //!   - If failed/unknown: The wallet may rollback or retry depending on the specific state.
 
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
 use cdk_common::wallet::{ProofInfo, WalletSagaState};
 use cdk_common::BlindedMessage;
 use tracing::instrument;
 
 use crate::dhke::construct_proofs;
-use crate::nuts::{CheckStateRequest, PreMintSecrets, Proofs, RestoreRequest, State, SwapRequest};
+use crate::nuts::{
+    BlindSignature, CheckStateRequest, PreMintSecrets, Proofs, RestoreRequest, RestoreResponse,
+    State, SwapRequest,
+};
+use crate::wallet::blind_signature::{
+    validate_mint_response_signatures, SignatureAmountValidation,
+};
+use crate::wallet::util::escape_log_value;
 use crate::{Error, Wallet};
 
 /// Parameters for recovering outputs using stored blinded messages.
@@ -36,8 +45,17 @@ struct OutputRecoveryParams<'a> {
     counter_end: u32,
 }
 
+/// Whether all requested outputs must have been signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputRecoveryMode {
+    /// Fixed outputs from swap, receive, or issuance must all be recovered.
+    Complete,
+    /// Melt change may leave some blank outputs unsigned.
+    Partial,
+}
+
 /// Report of recovery operations performed by [`Wallet::recover_incomplete_sagas`].
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RecoveryReport {
     /// Operations successfully completed after crash
     pub recovered: usize,
@@ -69,6 +87,17 @@ pub enum RecoveryAction {
     Skipped,
 }
 
+/// Detailed result of a restore attempt against the mint.
+#[derive(Debug, Clone)]
+pub(crate) enum OutputRecoveryResult {
+    /// The mint returned signatures and the wallet reconstructed proofs.
+    Restored(Vec<ProofInfo>),
+    /// The mint accepted the restore request but had no matching signatures.
+    EmptyResponse,
+    /// The restore attempt could not be made definitively.
+    Unavailable,
+}
+
 /// Shared recovery helpers for saga resume operations.
 ///
 /// These methods are used by individual saga resume modules to check
@@ -89,7 +118,8 @@ pub trait RecoveryHelpers {
     /// Restore outputs using stored blinded messages.
     ///
     /// Queries the mint's /restore endpoint to recover proof signatures,
-    /// then reconstructs the proofs.
+    /// then reconstructs the proofs. An incomplete response returns an error so
+    /// callers retain the operation for retry.
     ///
     /// Returns:
     /// - `Ok(Some(proofs))` if outputs were successfully restored
@@ -154,23 +184,20 @@ impl RecoveryHelpers for Wallet {
         counter_start: Option<u32>,
         counter_end: Option<u32>,
     ) -> Result<Option<Vec<ProofInfo>>, Error> {
-        // Clone blinded messages to avoid temporary lifetime issues
-        let blinded_messages_owned = blinded_messages.map(|bm| bm.to_vec());
-
-        // Extract and validate parameters
-        let params = match Self::extract_recovery_params(
-            saga_id,
-            saga_type,
-            blinded_messages_owned.as_ref(),
-            counter_start,
-            counter_end,
-        ) {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-
-        self.recover_outputs_from_blinded_messages(saga_id, saga_type, params)
-            .await
+        match self
+            .restore_outputs_with_result(
+                saga_id,
+                saga_type,
+                blinded_messages,
+                counter_start,
+                counter_end,
+                OutputRecoveryMode::Complete,
+            )
+            .await?
+        {
+            OutputRecoveryResult::Restored(proofs) => Ok(Some(proofs)),
+            OutputRecoveryResult::EmptyResponse | OutputRecoveryResult::Unavailable => Ok(None),
+        }
     }
 
     /// Attempt to replay a swap request using stored data.
@@ -238,7 +265,7 @@ impl RecoveryHelpers for Wallet {
                     "{} saga {} - replay failed ({}), falling back to other recovery",
                     saga_type,
                     saga_id,
-                    e
+                    escape_log_value(&e)
                 );
                 return Ok(None);
             }
@@ -260,7 +287,15 @@ impl RecoveryHelpers for Wallet {
             PreMintSecrets::restore_batch(keyset_id, &self.seed, counter_start, counter_end)?;
 
         // Load keyset keys
-        let keys = self.load_keyset_keys(keyset_id).await?;
+        let keys = self.keyset(keyset_id).await?.keys;
+
+        validate_mint_response_signatures(
+            self,
+            &swap_response.signatures,
+            blinded_messages.iter(),
+            SignatureAmountValidation::Exact,
+        )
+        .await?;
 
         // Construct proofs
         let proofs = construct_proofs(
@@ -273,7 +308,15 @@ impl RecoveryHelpers for Wallet {
         // Convert to ProofInfo
         let proof_infos: Vec<ProofInfo> = proofs
             .into_iter()
-            .map(|p| ProofInfo::new(p, self.mint_url.clone(), State::Unspent, self.unit.clone()))
+            .zip(&premint_secrets.secrets)
+            .map(|(p, premint)| {
+                let proof_info =
+                    ProofInfo::new(p, self.mint_url.clone(), State::Unspent, self.unit.clone())?;
+                Ok::<_, Error>(match premint.derivation_index {
+                    Some(index) => proof_info.with_derivation_index(index),
+                    None => proof_info,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Some(proof_infos))
@@ -281,6 +324,63 @@ impl RecoveryHelpers for Wallet {
 }
 
 impl Wallet {
+    /// Restore outputs, requiring complete coverage for fixed-output operations.
+    pub(crate) async fn restore_outputs_with_result(
+        &self,
+        saga_id: &uuid::Uuid,
+        saga_type: &str,
+        blinded_messages: Option<&[BlindedMessage]>,
+        counter_start: Option<u32>,
+        counter_end: Option<u32>,
+        mode: OutputRecoveryMode,
+    ) -> Result<OutputRecoveryResult, Error> {
+        let blinded_messages_owned = blinded_messages.map(|bm| bm.to_vec());
+
+        let params = match Self::extract_recovery_params(
+            saga_id,
+            saga_type,
+            blinded_messages_owned.as_ref(),
+            counter_start,
+            counter_end,
+        ) {
+            Some(p) => p,
+            None => return Ok(OutputRecoveryResult::Unavailable),
+        };
+
+        self.recover_outputs_from_blinded_messages(saga_id, saga_type, params, mode)
+            .await
+    }
+
+    /// Recover NUT-08 change signatures already included in a paid quote.
+    pub(crate) async fn recover_melt_change_signatures(
+        &self,
+        saga_id: &uuid::Uuid,
+        blinded_messages: &[BlindedMessage],
+        counter_start: u32,
+        counter_end: u32,
+        signatures: Vec<BlindSignature>,
+    ) -> Result<OutputRecoveryResult, Error> {
+        // NUT-08 returns the signed prefix in the original output order.
+        let outputs = blinded_messages.get(..signatures.len()).ok_or_else(|| {
+            Error::InvalidMintResponse("melt change exceeds the requested output count".to_owned())
+        })?;
+        self.construct_recovered_outputs(
+            saga_id,
+            "Melt",
+            OutputRecoveryParams {
+                blinded_messages,
+                counter_start,
+                counter_end,
+            },
+            OutputRecoveryMode::Partial,
+            RestoreResponse {
+                outputs: outputs.to_vec(),
+                signatures,
+            },
+        )
+        .await
+    }
+
     /// Recover from incomplete operations after a crash. Call on startup.
     ///
     /// Handles interrupted swap, send, receive, and melt operations to prevent
@@ -349,7 +449,11 @@ impl Wallet {
                     report.skipped += 1;
                 }
                 Err(e) => {
-                    tracing::error!("Failed to recover saga {}: {}", saga.id, e);
+                    tracing::error!(
+                        "Failed to recover saga {}: {}",
+                        saga.id,
+                        escape_log_value(&e)
+                    );
                     report.failed += 1;
                 }
             }
@@ -374,9 +478,9 @@ impl Wallet {
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(proofs))` - Successfully recovered proofs
-    /// - `Ok(None)` - Could not recover (mint unreachable, no signatures, etc.)
-    ///   Caller should fall back to cleanup.
+    /// - `Ok(OutputRecoveryResult::Restored(proofs))` - Successfully recovered proofs
+    /// - `Ok(OutputRecoveryResult::EmptyResponse)` - Mint had no matching signatures
+    /// - `Ok(OutputRecoveryResult::Unavailable)` - Could not make a definitive restore attempt
     /// - `Err(_)` - Unrecoverable error (e.g., cryptographic failure)
     #[instrument(skip(self, params))]
     async fn recover_outputs_from_blinded_messages(
@@ -384,7 +488,8 @@ impl Wallet {
         saga_id: &uuid::Uuid,
         saga_type: &str,
         params: OutputRecoveryParams<'_>,
-    ) -> Result<Option<Vec<ProofInfo>>, Error> {
+        mode: OutputRecoveryMode,
+    ) -> Result<OutputRecoveryResult, Error> {
         tracing::info!(
             "{} saga {} - attempting to recover {} outputs using stored blinded messages",
             saga_type,
@@ -405,21 +510,59 @@ impl Wallet {
                          Run wallet.restore() to recover any missing proofs.",
                         saga_type,
                         saga_id,
-                        e
+                        escape_log_value(&e)
                     );
-                    return Ok(None);
+                    return Ok(OutputRecoveryResult::Unavailable);
                 } else {
                     tracing::warn!(
                         "{} saga {} - failed to restore from mint (ambiguous): {}. \
                          Skipping recovery to retry later.",
                         saga_type,
                         saga_id,
-                        e
+                        escape_log_value(&e)
                     );
                     return Err(e);
                 }
             }
         };
+
+        self.construct_recovered_outputs(saga_id, saga_type, params, mode, restore_response)
+            .await
+    }
+
+    /// Validate and construct proofs identically for restore and quote responses.
+    async fn construct_recovered_outputs(
+        &self,
+        saga_id: &uuid::Uuid,
+        saga_type: &str,
+        params: OutputRecoveryParams<'_>,
+        mode: OutputRecoveryMode,
+        restore_response: RestoreResponse,
+    ) -> Result<OutputRecoveryResult, Error> {
+        // Even partial change must map each signature to a distinct requested
+        // output. Counting the same proof twice would overstate recovered value.
+        let mut expected: HashSet<_> = params
+            .blinded_messages
+            .iter()
+            .map(|output| output.blinded_secret)
+            .collect();
+        if expected.len() != params.blinded_messages.len()
+            || restore_response.outputs.len() != restore_response.signatures.len()
+            || !restore_response
+                .outputs
+                .iter()
+                .all(|output| expected.remove(&output.blinded_secret))
+        {
+            return Err(Error::InvalidMintResponse(
+                "restore response contains duplicate, unrequested, or unpaired outputs".to_owned(),
+            ));
+        }
+        // A subset is not enough to finish an operation with fixed outputs.
+        if mode == OutputRecoveryMode::Complete && !expected.is_empty() {
+            return Err(Error::InvalidMintResponse(
+                "restore response does not cover every expected output exactly once".to_owned(),
+            ));
+        }
 
         if restore_response.signatures.is_empty() {
             tracing::warn!(
@@ -428,7 +571,7 @@ impl Wallet {
                 saga_type,
                 saga_id
             );
-            return Ok(None);
+            return Ok(OutputRecoveryResult::EmptyResponse);
         }
 
         // Get keyset ID from the first blinded message
@@ -441,31 +584,58 @@ impl Wallet {
             params.counter_end,
         )?;
 
-        // Match the returned outputs to our premint secrets by B_ value
-        let matched_secrets: Vec<_> = premint_secrets
+        let premints_by_blinded_secret = premint_secrets
             .secrets
             .iter()
-            .filter(|p| restore_response.outputs.contains(&p.blinded_message))
+            .map(|premint| (premint.blinded_message.blinded_secret, premint))
+            .collect::<HashMap<_, _>>();
+        let requested_outputs_by_blinded_secret = params
+            .blinded_messages
+            .iter()
+            .map(|output| (output.blinded_secret, output))
+            .collect::<HashMap<_, _>>();
+
+        // Match the returned outputs to our premint secrets by B_ value, preserving
+        // the mint response order used by the returned signatures.
+        let matched: Vec<_> = restore_response
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                let premint = premints_by_blinded_secret.get(&output.blinded_secret)?;
+                let requested_output =
+                    requested_outputs_by_blinded_secret.get(&output.blinded_secret)?;
+                Some((*premint, *requested_output))
+            })
             .collect();
 
-        if matched_secrets.len() != restore_response.signatures.len() {
+        if matched.len() != restore_response.signatures.len() {
             tracing::warn!(
                 "{} saga {} - signature count mismatch: {} secrets, {} signatures",
                 saga_type,
                 saga_id,
-                matched_secrets.len(),
+                matched.len(),
                 restore_response.signatures.len()
             );
         }
 
         // Load keyset keys for proof construction
-        let keys = self.load_keyset_keys(keyset_id).await?;
+        let keys = self.keyset(keyset_id).await?.keys;
+
+        validate_mint_response_signatures(
+            self,
+            &restore_response.signatures,
+            matched
+                .iter()
+                .map(|(_, requested_output)| *requested_output),
+            SignatureAmountValidation::AllowZeroAmountPlaceholder,
+        )
+        .await?;
 
         // Construct proofs from signatures
         let proofs = construct_proofs(
             restore_response.signatures,
-            matched_secrets.iter().map(|p| p.r.clone()).collect(),
-            matched_secrets.iter().map(|p| p.secret.clone()).collect(),
+            matched.iter().map(|(p, _)| p.r.clone()).collect(),
+            matched.iter().map(|(p, _)| p.secret.clone()).collect(),
             &keys,
         )?;
 
@@ -479,10 +649,18 @@ impl Wallet {
         // Convert to ProofInfo
         let proof_infos: Vec<ProofInfo> = proofs
             .into_iter()
-            .map(|p| ProofInfo::new(p, self.mint_url.clone(), State::Unspent, self.unit.clone()))
+            .zip(matched)
+            .map(|(p, (premint, _))| {
+                let proof_info =
+                    ProofInfo::new(p, self.mint_url.clone(), State::Unspent, self.unit.clone())?;
+                Ok::<_, Error>(match premint.derivation_index {
+                    Some(index) => proof_info.with_derivation_index(index),
+                    None => proof_info,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(Some(proof_infos))
+        Ok(OutputRecoveryResult::Restored(proof_infos))
     }
 
     /// Extract recovery parameters from operation data.
@@ -566,23 +744,23 @@ impl Wallet {
                             // No saga found - this is an orphaned reservation
                             tracing::warn!(
                                 "Found orphaned melt quote reservation: quote={}, operation={}. Releasing.",
-                                quote.id,
+                                escape_log_value(&quote.id),
                                 operation_id
                             );
                             if let Err(e) = self.localstore.release_melt_quote(&operation_id).await
                             {
                                 tracing::error!(
                                     "Failed to release orphaned melt quote {}: {}",
-                                    quote.id,
-                                    e
+                                    escape_log_value(&quote.id),
+                                    escape_log_value(&e)
                                 );
                             }
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "Failed to check saga for melt quote {}: {}",
-                                quote.id,
-                                e
+                                escape_log_value(&quote.id),
+                                escape_log_value(&e)
                             );
                         }
                     }
@@ -609,23 +787,23 @@ impl Wallet {
                             // No saga found - this is an orphaned reservation
                             tracing::warn!(
                                 "Found orphaned mint quote reservation: quote={}, operation={}. Releasing.",
-                                quote.id,
+                                escape_log_value(&quote.id),
                                 operation_id
                             );
                             if let Err(e) = self.localstore.release_mint_quote(&operation_id).await
                             {
                                 tracing::error!(
                                     "Failed to release orphaned mint quote {}: {}",
-                                    quote.id,
-                                    e
+                                    escape_log_value(&quote.id),
+                                    escape_log_value(&e)
                                 );
                             }
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "Failed to check saga for mint quote {}: {}",
-                                quote.id,
-                                e
+                                escape_log_value(&quote.id),
+                                escape_log_value(&e)
                             );
                         }
                     }
@@ -639,18 +817,336 @@ impl Wallet {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::str::FromStr;
     use std::sync::Arc;
 
     use cdk_common::mint_url::MintUrl;
-    use cdk_common::nuts::{MeltQuoteBolt11Response, MeltQuoteState, State};
+    use cdk_common::nuts::{MeltQuoteBolt11Response, MeltQuoteState, PaymentMethod, State};
     use cdk_common::wallet::{
         IssueSagaState, MeltOperationData, MeltSagaState, MintOperationData, OperationData,
-        ReceiveOperationData, ReceiveSagaState, WalletSaga, WalletSagaState,
+        ReceiveOperationData, ReceiveSagaState, TransactionDirection, WalletSaga, WalletSagaState,
     };
     use cdk_common::Amount;
 
     use crate::wallet::test_utils::*;
+
+    #[tokio::test]
+    async fn test_partial_output_recovery_validates_response_identities() {
+        use crate::nuts::{BlindSignature, PreMintSecrets, RestoreResponse};
+
+        let db = create_test_db().await;
+        let client = Arc::new(MockMintConnector::new());
+        client.enable_mint_signing();
+        let keyset_id = client.keysets.lock().unwrap()[0].id;
+        let wallet = create_test_wallet_with_mock(db, client.clone()).await;
+        let premints = PreMintSecrets::restore_batch(keyset_id, &wallet.seed, 5, 9).unwrap();
+        let outputs = premints.blinded_messages();
+        let amount = Amount::from(8);
+        let signatures: Vec<_> = outputs
+            .iter()
+            .map(|output| BlindSignature {
+                amount,
+                keyset_id,
+                c: crate::dhke::sign_message(
+                    &client.mint_signing_keys.lock().unwrap().as_ref().unwrap()[&amount],
+                    &output.blinded_secret,
+                )
+                .unwrap(),
+                dleq: None,
+            })
+            .collect();
+        let saga_id = uuid::Uuid::new_v4();
+        let recover = || {
+            wallet.restore_outputs_with_result(
+                &saga_id,
+                "Melt",
+                Some(&outputs[..3]),
+                Some(5),
+                Some(8),
+                super::OutputRecoveryMode::Partial,
+            )
+        };
+        for (case, response) in [
+            (
+                "duplicate outputs with valid signatures",
+                RestoreResponse {
+                    outputs: vec![outputs[0].clone(); 3],
+                    signatures: vec![signatures[0].clone(); 3],
+                },
+            ),
+            (
+                "unrequested output",
+                RestoreResponse {
+                    outputs: vec![outputs[3].clone()],
+                    signatures: vec![signatures[3].clone()],
+                },
+            ),
+            (
+                "unrequested output must not be filtered out",
+                RestoreResponse {
+                    outputs: vec![outputs[3].clone(), outputs[0].clone()],
+                    signatures: vec![signatures[0].clone()],
+                },
+            ),
+            (
+                "output without a signature",
+                RestoreResponse {
+                    outputs: vec![outputs[0].clone()],
+                    signatures: vec![],
+                },
+            ),
+        ] {
+            client._set_restore_response(Ok(response));
+            assert!(
+                matches!(recover().await, Err(crate::Error::InvalidMintResponse(_))),
+                "accepted {case}"
+            );
+        }
+
+        // A genuine subset may arrive in any order. Each proof must retain the
+        // secret and derivation index belonging to its corresponding output.
+        client._set_restore_response(Ok(RestoreResponse {
+            outputs: vec![outputs[2].clone(), outputs[0].clone()],
+            signatures: vec![signatures[2].clone(), signatures[0].clone()],
+        }));
+        let super::OutputRecoveryResult::Restored(proofs) = recover().await.unwrap() else {
+            panic!("valid subset must restore");
+        };
+        assert_eq!(proofs.len(), 2);
+        for (proof, index) in proofs.iter().zip([2, 0]) {
+            assert_eq!(proof.derivation_index, Some(5 + index as u32));
+            assert_eq!(proof.proof.secret, premints.secrets[index].secret);
+            crate::dhke::verify_message(
+                &client.mint_signing_keys.lock().unwrap().as_ref().unwrap()[&amount],
+                proof.proof.c,
+                &proof.proof.secret.to_bytes(),
+            )
+            .unwrap();
+        }
+        client._set_restore_response(Ok(RestoreResponse {
+            outputs: vec![],
+            signatures: vec![],
+        }));
+        assert!(matches!(
+            recover().await.unwrap(),
+            super::OutputRecoveryResult::EmptyResponse
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fixed_output_recovery_rejects_incomplete_responses_and_retries() {
+        use cdk_common::amount::{FeeAndAmounts, SplitTarget};
+        use cdk_common::wallet::{SwapOperationData, SwapSagaState, TransactionStatus};
+
+        use crate::nuts::{
+            BlindSignature, CheckStateResponse, CurrencyUnit, PreMintSecrets, RestoreResponse,
+        };
+        use crate::Error;
+
+        for (kind, repeated_amounts) in [
+            ("Swap", false),
+            ("Issue", false),
+            ("Receive", false),
+            ("Swap", true),
+            ("Issue", true),
+            ("Receive", true),
+        ] {
+            let issue = kind == "Issue";
+            let receive = kind == "Receive";
+            let db = create_test_db().await;
+            let client = Arc::new(MockMintConnector::new());
+            client.enable_mint_signing();
+            let keyset_id = client.keysets.lock().unwrap()[0].id;
+            let wallet = create_test_wallet_with_mock(db.clone(), client.clone()).await;
+            let amount = Amount::from(13);
+            let split = if repeated_amounts {
+                SplitTarget::Values(vec![4.into(), 4.into(), 4.into(), 1.into()])
+            } else {
+                SplitTarget::None
+            };
+            let premints = PreMintSecrets::from_seed(
+                keyset_id,
+                0,
+                &wallet.seed,
+                amount,
+                &split,
+                &FeeAndAmounts::from((0, vec![1, 2, 4, 8])),
+            )
+            .unwrap();
+            let outputs = premints.blinded_messages();
+            let output_count = outputs.len();
+            assert_eq!(output_count, if repeated_amounts { 4 } else { 3 });
+            let signatures: Vec<_> = outputs
+                .iter()
+                .map(|output| BlindSignature {
+                    amount: output.amount,
+                    keyset_id,
+                    c: crate::dhke::sign_message(
+                        &client.mint_signing_keys.lock().unwrap().as_ref().unwrap()[&output.amount],
+                        &output.blinded_secret,
+                    )
+                    .unwrap(),
+                    dleq: None,
+                })
+                .collect();
+            client._set_restore_response(Ok(RestoreResponse {
+                outputs: outputs[..1].to_vec(),
+                signatures: signatures[..1].to_vec(),
+            }));
+            let mut blank_outputs = outputs.clone();
+            for output in &mut blank_outputs {
+                output.amount = Amount::ZERO;
+            }
+            let melt_result = wallet
+                .restore_outputs_with_result(
+                    &uuid::Uuid::new_v4(),
+                    "Melt",
+                    Some(&blank_outputs),
+                    Some(0),
+                    Some(output_count as u32),
+                    super::OutputRecoveryMode::Partial,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(melt_result, super::OutputRecoveryResult::Restored(proofs) if proofs.len() == 1)
+            );
+            let saga_id = uuid::Uuid::new_v4();
+            let (state, data) = match kind {
+                "Issue" => (
+                    WalletSagaState::Issue(IssueSagaState::MintRequested),
+                    OperationData::Mint(MintOperationData::new_single(
+                        "restore-test".to_owned(),
+                        amount,
+                        Some(0),
+                        Some(output_count as u32),
+                        Some(outputs.clone()),
+                    )),
+                ),
+                "Receive" => (
+                    WalletSagaState::Receive(ReceiveSagaState::SwapRequested),
+                    OperationData::Receive(ReceiveOperationData {
+                        token: None,
+                        counter_start: Some(0),
+                        counter_end: Some(output_count as u32),
+                        amount: Some(amount),
+                        blinded_messages: Some(outputs.clone()),
+                    }),
+                ),
+                _ => (
+                    WalletSagaState::Swap(SwapSagaState::SwapRequested),
+                    OperationData::Swap(SwapOperationData {
+                        input_amount: amount,
+                        output_amount: amount,
+                        counter_start: Some(0),
+                        counter_end: Some(output_count as u32),
+                        blinded_messages: Some(outputs.clone()),
+                    }),
+                ),
+            };
+            let input = test_proof_info(keyset_id, 13, test_mint_url());
+            if receive {
+                db.update_proofs(vec![input.clone()], vec![]).await.unwrap();
+                db.reserve_proofs(vec![input.y], &saga_id).await.unwrap();
+            }
+            let stage_spent_inputs = || {
+                client.set_post_swap_response(Err(Error::TokenAlreadySpent));
+                client.set_check_state_response(Ok(CheckStateResponse {
+                    states: vec![(input.y, State::Spent).into()],
+                }));
+            };
+            db.add_saga(WalletSaga::new(
+                saga_id,
+                state,
+                amount,
+                test_mint_url(),
+                CurrencyUnit::Sat,
+                data,
+            ))
+            .await
+            .unwrap();
+
+            let mut duplicate_outputs = outputs.clone();
+            let duplicate_index = outputs
+                .iter()
+                .position(|o| {
+                    o.amount == outputs[1].amount && o.blinded_secret != outputs[1].blinded_secret
+                })
+                .unwrap_or(0);
+            duplicate_outputs[1] = duplicate_outputs[duplicate_index].clone();
+            let mut duplicate_signatures = signatures.clone();
+            duplicate_signatures[1] = duplicate_signatures[duplicate_index].clone();
+            let mut unknown_outputs = outputs.clone();
+            unknown_outputs[0].blinded_secret = test_proof(keyset_id, 1).c;
+            // Repeated denominations let a valid duplicate signature preserve
+            // both count and total amount while omitting an expected identity.
+            let invalid_responses = [
+                RestoreResponse {
+                    outputs: vec![],
+                    signatures: vec![],
+                },
+                RestoreResponse {
+                    outputs: outputs[..1].to_vec(),
+                    signatures: signatures[..1].to_vec(),
+                },
+                RestoreResponse {
+                    outputs: duplicate_outputs,
+                    signatures: duplicate_signatures,
+                },
+                RestoreResponse {
+                    outputs: unknown_outputs,
+                    signatures: signatures.clone(),
+                },
+                RestoreResponse {
+                    outputs: outputs.clone(),
+                    signatures: signatures[..1].to_vec(),
+                },
+            ];
+            for (case, response) in invalid_responses.into_iter().enumerate() {
+                client._set_restore_response(Ok(response));
+                stage_spent_inputs();
+                let report = wallet.recover_incomplete_sagas().await.unwrap();
+                assert_eq!(
+                    report.failed, 1,
+                    "kind={kind}, repeated={repeated_amounts}, case={case}"
+                );
+                assert_eq!(report.recovered, 0);
+                assert!(db.get_saga(&saga_id).await.unwrap().is_some());
+                let stored = db.get_proofs(None, None, None, None).await.unwrap();
+                assert_eq!(stored.len(), usize::from(receive));
+                if receive {
+                    assert_eq!(stored[0].y, input.y);
+                    assert_eq!(db.get_reserved_proofs(&saga_id).await.unwrap().len(), 1);
+                }
+                if issue || receive {
+                    let transactions = db.list_transactions(None, None, None).await.unwrap();
+                    assert_eq!(transactions.len(), 1);
+                    assert_eq!(transactions[0].status, TransactionStatus::Pending);
+                }
+            }
+
+            client._set_restore_response(Ok(RestoreResponse {
+                outputs: outputs.into_iter().rev().collect(),
+                signatures: signatures.into_iter().rev().collect(),
+            }));
+            stage_spent_inputs();
+            let report = wallet.recover_incomplete_sagas().await.unwrap();
+            assert_eq!(report.recovered, 1);
+            assert_eq!(report.failed, 0);
+            assert!(db.get_saga(&saga_id).await.unwrap().is_none());
+            let proofs = db.get_proofs(None, None, None, None).await.unwrap();
+            assert_eq!(proofs.len(), output_count);
+            assert_eq!(
+                Amount::try_sum(proofs.iter().map(|p| p.proof.amount)).unwrap(),
+                amount
+            );
+            if issue || receive {
+                let transactions = db.list_transactions(None, None, None).await.unwrap();
+                assert_eq!(transactions[0].status, TransactionStatus::Completed);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_recover_receive_proofs_pending() {
@@ -771,6 +1267,8 @@ mod tests {
                 counter_start: None,
                 counter_end: None,
                 change_amount: None,
+                metadata: HashMap::new(),
+                final_proof_ys: None,
                 change_blinded_messages: None,
             }),
         );
@@ -846,6 +1344,8 @@ mod tests {
                     counter_start: None,
                     counter_end: None,
                     change_amount: None,
+                    metadata: HashMap::new(),
+                    final_proof_ys: None,
                     change_blinded_messages: None,
                 }),
             );
@@ -919,11 +1419,11 @@ mod tests {
         let keyset_id = test_keyset_id();
         let saga_id = uuid::Uuid::new_v4();
 
-        // Create and reserve proofs
-        let proof_info = test_proof_info(keyset_id, 100, mint_url.clone());
-        let proof_y = proof_info.y;
+        // Create pending proofs as they would be after a melt request is sent.
+        let mut proof_info = test_proof_info(keyset_id, 100, mint_url.clone());
+        proof_info.state = State::Pending;
+        proof_info.used_by_operation = Some(saga_id);
         db.update_proofs(vec![proof_info], vec![]).await.unwrap();
-        db.reserve_proofs(vec![proof_y], &saga_id).await.unwrap();
 
         // Create a melt quote
         let mut quote = test_melt_quote();
@@ -945,6 +1445,8 @@ mod tests {
                 counter_start: None,
                 counter_end: None,
                 change_amount: None,
+                metadata: HashMap::new(),
+                final_proof_ys: None,
                 change_blinded_messages: None,
             }),
         );
@@ -962,6 +1464,7 @@ mod tests {
             change: None,
             request: None,
             unit: None,
+            method: PaymentMethod::BOLT11,
         }));
 
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
@@ -1020,6 +1523,8 @@ mod tests {
                 counter_start: None,
                 counter_end: None,
                 change_amount: None,
+                metadata: HashMap::new(),
+                final_proof_ys: None,
                 change_blinded_messages: None,
             }),
         );
@@ -1037,6 +1542,7 @@ mod tests {
             change: None,
             request: None,
             unit: None,
+            method: PaymentMethod::BOLT11,
         }));
 
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
@@ -1089,6 +1595,8 @@ mod tests {
                 counter_start: None,
                 counter_end: None,
                 change_amount: None,
+                metadata: HashMap::new(),
+                final_proof_ys: None,
                 change_blinded_messages: None,
             }),
         );
@@ -1106,6 +1614,7 @@ mod tests {
             change: None,
             request: None,
             unit: None,
+            method: PaymentMethod::BOLT11,
         }));
 
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
@@ -1139,17 +1648,20 @@ mod tests {
         let keyset_id = test_keyset_id();
         let saga_id = uuid::Uuid::new_v4();
 
-        // Create and reserve proofs
-        let proof_info = test_proof_info(keyset_id, 100, mint_url.clone());
-        let proof_y = proof_info.y;
-        db.update_proofs(vec![proof_info], vec![]).await.unwrap();
-        db.reserve_proofs(vec![proof_y], &saga_id).await.unwrap();
-
         // Create a melt quote
         let mut quote = test_melt_quote();
         quote.used_by_operation = Some(saga_id.to_string());
         let quote_id = quote.id.clone();
         db.add_melt_quote(quote).await.unwrap();
+
+        let mut metadata = HashMap::new();
+        metadata.insert("label".to_string(), "restored melt".to_string());
+
+        // Create pending proofs as they would be after a melt request is sent.
+        let mut proof_info = test_proof_info(keyset_id, 100, mint_url.clone());
+        proof_info.state = State::Pending;
+        proof_info.used_by_operation = Some(saga_id);
+        db.update_proofs(vec![proof_info], vec![]).await.unwrap();
 
         // Create saga in MeltRequested state (no change blinded messages for simplicity)
         let saga = WalletSaga::new(
@@ -1165,6 +1677,8 @@ mod tests {
                 counter_start: None,
                 counter_end: None,
                 change_amount: None,
+                metadata: metadata.clone(),
+                final_proof_ys: None,
                 change_blinded_messages: None, // No change to recover
             }),
         );
@@ -1182,6 +1696,7 @@ mod tests {
             change: None,
             request: None,
             unit: None,
+            method: PaymentMethod::BOLT11,
         }));
 
         let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
@@ -1201,6 +1716,21 @@ mod tests {
 
         // Saga should be deleted
         assert!(db.get_saga(&saga_id).await.unwrap().is_none());
+
+        let transactions = db
+            .list_transactions(None, Some(TransactionDirection::Outgoing), None)
+            .await
+            .unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].metadata, metadata);
+        assert_eq!(transactions[0].saga_id, Some(saga_id));
+        assert_eq!(
+            transactions[0].payment_proof,
+            Some("preimage123".to_string())
+        );
+
+        let recovered_quote = db.get_melt_quote(&quote_id).await.unwrap().unwrap();
+        assert_eq!(recovered_quote.state, MeltQuoteState::Paid);
     }
 
     #[tokio::test]

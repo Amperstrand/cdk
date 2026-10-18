@@ -14,10 +14,11 @@ use axum::response::{IntoResponse, Response};
 use cdk::mint::QuoteId;
 use cdk::nuts::nut21::{Method, ProtectedEndpoint, RoutePath};
 use cdk::nuts::{
-    BatchCheckMintQuoteRequest, BatchMintRequest, MeltQuoteBolt11Request, MeltQuoteBolt12Request,
-    MeltQuoteCustomRequest, MintQuoteBolt11Request, MintQuoteBolt11Response,
-    MintQuoteBolt12Request, MintQuoteBolt12Response, MintQuoteCustomRequest, MintRequest,
-    MintResponse,
+    BatchCheckMintQuoteRequest, BatchMintRequest, MeltOnchainRequest, MeltQuoteBolt11Request,
+    MeltQuoteBolt12Request, MeltQuoteCustomRequest, MeltQuoteOnchainRequest,
+    MintQuoteBolt11Request, MintQuoteBolt11Response, MintQuoteBolt12Request,
+    MintQuoteBolt12Response, MintQuoteCustomRequest, MintQuoteOnchainRequest,
+    MintQuoteOnchainResponse, MintRequest, MintResponse, PaymentMethod,
 };
 use cdk::{MeltQuoteCreateResponse, MeltQuoteResponse};
 use serde_json::Value;
@@ -71,22 +72,23 @@ where
 }
 
 /// Serialize a `MeltQuoteResponse` into an HTTP JSON response that carries the
-/// per-variant payload shape (bolt11, bolt12, or custom) rather than the tag.
+/// per-variant payload shape rather than the enum tag.
 fn melt_quote_response_to_json(response: MeltQuoteResponse<QuoteId>) -> Response {
     match response {
         MeltQuoteResponse::Bolt11(r) => Json(r).into_response(),
         MeltQuoteResponse::Bolt12(r) => Json(r).into_response(),
+        MeltQuoteResponse::Onchain(r) => Json(r).into_response(),
         MeltQuoteResponse::Custom((_, r)) => Json(r).into_response(),
     }
 }
 
 /// Serialize a `MeltQuoteCreateResponse` into an HTTP JSON response that
-/// carries the per-variant payload shape (bolt11, bolt12, or custom) rather
-/// than the tag.
+/// carries the per-variant payload shape rather than the enum tag.
 fn melt_quote_create_response_to_json(response: MeltQuoteCreateResponse<QuoteId>) -> Response {
     match response {
         MeltQuoteCreateResponse::Bolt11(r) => Json(r).into_response(),
         MeltQuoteCreateResponse::Bolt12(r) => Json(r).into_response(),
+        MeltQuoteCreateResponse::Onchain(r) => Json(r).into_response(),
         MeltQuoteCreateResponse::Custom((_, r)) => Json(r).into_response(),
     }
 }
@@ -96,17 +98,102 @@ async fn validate_melt_quote_method(
     method: &str,
     quote_id: &QuoteId,
 ) -> Result<(), cdk::Error> {
-    let quote_method = state
-        .mint
-        .get_melt_quote_method(quote_id)
-        .await?
-        .to_string();
+    let quote_method = state.mint.get_melt_quote_method(quote_id).await?;
+    let expected_method = PaymentMethod::from(method);
 
-    if quote_method != method {
+    if quote_method != expected_method {
         return Err(cdk::Error::InvalidPaymentMethod);
     }
 
     Ok(())
+}
+
+// Validate batch bounds before any per-quote database work, including on cache hits.
+async fn validate_batch_quote_ids(
+    state: &MintState,
+    quote_ids: &[QuoteId],
+) -> Result<(), cdk::Error> {
+    if quote_ids.is_empty() {
+        return Err(cdk::Error::UnknownQuote);
+    }
+
+    if let Some(max) = state.mint.mint_info().await?.nuts.nut29.max_batch_size {
+        let max = usize::try_from(max).unwrap_or(usize::MAX);
+        if quote_ids.len() > max {
+            return Err(cdk::Error::BatchSizeExceeded {
+                actual: quote_ids.len(),
+                max,
+            });
+        }
+    }
+
+    let mut unique_ids = std::collections::HashSet::new();
+    for quote_id in quote_ids {
+        if !unique_ids.insert(quote_id) {
+            return Err(cdk::Error::DuplicateQuoteIds);
+        }
+    }
+
+    Ok(())
+}
+
+async fn validate_mint_quote_methods(
+    state: &MintState,
+    method: &str,
+    quote_ids: &[QuoteId],
+) -> Result<(), cdk::Error> {
+    let expected_method = PaymentMethod::from(method);
+
+    for quote_id in quote_ids {
+        let quote_method = state.mint.get_mint_quote_method(quote_id).await?;
+
+        if quote_method != expected_method {
+            return Err(cdk::Error::InvalidPaymentMethod);
+        }
+    }
+
+    Ok(())
+}
+
+async fn validate_mint_request_route(
+    auth: AuthHeader,
+    state: &MintState,
+    method: &str,
+    quote_ids: &[QuoteId],
+) -> Result<(), cdk::Error> {
+    state
+        .mint
+        .verify_auth(
+            auth.into(),
+            &ProtectedEndpoint::new(Method::Post, RoutePath::Mint(method.to_owned())),
+        )
+        .await?;
+
+    validate_mint_quote_methods(state, method, quote_ids).await
+}
+
+async fn process_mint_input(
+    state: &MintState,
+    input: cdk::mint::MintInput,
+) -> Result<MintResponse, cdk::Error> {
+    state.mint.process_mint_request(input).await
+}
+
+async fn validate_melt_request_route(
+    auth: AuthHeader,
+    state: &MintState,
+    method: &str,
+    quote_id: &QuoteId,
+) -> Result<(), cdk::Error> {
+    state
+        .mint
+        .verify_auth(
+            auth.into(),
+            &ProtectedEndpoint::new(Method::Post, RoutePath::Melt(method.to_owned())),
+        )
+        .await?;
+
+    validate_melt_quote_method(state, method, quote_id).await
 }
 
 /// Generic handler for custom payment method mint quotes
@@ -168,6 +255,27 @@ pub async fn post_mint_custom_quote(
                 quote.try_into().map_err(into_response)?;
             Ok(Json(response).into_response())
         }
+        "onchain" => {
+            let onchain_request: MintQuoteOnchainRequest = serde_json::from_value(payload)
+                .map_err(|e| {
+                    tracing::error!("Failed to parse onchain request: {}", e);
+                    if e.to_string().contains("missing field `pubkey`") {
+                        into_response(cdk::Error::PubkeyRequired)
+                    } else {
+                        into_response(cdk::Error::InvalidPaymentMethod)
+                    }
+                })?;
+
+            let quote = state
+                .mint
+                .get_mint_quote(onchain_request.into())
+                .await
+                .map_err(into_response)?;
+
+            let response: MintQuoteOnchainResponse<QuoteId> =
+                MintQuoteOnchainResponse::try_from(quote).map_err(into_response)?;
+            Ok(Json(response).into_response())
+        }
         _ => {
             let custom_request: MintQuoteCustomRequest =
                 serde_json::from_value(payload).map_err(|e| {
@@ -225,12 +333,17 @@ pub async fn get_check_mint_custom_quote(
     match method.as_str() {
         "bolt11" => {
             let response: MintQuoteBolt11Response<QuoteId> =
-                quote_response.try_into().map_err(into_response)?;
+                MintQuoteBolt11Response::try_from(quote_response).map_err(into_response)?;
             Ok(Json(response).into_response())
         }
         "bolt12" => {
             let response: MintQuoteBolt12Response<QuoteId> =
-                quote_response.try_into().map_err(into_response)?;
+                MintQuoteBolt12Response::try_from(quote_response).map_err(into_response)?;
+            Ok(Json(response).into_response())
+        }
+        "onchain" => {
+            let response: MintQuoteOnchainResponse<QuoteId> =
+                MintQuoteOnchainResponse::try_from(quote_response).map_err(into_response)?;
             Ok(Json(response).into_response())
         }
         _ => {
@@ -239,6 +352,7 @@ pub async fn get_check_mint_custom_quote(
                 cdk::mint::MintQuoteResponse::Custom {
                     method: quote_method,
                     response,
+                    ..
                 } => {
                     if quote_method.to_string() != method {
                         return Err(into_response(cdk::Error::InvalidPaymentMethod));
@@ -268,6 +382,14 @@ pub async fn post_batch_check_mint_quote(
         .await
         .map_err(into_response)?;
 
+    validate_batch_quote_ids(&state, &payload.quotes)
+        .await
+        .map_err(into_response)?;
+
+    validate_mint_quote_methods(&state, &method, &payload.quotes)
+        .await
+        .map_err(into_response)?;
+
     let responses = state
         .mint
         .check_mint_quotes(&payload.quotes)
@@ -278,7 +400,7 @@ pub async fn post_batch_check_mint_quote(
         "bolt11" => {
             let responses: Vec<MintQuoteBolt11Response<QuoteId>> = responses
                 .into_iter()
-                .map(|r| r.try_into())
+                .map(MintQuoteBolt11Response::try_from)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(into_response)?;
             Ok(Json(responses).into_response())
@@ -286,7 +408,15 @@ pub async fn post_batch_check_mint_quote(
         "bolt12" => {
             let responses: Vec<MintQuoteBolt12Response<QuoteId>> = responses
                 .into_iter()
-                .map(|r| r.try_into())
+                .map(MintQuoteBolt12Response::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(into_response)?;
+            Ok(Json(responses).into_response())
+        }
+        "onchain" => {
+            let responses: Vec<MintQuoteOnchainResponse<QuoteId>> = responses
+                .into_iter()
+                .map(MintQuoteOnchainResponse::try_from)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(into_response)?;
             Ok(Json(responses).into_response())
@@ -303,58 +433,6 @@ pub async fn post_batch_check_mint_quote(
             Ok(Json(responses).into_response())
         }
     }
-}
-
-/// Mint tokens with custom payment method
-#[instrument(skip_all, fields(method = ?method, quote_id = ?payload.quote))]
-pub async fn post_mint_custom(
-    auth: AuthHeader,
-    State(state): State<MintState>,
-    Path(method): Path<String>,
-    Json(payload): Json<MintRequest<QuoteId>>,
-) -> Result<Json<MintResponse>, Response> {
-    state
-        .mint
-        .verify_auth(
-            auth.into(),
-            &ProtectedEndpoint::new(Method::Post, RoutePath::Mint(method.clone())),
-        )
-        .await
-        .map_err(into_response)?;
-
-    let res = state
-        .mint
-        .process_mint_request(cdk::mint::MintInput::Single(payload))
-        .await
-        .map_err(into_response)?;
-
-    Ok(Json(res))
-}
-
-/// Batch mint tokens (NUT-29)
-#[instrument(skip_all, fields(method = ?method))]
-pub async fn post_batch_mint(
-    auth: AuthHeader,
-    State(state): State<MintState>,
-    Path(method): Path<String>,
-    Json(payload): Json<BatchMintRequest<QuoteId>>,
-) -> Result<Json<MintResponse>, Response> {
-    state
-        .mint
-        .verify_auth(
-            auth.into(),
-            &ProtectedEndpoint::new(Method::Post, RoutePath::Mint(method.clone())),
-        )
-        .await
-        .map_err(into_response)?;
-
-    let res = state
-        .mint
-        .process_mint_request(cdk::mint::MintInput::Batch(payload))
-        .await
-        .map_err(into_response)?;
-
-    Ok(Json(res))
 }
 
 /// Request a melt quote for custom payment method
@@ -401,12 +479,37 @@ pub async fn post_melt_custom_quote(
                 .await
                 .map_err(into_response)?
         }
+        "onchain" => {
+            let onchain_request: MeltQuoteOnchainRequest = serde_json::from_value(payload)
+                .map_err(|e| {
+                    tracing::error!("Failed to parse onchain melt request: {}", e);
+                    into_response(cdk::Error::InvalidPaymentMethod)
+                })?;
+
+            let response = state
+                .mint
+                .get_melt_quote(onchain_request.into())
+                .await
+                .map_err(into_response)?;
+
+            return match response {
+                MeltQuoteCreateResponse::Onchain(r) => Ok(Json(r).into_response()),
+                _ => Err(into_response(cdk::Error::InvalidPaymentMethod)),
+            };
+        }
         _ => {
             let custom_request: MeltQuoteCustomRequest =
                 serde_json::from_value(payload).map_err(|e| {
                     tracing::error!("Failed to parse custom melt request: {}", e);
                     into_response(cdk::Error::InvalidPaymentMethod)
                 })?;
+
+            let request_method = PaymentMethod::from(custom_request.method.as_str());
+            let route_method = PaymentMethod::from(method.as_str());
+
+            if request_method != route_method {
+                return Err(into_response(cdk::Error::InvalidPaymentMethod));
+            }
 
             state
                 .mint
@@ -448,27 +551,17 @@ pub async fn get_check_melt_custom_quote(
     Ok(melt_quote_response_to_json(quote))
 }
 
-async fn post_melt_custom_internal(
-    auth: AuthHeader,
+async fn process_melt_request(
     prefer: PreferHeader,
-    state: MintState,
-    method: String,
-    payload: cdk::nuts::MeltRequest<QuoteId>,
+    state: &MintState,
+    method: &str,
+    payload: &cdk::nuts::MeltRequest<QuoteId>,
 ) -> Result<MeltQuoteResponse<QuoteId>, cdk::Error> {
-    state
-        .mint
-        .verify_auth(
-            auth.into(),
-            &ProtectedEndpoint::new(Method::Post, RoutePath::Melt(method.clone())),
-        )
-        .await?;
-
-    validate_melt_quote_method(&state, &method, payload.quote()).await?;
-
     // Check for async preference in either the Prefer header or the request body
-    let respond_async = prefer.respond_async || payload.is_prefer_async();
+    // For onchain we always want to do the async flow
+    let respond_async = prefer.respond_async || payload.is_prefer_async() || method == "onchain";
 
-    let pending = state.mint.melt(&payload).await?;
+    let pending = state.mint.melt(payload).await?;
 
     let res = if respond_async {
         // Asynchronous processing - return immediately after setup
@@ -479,22 +572,6 @@ async fn post_melt_custom_internal(
     };
 
     Ok(res)
-}
-
-/// Melt tokens with custom payment method
-#[instrument(skip_all, fields(method = ?method))]
-pub async fn post_melt_custom(
-    auth: AuthHeader,
-    prefer: PreferHeader,
-    State(state): State<MintState>,
-    Path(method): Path<String>,
-    Json(payload): Json<cdk::nuts::MeltRequest<QuoteId>>,
-) -> Result<Response, Response> {
-    let res = post_melt_custom_internal(auth, prefer, state, method, payload)
-        .await
-        .map_err(into_response)?;
-
-    Ok(melt_quote_response_to_json(res))
 }
 
 // ============================================================================
@@ -511,14 +588,30 @@ pub async fn cache_post_mint_custom(
 ) -> Result<Json<MintResponse>, Response> {
     use std::ops::Deref;
 
-    let State(mint_state) = state.clone();
-    let json_extracted_payload = payload.deref();
+    let State(mint_state) = state;
+    let method = method.0;
+    let payload = payload.0;
 
-    let cache_key = match mint_state.cache.calculate_key(json_extracted_payload) {
+    validate_mint_request_route(
+        auth,
+        &mint_state,
+        &method,
+        std::slice::from_ref(&payload.quote),
+    )
+    .await
+    .map_err(into_response)?;
+
+    let cache_key = match mint_state
+        .cache
+        .calculate_key(&("mint", method.as_str(), &payload))
+    {
         Some(key) => key,
         None => {
-            // Could not calculate key, just return the handler result
-            return post_mint_custom(auth, state, method, payload).await;
+            let result = process_mint_input(&mint_state, cdk::mint::MintInput::Single(payload))
+                .await
+                .map_err(into_response)?;
+
+            return Ok(Json(result));
         }
     };
 
@@ -526,7 +619,11 @@ pub async fn cache_post_mint_custom(
         return Ok(Json(cached_response));
     }
 
-    let result = post_mint_custom(auth, state, method, payload).await?;
+    let result = Json(
+        process_mint_input(&mint_state, cdk::mint::MintInput::Single(payload))
+            .await
+            .map_err(into_response)?,
+    );
 
     // Cache the response
     mint_state.cache.set(cache_key, result.deref()).await;
@@ -541,20 +638,33 @@ pub async fn cache_post_melt_custom(
     prefer: PreferHeader,
     state: State<MintState>,
     method: Path<String>,
-    payload: Json<cdk::nuts::MeltRequest<QuoteId>>,
+    payload: Json<Value>,
 ) -> Result<Response, Response> {
     use std::ops::Deref;
 
     let State(mint_state) = state.clone();
-    let json_extracted_payload = payload.deref();
+    let method = method.0;
+    tracing::debug!(method = %method, "melt request received");
+    let parsed_payload = parse_melt_payload(&method, payload.deref().clone())?;
 
-    let cache_key = match mint_state.cache.calculate_key(json_extracted_payload) {
-        Some(key) => key,
-        None => {
-            // Could not calculate key, just return the handler result
-            return post_melt_custom(auth, prefer, state, method, payload).await;
-        }
-    };
+    validate_melt_request_route(auth, &mint_state, &method, parsed_payload.quote())
+        .await
+        .map_err(into_response)?;
+
+    let cache_key =
+        match mint_state
+            .cache
+            .calculate_key(&("melt", method.as_str(), &parsed_payload))
+        {
+            Some(key) => key,
+            None => {
+                let result = process_melt_request(prefer, &mint_state, &method, &parsed_payload)
+                    .await
+                    .map_err(into_response)?;
+
+                return Ok(melt_quote_response_to_json(result));
+            }
+        };
 
     if let Some(cached_response) = mint_state
         .cache
@@ -564,19 +674,43 @@ pub async fn cache_post_melt_custom(
         return Ok(melt_quote_response_to_json(cached_response));
     }
 
-    let result = post_melt_custom_internal(
-        auth,
-        prefer,
-        mint_state.clone(),
-        method.clone(),
-        json_extracted_payload.clone(),
-    )
-    .await
-    .map_err(into_response)?;
+    let result = process_melt_request(prefer, &mint_state, &method, &parsed_payload)
+        .await
+        .map_err(into_response)?;
 
     mint_state.cache.set(cache_key, &result).await;
 
     Ok(melt_quote_response_to_json(result))
+}
+
+// The `Err` variant carries an axum `Response` (a pre-built 400 with the full
+// body), which is large but matches the style used throughout this module.
+// Refactoring to a boxed/smaller error would be a cross-cutting change outside
+// the scope of this bug fix.
+#[allow(clippy::result_large_err)]
+fn parse_melt_payload(
+    method: &str,
+    payload: Value,
+) -> Result<cdk::nuts::MeltRequest<QuoteId>, Response> {
+    if method == "onchain" {
+        let request: MeltOnchainRequest<QuoteId> =
+            serde_json::from_value(payload).map_err(|e| {
+                tracing::warn!(
+                    method = %method,
+                    "failed to parse onchain melt request body: {e}",
+                );
+                into_response(cdk::Error::InvalidPaymentRequest)
+            })?;
+        Ok(request.into())
+    } else {
+        serde_json::from_value(payload).map_err(|e| {
+            tracing::warn!(
+                method = %method,
+                "failed to parse melt request body: {e}",
+            );
+            into_response(cdk::Error::InvalidPaymentRequest)
+        })
+    }
 }
 
 /// Cached version of post_batch_mint for NUT-19 caching support
@@ -589,13 +723,38 @@ pub async fn cache_post_batch_mint(
 ) -> Result<Json<MintResponse>, Response> {
     use std::ops::Deref;
 
-    let State(mint_state) = state.clone();
-    let json_extracted_payload = payload.deref();
+    let State(mint_state) = state;
+    let method = method.0;
+    let payload = payload.0;
 
-    let cache_key = match mint_state.cache.calculate_key(json_extracted_payload) {
+    mint_state
+        .mint
+        .verify_auth(
+            auth.into(),
+            &ProtectedEndpoint::new(Method::Post, RoutePath::Mint(method.clone())),
+        )
+        .await
+        .map_err(into_response)?;
+
+    validate_batch_quote_ids(&mint_state, &payload.quotes)
+        .await
+        .map_err(into_response)?;
+
+    validate_mint_quote_methods(&mint_state, &method, &payload.quotes)
+        .await
+        .map_err(into_response)?;
+
+    let cache_key = match mint_state
+        .cache
+        .calculate_key(&("mint_batch", method.as_str(), &payload))
+    {
         Some(key) => key,
         None => {
-            return post_batch_mint(auth, state, method, payload).await;
+            let result = process_mint_input(&mint_state, cdk::mint::MintInput::Batch(payload))
+                .await
+                .map_err(into_response)?;
+
+            return Ok(Json(result));
         }
     };
 
@@ -603,7 +762,11 @@ pub async fn cache_post_batch_mint(
         return Ok(Json(cached_response));
     }
 
-    let result = post_batch_mint(auth, state, method, payload).await?;
+    let result = Json(
+        process_mint_input(&mint_state, cdk::mint::MintInput::Batch(payload))
+            .await
+            .map_err(into_response)?,
+    );
 
     mint_state.cache.set(cache_key, result.deref()).await;
 
@@ -612,9 +775,21 @@ pub async fn cache_post_batch_mint(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use axum::http::{HeaderValue, Request, StatusCode};
+    use bip39::Mnemonic;
+    use cdk::mint::{MintBuilder, MintMeltLimits, MintQuoteResponse};
+    use cdk::nuts::nut00::KnownMethod;
+    use cdk::nuts::{BlindedMessage, CurrencyUnit, MintQuoteState, PaymentMethod, SecretKey};
+    use cdk::types::{FeeReserve, QuoteTTL};
+    use cdk::Amount;
+    use cdk_fake_wallet::FakeWallet;
 
     use super::*;
+    use crate::cache::HttpCache;
 
     fn create_test_request(prefer_header: Option<&str>) -> Request<()> {
         let mut req = Request::builder()
@@ -644,6 +819,165 @@ mod tests {
             .insert(PREFER_HEADER_KEY, HeaderValue::from_bytes(bytes).unwrap());
 
         req
+    }
+
+    async fn create_test_state() -> MintState {
+        let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(db.clone())
+            .with_batch_minting(Some(10), Some(vec![KnownMethod::Bolt11.to_string()]));
+        let fake = FakeWallet::new(
+            FeeReserve {
+                min_fee_reserve: 1.into(),
+                percent_fee_reserve: 0.0,
+            },
+            HashMap::default(),
+            HashSet::default(),
+            0,
+            CurrencyUnit::Sat,
+        );
+        builder
+            .add_payment_processor(
+                CurrencyUnit::Sat,
+                PaymentMethod::Known(KnownMethod::Bolt11),
+                MintMeltLimits::new(1, 10_000),
+                Arc::new(fake),
+            )
+            .await
+            .unwrap();
+
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let mint = builder
+            .build_with_seed(db, &mnemonic.to_seed_normalized(""))
+            .await
+            .unwrap();
+        mint.set_quote_ttl(QuoteTTL::new(10_000, 10_000))
+            .await
+            .unwrap();
+        mint.start().await.unwrap();
+
+        MintState {
+            mint: Arc::new(mint),
+            cache: Arc::new(HttpCache::default()),
+        }
+    }
+
+    async fn create_test_state_with_custom_methods(methods: &[&str]) -> MintState {
+        let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+        let mut builder = MintBuilder::new(db.clone()).with_batch_minting(
+            Some(10),
+            Some(methods.iter().map(|method| method.to_string()).collect()),
+        );
+
+        let custom_methods = methods
+            .iter()
+            .map(|method| (method.to_string(), "{}".to_string()))
+            .collect::<HashMap<_, _>>();
+
+        for method in methods {
+            let fake = FakeWallet::new(
+                FeeReserve {
+                    min_fee_reserve: 1.into(),
+                    percent_fee_reserve: 0.0,
+                },
+                HashMap::default(),
+                HashSet::default(),
+                0,
+                CurrencyUnit::Sat,
+            )
+            .with_custom_payment_methods(custom_methods.clone());
+
+            builder
+                .add_payment_processor(
+                    CurrencyUnit::Sat,
+                    PaymentMethod::Custom(method.to_string()),
+                    MintMeltLimits::new(1, 10_000),
+                    Arc::new(fake),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mnemonic = Mnemonic::generate(12).unwrap();
+        let mint = builder
+            .build_with_seed(db, &mnemonic.to_seed_normalized(""))
+            .await
+            .unwrap();
+        mint.set_quote_ttl(QuoteTTL::new(10_000, 10_000))
+            .await
+            .unwrap();
+        mint.start().await.unwrap();
+
+        MintState {
+            mint: Arc::new(mint),
+            cache: Arc::new(HttpCache::default()),
+        }
+    }
+
+    async fn create_custom_quote(state: &MintState, method: &str, amount: u64) -> QuoteId {
+        let quote = state
+            .mint
+            .get_mint_quote(cdk::mint::MintQuoteRequest::Custom {
+                method: PaymentMethod::Custom(method.to_string()),
+                request: MintQuoteCustomRequest {
+                    amount: Some(Amount::from(amount)),
+                    unit: CurrencyUnit::Sat,
+                    description: None,
+                    pubkey: None,
+                    extra: Value::Null,
+                },
+            })
+            .await
+            .unwrap();
+
+        quote.quote().clone()
+    }
+
+    async fn create_paid_bolt11_quote(state: &MintState) -> QuoteId {
+        let quote: MintQuoteBolt11Response<QuoteId> = state
+            .mint
+            .get_mint_quote(
+                MintQuoteBolt11Request {
+                    amount: Amount::from(2u64),
+                    unit: CurrencyUnit::Sat,
+                    description: None,
+                    pubkey: None,
+                }
+                .into(),
+            )
+            .await
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        for _ in 0..100 {
+            let check = state
+                .mint
+                .check_mint_quotes(std::slice::from_ref(&quote.quote))
+                .await
+                .unwrap();
+            if let MintQuoteResponse::Bolt11(q) = &check[0] {
+                if q.state == MintQuoteState::Paid {
+                    return quote.quote;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        panic!("bolt11 quote was not paid by the fake wallet");
+    }
+
+    fn outputs_for_amount(state: &MintState, amount: u64) -> Vec<BlindedMessage> {
+        let keyset_id = *state
+            .mint
+            .get_active_keysets()
+            .get(&CurrencyUnit::Sat)
+            .unwrap();
+
+        vec![BlindedMessage::new(
+            Amount::from(amount),
+            keyset_id,
+            SecretKey::generate().public_key(),
+        )]
     }
 
     #[tokio::test]
@@ -716,5 +1050,255 @@ mod tests {
         let result = PreferHeader::from_request_parts(&mut parts, &()).await;
         assert!(result.is_ok());
         assert!(!result.unwrap().respond_async);
+    }
+
+    #[tokio::test]
+    async fn cache_post_mint_custom_rejects_cached_url_method_quote_method_mismatch() {
+        let state = create_test_state().await;
+        let quote_id = create_paid_bolt11_quote(&state).await;
+        let mint_request = MintRequest {
+            quote: quote_id,
+            outputs: outputs_for_amount(&state, 2),
+            signature: None,
+        };
+
+        let result = cache_post_mint_custom(
+            AuthHeader::None,
+            State(state.clone()),
+            Path("bolt11".to_string()),
+            Json(mint_request.clone()),
+        )
+        .await;
+        assert!(result.is_ok(), "bolt11 mint should populate the cache");
+
+        let result = cache_post_mint_custom(
+            AuthHeader::None,
+            State(state),
+            Path("bolt12".to_string()),
+            Json(mint_request),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "cache_post_mint_custom must reject cross-method cached mint"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_post_batch_mint_rejects_cached_url_method_quote_method_mismatch() {
+        let state = create_test_state().await;
+        let quote_id = create_paid_bolt11_quote(&state).await;
+        let batch_request = BatchMintRequest {
+            quotes: vec![quote_id],
+            quote_amounts: None,
+            outputs: outputs_for_amount(&state, 2),
+            signatures: None,
+        };
+
+        let result = cache_post_batch_mint(
+            AuthHeader::None,
+            State(state.clone()),
+            Path("bolt11".to_string()),
+            Json(batch_request.clone()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "bolt11 batch mint should populate the cache"
+        );
+
+        let result = cache_post_batch_mint(
+            AuthHeader::None,
+            State(state),
+            Path("bolt12".to_string()),
+            Json(batch_request),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "cache_post_batch_mint must reject cross-method cached mint"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_routes_reject_invalid_bounds_before_loading_quotes() {
+        let state = create_test_state().await;
+        // These IDs do not exist. Any premature quote lookup would return UnknownQuote.
+        let duplicate_id = QuoteId::new();
+        for (quotes, expected) in [
+            (
+                vec![duplicate_id.clone(), duplicate_id],
+                cdk::Error::DuplicateQuoteIds,
+            ),
+            (
+                (0..11).map(|_| QuoteId::new()).collect(),
+                cdk::Error::BatchSizeExceeded {
+                    actual: 11,
+                    max: 10,
+                },
+            ),
+        ] {
+            let status_error = post_batch_check_mint_quote(
+                AuthHeader::None,
+                State(state.clone()),
+                Path("bolt11".to_string()),
+                Json(BatchCheckMintQuoteRequest {
+                    quotes: quotes.clone(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            let mint_error = cache_post_batch_mint(
+                AuthHeader::None,
+                State(state.clone()),
+                Path("bolt11".to_string()),
+                Json(BatchMintRequest {
+                    quotes,
+                    outputs: vec![],
+                    quote_amounts: None,
+                    signatures: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+
+            let expected = into_response(expected);
+            let expected_status = expected.status();
+            let expected_body = axum::body::to_bytes(expected.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            for response in [status_error, mint_error] {
+                assert_eq!(response.status(), expected_status);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(body, expected_body);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_status_accepts_configured_limit() {
+        let state = create_test_state().await;
+        let mut quotes = Vec::new();
+        for _ in 0..10 {
+            quotes.push(create_paid_bolt11_quote(&state).await);
+        }
+        let response = post_batch_check_mint_quote(
+            AuthHeader::None,
+            State(state),
+            Path("bolt11".to_string()),
+            Json(BatchCheckMintQuoteRequest { quotes }),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let quotes: Vec<MintQuoteBolt11Response<QuoteId>> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(quotes.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn post_batch_check_mint_quote_rejects_url_method_quote_method_mismatch() {
+        let state = create_test_state_with_custom_methods(&["paypal", "venmo"]).await;
+        let quote_id = create_custom_quote(&state, "venmo", 2).await;
+
+        let result = post_batch_check_mint_quote(
+            AuthHeader::None,
+            State(state),
+            Path("paypal".to_string()),
+            Json(BatchCheckMintQuoteRequest {
+                quotes: vec![quote_id],
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "post_batch_check_mint_quote must reject cross-method quote checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_melt_custom_quote_rejects_url_method_request_body_mismatch() {
+        let state = create_test_state_with_custom_methods(&["paypal", "venmo"]).await;
+
+        let payload = serde_json::to_value(MeltQuoteCustomRequest {
+            method: "venmo".to_string(),
+            request: "test-payment-request".to_string(),
+            unit: CurrencyUnit::Sat,
+            amount: None,
+            extra: Value::Null,
+        })
+        .unwrap();
+
+        let result = post_melt_custom_quote(
+            AuthHeader::None,
+            State(state.clone()),
+            Path("paypal".to_string()),
+            Json(payload),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "post_melt_custom_quote must reject cross-method quote creation"
+        );
+
+        let venmo_quote_created = state
+            .mint
+            .melt_quotes()
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|quote| quote.payment_method == PaymentMethod::Custom("venmo".to_string()));
+
+        assert!(
+            !venmo_quote_created,
+            "request to the paypal melt-quote endpoint must not create a venmo-method quote"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_melt_custom_quote_accepts_normalized_method_match() {
+        let state = create_test_state_with_custom_methods(&["paypal"]).await;
+
+        let payload = serde_json::to_value(MeltQuoteCustomRequest {
+            method: "PayPal".to_string(),
+            request: "test-payment-request".to_string(),
+            unit: CurrencyUnit::Sat,
+            amount: None,
+            extra: Value::Null,
+        })
+        .unwrap();
+
+        let result = post_melt_custom_quote(
+            AuthHeader::None,
+            State(state.clone()),
+            Path("paypal".to_string()),
+            Json(payload),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "post_melt_custom_quote must accept path/body methods that normalize to the same value"
+        );
+
+        let paypal_quote_created = state
+            .mint
+            .melt_quotes()
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|quote| quote.payment_method == PaymentMethod::Custom("paypal".to_string()));
+
+        assert!(
+            paypal_quote_created,
+            "mixed-case body method should create a quote under the normalized payment method"
+        );
     }
 }

@@ -1,17 +1,23 @@
 //! Payments
 
+use std::cmp::Reverse;
 use std::ops::Deref;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use cashu::nut00::KnownMethod;
 use cashu::quote_id::QuoteId;
 use cashu::{Amount, BlindSignature, CurrencyUnit, Id, SecretKey};
 
-use crate::database::mint::test::unique_string;
-use crate::database::mint::{Database, Error, KeysDatabase};
+use crate::database::mint::{Database, DynMintDatabase, Error, KeysDatabase};
 use crate::database::MintSignaturesDatabase;
 use crate::mint::{MeltPaymentRequest, MeltQuote, MintQuote, Operation};
 use crate::payment::PaymentIdentifier;
+
+fn unique_string() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
 
 /// Add a mint quote
 pub async fn add_mint_quote<DB>(db: DB)
@@ -29,6 +35,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
         0,
         vec![],
         vec![],
@@ -56,6 +63,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
         0,
         vec![],
         vec![],
@@ -86,6 +94,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
         0,
         vec![],
         vec![],
@@ -157,6 +166,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
         0,
         vec![],
         vec![],
@@ -234,6 +244,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
         0,
+        0,
         vec![],
         vec![],
         None,
@@ -285,6 +296,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
         0,
         vec![],
         vec![],
@@ -341,6 +353,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
         0,
+        0,
         vec![],
         vec![],
         None,
@@ -370,6 +383,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
         0,
         vec![],
         vec![],
@@ -408,6 +422,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
         0,
         vec![],
         vec![],
@@ -448,6 +463,7 @@ where
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt12),
         0,
+        0,
         vec![],
         vec![],
         None,
@@ -487,18 +503,26 @@ where
     let inputs_fee = Amount::new(1, CurrencyUnit::Sat);
     let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
 
-    // Create a dummy blinded message
-    let blinded_secret = SecretKey::generate().public_key();
-    let blinded_message = cashu::BlindedMessage {
-        blinded_secret,
-        keyset_id,
-        amount: Amount::from(100u64),
-        witness: None,
-    };
-    let blinded_messages = vec![blinded_message];
+    // Use reverse key order to verify physical lock ordering does not change
+    // the logical order returned to the client.
+    let mut blinded_messages = vec![
+        cashu::BlindedMessage {
+            blinded_secret: SecretKey::generate().public_key(),
+            keyset_id,
+            amount: Amount::from(100u64),
+            witness: None,
+        },
+        cashu::BlindedMessage {
+            blinded_secret: SecretKey::generate().public_key(),
+            keyset_id,
+            amount: Amount::from(200u64),
+            witness: None,
+        },
+    ];
+    blinded_messages.sort_unstable_by_key(|message| Reverse(message.blinded_secret.to_bytes()));
 
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    let quote = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat), Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None);
+    let quote = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat), Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None, None);
     tx.add_melt_quote(quote.clone()).await.unwrap();
     tx.add_melt_request(&quote.id, inputs_amount.clone(), inputs_fee.clone())
         .await
@@ -525,8 +549,8 @@ where
         .unwrap();
     assert_eq!(retrieved.inputs_amount, inputs_amount);
     assert_eq!(retrieved.inputs_fee, inputs_fee);
-    assert_eq!(retrieved.change_outputs.len(), 1);
-    assert_eq!(retrieved.change_outputs[0].amount, Amount::from(100u64));
+    assert_eq!(retrieved.change_outputs.len(), 2);
+    assert_eq!(retrieved.change_outputs, blinded_messages);
     tx.commit().await.unwrap();
 }
 
@@ -535,7 +559,7 @@ pub async fn reject_melt_duplicate_blinded_signature<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
 {
-    let quote_id1 = QuoteId::new_uuid();
+    let quote_id1 = QuoteId::new();
     let inputs_amount = Amount::new(100, CurrencyUnit::Sat);
     let inputs_fee = Amount::new(1, CurrencyUnit::Sat);
     let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
@@ -567,7 +591,7 @@ where
 
     // Now try to add melt request with the same blinded message - should fail due to constraint
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    let quote2 = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat),Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None);
+    let quote2 = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat),Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None, None);
     tx.add_melt_quote(quote2.clone()).await.unwrap();
     tx.add_melt_request(&quote2.id, inputs_amount, inputs_fee)
         .await
@@ -608,7 +632,7 @@ where
 
     // First insert succeeds
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    let quote = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat), Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None);
+    let quote = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat), Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None, None);
     tx.add_melt_quote(quote.clone()).await.unwrap();
     tx.add_melt_request(&quote.id, inputs_amount.clone(), inputs_fee.clone())
         .await
@@ -629,7 +653,7 @@ where
 
     // Second insert with same blinded_message but different quote_id should fail due to unique constraint on blinded_message
     let mut tx = Database::begin_transaction(&db).await.unwrap();
-    let quote = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat), Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None);
+    let quote = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat), Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None, None);
     tx.add_melt_quote(quote.clone()).await.unwrap();
     tx.add_melt_request(&quote.id, inputs_amount, inputs_fee)
         .await
@@ -671,7 +695,7 @@ where
 
     // Insert melt request
     let mut tx1 = Database::begin_transaction(&db).await.unwrap();
-    let quote = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat), Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None);
+    let quote = MeltQuote::new(None,MeltPaymentRequest::Bolt11 { bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap() }, cashu::CurrencyUnit::Sat, Amount::new(33, cashu::CurrencyUnit::Sat), Amount::new(0, cashu::CurrencyUnit::Sat), 0, None, None, cashu::PaymentMethod::Known(KnownMethod::Bolt11), None, None);
     tx1.add_melt_quote(quote.clone()).await.unwrap();
     tx1.add_melt_request(&quote.id, inputs_amount, inputs_fee)
         .await
@@ -727,7 +751,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"processor": "metadata"})),
-    );
+        None    );
 
     // Add melt quote
     let mut tx = Database::begin_transaction(&db).await.unwrap();
@@ -762,7 +786,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         None,
-    );
+        None    );
 
     // Add first melt quote
     let mut tx = Database::begin_transaction(&db).await.unwrap();
@@ -795,6 +819,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"state": "init"})),
+        None,
     );
 
     // Add melt quote
@@ -850,6 +875,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"lookup": "test"})),
+        None,
     );
 
     // Add melt quote
@@ -880,8 +906,6 @@ pub async fn get_all_mint_quotes<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let quote1 = MintQuote::new(
         None,
         unique_string(),
@@ -893,6 +917,7 @@ where
         Amount::new(100, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -910,6 +935,7 @@ where
         Amount::new(200, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -947,7 +973,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"processor": "metadata-1"})),
-    );
+        None    );
 
     let quote2 = MeltQuote::new(
         None,
@@ -962,7 +988,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"processor": "metadata-2"})),
-    );
+        None    );
 
     // Add quotes
     let mut tx = Database::begin_transaction(&db).await.unwrap();
@@ -988,8 +1014,6 @@ pub async fn get_mint_quote_by_request<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let request = unique_string();
     let mint_quote = MintQuote::new(
         None,
@@ -1002,6 +1026,7 @@ where
         Amount::new(100, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1026,8 +1051,6 @@ pub async fn get_mint_quote_by_request_lookup_id<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let lookup_id = PaymentIdentifier::CustomId(unique_string());
     let mint_quote = MintQuote::new(
         None,
@@ -1040,6 +1063,7 @@ where
         Amount::new(100, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1142,8 +1166,6 @@ pub async fn increment_mint_quote_amount_paid<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let mint_quote = MintQuote::new(
         None,
         unique_string(),
@@ -1155,6 +1177,7 @@ where
         Amount::new(1000, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1177,11 +1200,13 @@ where
         .add_payment(
             Amount::from(300).with_unit(CurrencyUnit::Sat),
             "payment_1".to_string(),
-            None,
+            Some(100),
         )
         .unwrap();
     tx.update_mint_quote(&mut mint_quote).await.unwrap();
     assert_eq!(mint_quote.amount_paid().value(), 300);
+    let first_updated_at = mint_quote.updated_at();
+    assert!(first_updated_at > 0);
     tx.commit().await.unwrap();
 
     // Add payment second time
@@ -1195,16 +1220,45 @@ where
         .add_payment(
             Amount::from(200).with_unit(CurrencyUnit::Sat),
             "payment_2".to_string(),
-            None,
+            Some(100),
         )
         .unwrap();
     tx.update_mint_quote(&mut mint_quote).await.unwrap();
     assert_eq!(mint_quote.amount_paid().value(), 500);
+    let second_updated_at = mint_quote.updated_at();
+    assert!(second_updated_at > first_updated_at);
     tx.commit().await.unwrap();
 
     // Verify final state
     let retrieved = db.get_mint_quote(&mint_quote.id).await.unwrap().unwrap();
     assert_eq!(retrieved.amount_paid().value(), 500);
+    assert_eq!(retrieved.updated_at(), second_updated_at);
+
+    // Even if the in-memory quote carries a stale timestamp, persistence must
+    // bump from the database value instead of regressing.
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut mint_quote = tx
+        .get_mint_quote(&mint_quote.id)
+        .await
+        .expect("valid quote")
+        .expect("valid result");
+    mint_quote.set_updated_at(0);
+    mint_quote
+        .add_payment(
+            Amount::from(100).with_unit(CurrencyUnit::Sat),
+            "payment_3".to_string(),
+            Some(100),
+        )
+        .unwrap();
+    tx.update_mint_quote(&mut mint_quote).await.unwrap();
+    assert_eq!(mint_quote.amount_paid().value(), 600);
+    let stale_update_updated_at = mint_quote.updated_at();
+    assert!(stale_update_updated_at > second_updated_at);
+    tx.commit().await.unwrap();
+
+    let retrieved = db.get_mint_quote(&mint_quote.id).await.unwrap().unwrap();
+    assert_eq!(retrieved.amount_paid().value(), 600);
+    assert_eq!(retrieved.updated_at(), stale_update_updated_at);
 }
 
 /// Test incrementing mint quote amount issued
@@ -1212,8 +1266,6 @@ pub async fn increment_mint_quote_amount_issued<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let mint_quote = MintQuote::new(
         None,
         unique_string(),
@@ -1225,6 +1277,7 @@ where
         Amount::new(1000, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1251,6 +1304,7 @@ where
         )
         .unwrap();
     tx.update_mint_quote(&mut mint_quote).await.unwrap();
+    let paid_updated_at = mint_quote.updated_at();
     tx.commit().await.unwrap();
 
     // Add issuance first time
@@ -1265,6 +1319,8 @@ where
         .unwrap();
     tx.update_mint_quote(&mut mint_quote).await.unwrap();
     assert_eq!(mint_quote.amount_issued().value(), 400);
+    let first_issuance_updated_at = mint_quote.updated_at();
+    assert!(first_issuance_updated_at > paid_updated_at);
     tx.commit().await.unwrap();
 
     // Add issuance second time
@@ -1279,11 +1335,14 @@ where
         .unwrap();
     tx.update_mint_quote(&mut mint_quote).await.unwrap();
     assert_eq!(mint_quote.amount_issued().value(), 700);
+    let second_issuance_updated_at = mint_quote.updated_at();
+    assert!(second_issuance_updated_at > first_issuance_updated_at);
     tx.commit().await.unwrap();
 
     // Verify final state
     let retrieved = db.get_mint_quote(&mint_quote.id).await.unwrap().unwrap();
     assert_eq!(retrieved.amount_issued().value(), 700);
+    assert_eq!(retrieved.updated_at(), second_issuance_updated_at);
 }
 
 /// Test getting mint quote within transaction (with lock)
@@ -1291,8 +1350,6 @@ pub async fn get_mint_quote_in_transaction<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let mint_quote = MintQuote::new(
         None,
         unique_string(),
@@ -1304,6 +1361,7 @@ where
         Amount::new(100, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1343,6 +1401,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"tx": true})),
+        None,
     );
 
     // Add quote
@@ -1366,8 +1425,6 @@ pub async fn get_mint_quote_by_request_in_transaction<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let request = unique_string();
     let mint_quote = MintQuote::new(
         None,
@@ -1380,6 +1437,7 @@ where
         Amount::new(100, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1406,8 +1464,6 @@ pub async fn get_mint_quote_by_request_lookup_id_in_transaction<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let lookup_id = PaymentIdentifier::CustomId(unique_string());
     let mint_quote = MintQuote::new(
         None,
@@ -1420,6 +1476,7 @@ where
         Amount::new(100, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1483,8 +1540,6 @@ pub async fn get_melt_quotes_by_request_lookup_id<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let lookup_id = PaymentIdentifier::CustomId(unique_string());
 
     let quote1 = MeltQuote::new(
@@ -1500,6 +1555,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"item": 1})),
+        None,
     );
 
     let quote2 = MeltQuote::new(
@@ -1515,6 +1571,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"item": 2})),
+        None,
     );
 
     let mut tx = Database::begin_transaction(&db).await.unwrap();
@@ -1550,8 +1607,6 @@ pub async fn lock_melt_quote_and_related<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let lookup_id = PaymentIdentifier::CustomId(unique_string());
 
     let quote1 = MeltQuote::new(
@@ -1567,6 +1622,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"target": true})),
+        None,
     );
 
     let quote2 = MeltQuote::new(
@@ -1582,6 +1638,7 @@ where
         None,
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
         Some(serde_json::json!({"target": false})),
+        None,
     );
 
     let mut tx = Database::begin_transaction(&db).await.unwrap();
@@ -1627,8 +1684,6 @@ pub async fn reject_duplicate_payment_ids<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let mint_quote = MintQuote::new(
         None,
         unique_string(),
@@ -1640,6 +1695,7 @@ where
         Amount::new(1000, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1723,8 +1779,6 @@ pub async fn modify_mint_quote_after_loading_succeeds<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let mint_quote = MintQuote::new(
         None,
         unique_string(),
@@ -1736,6 +1790,7 @@ where
         Amount::new(1000, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1784,8 +1839,6 @@ pub async fn get_mint_quotes_by_ids<DB>(db: DB)
 where
     DB: Database<Error> + KeysDatabase<Err = Error>,
 {
-    use crate::database::mint::test::unique_string;
-
     let quote1 = MintQuote::new(
         None,
         unique_string(),
@@ -1797,6 +1850,7 @@ where
         Amount::new(100, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1814,6 +1868,7 @@ where
         Amount::new(200, cashu::CurrencyUnit::Sat),
         Amount::new(0, cashu::CurrencyUnit::Sat),
         cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
         0,
         vec![],
         vec![],
@@ -1836,7 +1891,7 @@ where
     assert_eq!(quotes[1].as_ref().unwrap().id, quote2.id);
 
     // 2. Test getting with missing ID
-    let missing_id = QuoteId::new_uuid();
+    let missing_id = QuoteId::new();
     let ids = vec![quote1.id.clone(), missing_id, quote2.id.clone()];
     let quotes = db.get_mint_quotes_by_ids(&ids).await.unwrap();
     assert_eq!(quotes.len(), 3);
@@ -1858,4 +1913,86 @@ where
     assert_eq!(quotes[0].as_ref().unwrap().id, quote2.id);
     assert_eq!(quotes[1].as_ref().unwrap().id, quote1.id);
     tx.commit().await.unwrap();
+}
+
+/// Test concurrent quote batches acquire row locks in a consistent order.
+///
+/// This test is invoked explicitly by the PostgreSQL suite because SQLite does
+/// not provide row-level `FOR UPDATE` locking.
+pub async fn concurrent_mint_quote_batches_use_consistent_lock_order(db: DynMintDatabase) {
+    let quote1 = MintQuote::new(
+        None,
+        unique_string(),
+        cashu::CurrencyUnit::Sat,
+        None,
+        0,
+        PaymentIdentifier::CustomId(unique_string()),
+        None,
+        Amount::new(100, cashu::CurrencyUnit::Sat),
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+    );
+    let quote2 = MintQuote::new(
+        None,
+        unique_string(),
+        cashu::CurrencyUnit::Sat,
+        None,
+        0,
+        PaymentIdentifier::CustomId(unique_string()),
+        None,
+        Amount::new(200, cashu::CurrencyUnit::Sat),
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+    );
+
+    let mut tx = db.begin_transaction().await.unwrap();
+    tx.add_mint_quote(quote1.clone()).await.unwrap();
+    tx.add_mint_quote(quote2.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let forward = vec![quote1.id.clone(), quote2.id.clone()];
+    let reverse = vec![quote2.id.clone(), quote1.id.clone()];
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let first_db = db.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first = tokio::spawn(async move {
+        let mut tx = first_db.begin_transaction().await?;
+        first_barrier.wait().await;
+        let quotes = tx.get_mint_quotes_by_ids(&forward).await?;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        tx.commit().await?;
+        Ok::<_, Error>(quotes)
+    });
+
+    let second = tokio::spawn(async move {
+        let mut tx = db.begin_transaction().await?;
+        barrier.wait().await;
+        let quotes = tx.get_mint_quotes_by_ids(&reverse).await?;
+        tx.commit().await?;
+        Ok::<_, Error>(quotes)
+    });
+
+    let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("reversed quote batches should not deadlock");
+
+    let first_quotes = first_result.unwrap().unwrap();
+    let second_quotes = second_result.unwrap().unwrap();
+    assert_eq!(first_quotes[0].as_ref().unwrap().id, quote1.id);
+    assert_eq!(first_quotes[1].as_ref().unwrap().id, quote2.id);
+    assert_eq!(second_quotes[0].as_ref().unwrap().id, quote2.id);
+    assert_eq!(second_quotes[1].as_ref().unwrap().id, quote1.id);
 }

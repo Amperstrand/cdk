@@ -17,6 +17,19 @@ impl Wallet {
         request: String,
         options: Option<MeltOptions>,
     ) -> Result<MeltQuote, Error> {
+        let quote = self.request_melt_bolt11_quote(request, options).await?;
+
+        self.localstore.add_melt_quote(quote.clone()).await?;
+
+        Ok(quote)
+    }
+
+    /// Request a BOLT11 melt quote without persisting it to the wallet database.
+    pub(crate) async fn request_melt_bolt11_quote(
+        &self,
+        request: String,
+        options: Option<MeltOptions>,
+    ) -> Result<MeltQuote, Error> {
         let invoice = Bolt11Invoice::from_str(&request)?;
 
         let quote_request = MeltQuoteBolt11Request {
@@ -42,7 +55,7 @@ impl Wallet {
                 .ok_or(Error::InvoiceAmountUndefined)?;
 
             let amount_quote_unit = Amount::new(amount_msat, CurrencyUnit::Msat)
-                .convert_to(&self.unit)?
+                .convert_to_ceil(&self.unit)?
                 .into();
 
             if quote_res.amount != amount_quote_unit {
@@ -66,12 +79,13 @@ impl Wallet {
             state: quote_res.state,
             expiry: quote_res.expiry,
             payment_proof: quote_res.payment_preimage,
+            estimated_blocks: None,
+            fee_index: None,
             payment_method: PaymentMethod::Known(KnownMethod::Bolt11),
+
             used_by_operation: None,
             version: 0,
         };
-
-        self.localstore.add_melt_quote(quote.clone()).await?;
 
         Ok(quote)
     }

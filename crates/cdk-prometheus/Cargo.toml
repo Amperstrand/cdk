@@ -15,19 +15,13 @@ system-metrics = ["sysinfo"]
 
 [dependencies]
 # Prometheus
-prometheus = "0.13"
+prometheus = "0.14"
 
 # Async runtime
-tokio.workspace = true
-futures.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
 
 # Error handling
-anyhow.workspace = true
 thiserror.workspace = true
-
-# Serialization
-serde.workspace = true
-serde_json.workspace = true
 
 # System metrics (optional)
 sysinfo = { version = "0.32", optional = true }
@@ -35,12 +29,8 @@ sysinfo = { version = "0.32", optional = true }
 # Tracing
 tracing.workspace = true
 
-# Utility
-once_cell.workspace = true
-
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-reqwest.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]

@@ -27,10 +27,15 @@ impl Wallet {
         memo: Option<String>,
         token: Option<String>,
     ) -> Result<Amount, Error> {
-        let saga = ReceiveSaga::new(self);
-        let saga = saga.prepare(proofs, opts, memo, token).await?;
-        let saga = saga.execute().await?;
-        Ok(saga.into_amount())
+        self.retry_on_inactive_keyset(|| async {
+            let saga = ReceiveSaga::new(self);
+            let saga = saga
+                .prepare(proofs.clone(), opts.clone(), memo.clone(), token.clone())
+                .await?;
+            let saga = saga.execute().await?;
+            Ok(saga.into_amount())
+        })
+        .await
     }
 
     /// Receive
@@ -47,7 +52,7 @@ impl Wallet {
     /// #[tokio::main]
     /// async fn main() -> anyhow::Result<()> {
     ///  let seed = random::<[u8; 64]>();
-    ///  let mint_url = "https://fake.thesimplekid.dev";
+    ///  let mint_url = "https://testnut.cashudevkit.org";
     ///  let unit = CurrencyUnit::Sat;
     ///
     ///  let localstore = memory::empty().await?;
@@ -69,8 +74,7 @@ impl Wallet {
 
         ensure_cdk!(unit == self.unit, Error::UnsupportedUnit);
 
-        let keysets_info = self.load_mint_keysets().await?;
-        let proofs = token.proofs(&keysets_info)?;
+        let proofs = self.token_proofs(&token).await?;
 
         if let Token::TokenV3(token) = &token {
             ensure_cdk!(!token.is_multi_mint(), Error::MultiMintTokenNotSupported);
@@ -105,7 +109,7 @@ impl Wallet {
     /// #[tokio::main]
     /// async fn main() -> anyhow::Result<()> {
     ///  let seed = random::<[u8; 64]>();
-    ///  let mint_url = "https://fake.thesimplekid.dev";
+    ///  let mint_url = "https://testnut.cashudevkit.org";
     ///  let unit = CurrencyUnit::Sat;
     ///
     ///  let localstore = memory::empty().await?;

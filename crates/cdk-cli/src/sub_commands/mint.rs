@@ -1,16 +1,22 @@
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use cdk::amount::SplitTarget;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut00::ProofsMethods;
 use cdk::nuts::{CurrencyUnit, PaymentMethod};
-use cdk::wallet::WalletRepository;
+use cdk::wallet::{Wallet, WalletRepository, WalletSubscription};
 use cdk::{Amount, StreamExt};
 use cdk_common::nut00::KnownMethod;
+use cdk_common::NotificationPayload;
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
+use tokio::time::timeout;
 
+use crate::terminal::escape_control;
 use crate::utils::get_or_create_wallet;
 
 #[derive(Args, Serialize, Deserialize)]
@@ -25,6 +31,9 @@ pub struct MintSubCommand {
     /// Quote Id
     #[arg(short, long)]
     quote_id: Option<String>,
+    /// Number of seed-derived quote keys to search when recovering a quote
+    #[arg(long, default_value = "1000", requires = "quote_id")]
+    key_search_limit: u32,
     /// Payment method
     #[arg(long, default_value = "bolt11")]
     method: String,
@@ -34,7 +43,8 @@ pub struct MintSubCommand {
     /// Expiry
     #[arg(short, long)]
     single_use: Option<bool>,
-    /// Wait duration in seconds for mint quote polling
+    /// Wait duration in seconds with no mint progress before giving up
+    /// (0 = wait indefinitely; use this for onchain or slow payments)
     #[arg(long, default_value = "30")]
     wait_duration: u64,
 }
@@ -68,13 +78,13 @@ pub async fn mint(
 
                 println!(
                     "Quote: id={}, state={}, amount={}, expiry={}",
-                    quote.id,
+                    escape_control(&quote.id),
                     quote.state,
                     quote.amount.map_or("none".to_string(), |a| a.to_string()),
                     quote.expiry
                 );
 
-                println!("Please pay: {}", quote.request);
+                println!("Please pay: {}", escape_control(&quote.request));
 
                 quote
             }
@@ -96,14 +106,28 @@ pub async fn mint(
                     .await?;
 
                 println!(
-                    "Quote: id={}, state={}, amount={}, expiry={}",
-                    quote.id,
-                    quote.state,
+                    "Quote: id={}, amount={}, expiry={}",
+                    escape_control(&quote.id),
                     quote.amount.map_or("none".to_string(), |a| a.to_string()),
                     quote.expiry
                 );
 
-                println!("Please pay: {}", quote.request);
+                println!("Please pay: {}", escape_control(&quote.request));
+
+                quote
+            }
+            PaymentMethod::Known(KnownMethod::Onchain) => {
+                let amount = sub_command_args.amount;
+                let quote = wallet
+                    .mint_quote(payment_method.clone(), amount.map(|a| a.into()), None, None)
+                    .await?;
+
+                println!(
+                    "Quote: id={}, expiry={}",
+                    escape_control(&quote.id),
+                    quote.expiry
+                );
+                println!("Send sats to: {}", escape_control(&quote.request));
 
                 quote
             }
@@ -120,43 +144,209 @@ pub async fn mint(
                     .await?;
 
                 println!(
-                    "Quote: id={}, state={}, amount={}, expiry={}",
-                    quote.id,
-                    quote.state,
+                    "Quote: id={}, amount={}, expiry={}",
+                    escape_control(&quote.id),
                     quote.amount.map_or("none".to_string(), |a| a.to_string()),
                     quote.expiry
                 );
 
-                println!("Please pay: {}", quote.request);
+                println!("Please pay: {}", escape_control(&quote.request));
 
                 quote
             }
         },
-        Some(quote_id) => wallet
-            .localstore
-            .get_mint_quote(quote_id)
-            .await?
-            .ok_or(anyhow!("Unknown quote"))?,
+        Some(quote_id) => {
+            wallet
+                .fetch_mint_quote_with_key_search(
+                    quote_id,
+                    Some(payment_method.clone()),
+                    sub_command_args.key_search_limit,
+                )
+                .await?
+        }
     };
 
+    let payment_method = quote.payment_method.clone();
     tracing::debug!("Attempting mint for: {}", payment_method);
+
+    // Spawn a background task that prints progress updates from the mint's
+    // quote-state subscription while we wait for the `proof_stream` to yield
+    // issued proofs. This is especially useful for onchain mints where block
+    // confirmations can take many minutes and the user would otherwise see
+    // nothing between printing the address and the first mint batch.
+    let stop_progress = Arc::new(Notify::new());
+    let progress_handle = spawn_progress_task(
+        wallet.clone(),
+        quote.id.clone(),
+        payment_method.clone(),
+        stop_progress.clone(),
+    )
+    .await;
 
     let mut amount_minted = Amount::ZERO;
 
     let mut proof_streams = wallet.proof_stream(quote, SplitTarget::default(), None);
 
-    while let Some(proofs) = proof_streams.next().await {
-        let proofs = match proofs {
-            Ok(proofs) => proofs,
-            Err(err) => {
-                tracing::error!("Proof streams ended with {:?}", err);
+    // `wait_duration` is an *idle* timeout: it bounds how long we wait without
+    // any new proofs being issued, and resets each time a batch arrives. A
+    // value of 0 disables it entirely (wait indefinitely), which is the right
+    // choice for onchain or otherwise slow payments. We never `bail!` from
+    // inside the loop so that the progress task below is always stopped cleanly.
+    let wait_duration = sub_command_args.wait_duration;
+    let mut timed_out = false;
+    let mut mint_error = None;
+
+    loop {
+        let next = proof_streams.next();
+        let event = if wait_duration == 0 {
+            Ok(next.await)
+        } else {
+            timeout(Duration::from_secs(wait_duration), next).await
+        };
+
+        match event {
+            // A batch of proofs was issued.
+            Ok(Some(Ok(proofs))) => {
+                let batch = proofs.total_amount()?;
+                amount_minted += batch;
+                println!("Minted {batch} {unit} (total: {amount_minted} {unit})");
+            }
+            // The stream surfaced an error.
+            Ok(Some(Err(err))) => {
+                tracing::error!(
+                    "Proof streams ended with {}",
+                    escape_control(&format!("{err:?}"))
+                );
+                mint_error = Some(err);
                 break;
             }
-        };
-        amount_minted += proofs.total_amount()?;
+            // The stream ended normally.
+            Ok(None) => break,
+            // No proofs arrived within `wait_duration`.
+            Err(_elapsed) => {
+                tracing::warn!("Timed out after {wait_duration}s waiting for mint proofs");
+                println!("Timed out after {wait_duration}s waiting for the mint quote to be paid");
+                timed_out = true;
+                break;
+            }
+        }
     }
 
-    println!("Received {amount_minted} from mint {mint_url}");
+    // Stop and await the progress task so the CLI exits cleanly.
+    stop_progress.notify_waiters();
+    if let Some(handle) = progress_handle {
+        let _ = handle.await;
+    }
+
+    if let Some(err) = mint_error {
+        return Err(err.into());
+    }
+
+    if timed_out && amount_minted == Amount::ZERO {
+        bail!("Timed out after {wait_duration}s waiting for the mint quote to be paid");
+    }
+
+    println!(
+        "Received {amount_minted} from mint {}",
+        escape_control(&mint_url.to_string())
+    );
 
     Ok(())
+}
+
+/// Spawns a background task that prints human-readable progress updates for
+/// the given mint quote. Returns `None` if the subscription could not be
+/// created (e.g. for unsupported payment methods); in that case the main flow
+/// continues silently as before.
+async fn spawn_progress_task(
+    wallet: Wallet,
+    quote_id: String,
+    payment_method: PaymentMethod,
+    stop: Arc<Notify>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let subscription_filter = match payment_method {
+        PaymentMethod::Known(KnownMethod::Bolt11) => {
+            WalletSubscription::Bolt11MintQuoteState(vec![quote_id.clone()])
+        }
+        PaymentMethod::Known(KnownMethod::Bolt12) => {
+            WalletSubscription::Bolt12MintQuoteState(vec![quote_id.clone()])
+        }
+        PaymentMethod::Known(KnownMethod::Onchain) => {
+            WalletSubscription::MintQuoteOnchainState(vec![quote_id.clone()])
+        }
+        _ => return None,
+    };
+
+    let mut subscription = match wallet.subscribe(subscription_filter).await {
+        Ok(sub) => sub,
+        Err(err) => {
+            tracing::warn!(
+                "Failed to subscribe to mint quote updates: {}",
+                escape_control(&err.to_string())
+            );
+            return None;
+        }
+    };
+
+    Some(tokio::spawn(async move {
+        // Track the last values we printed so we don't spam duplicates.
+        let mut last_state: Option<String> = None;
+        let mut last_amount_paid: Option<Amount> = None;
+        let mut last_amount_issued: Option<Amount> = None;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.notified() => break,
+                maybe_event = subscription.recv() => {
+                    let Some(event) = maybe_event else { break };
+                    match event.into_inner() {
+                        NotificationPayload::MintQuoteBolt11Response(info)
+                            if info.quote == quote_id =>
+                        {
+                            let state_str = info.state.to_string();
+                            if last_state.as_deref() != Some(state_str.as_str()) {
+                                println!("Quote state: {}", state_str);
+                                last_state = Some(state_str);
+                            }
+                        }
+                        NotificationPayload::MintQuoteBolt12Response(info)
+                            if info.quote == quote_id
+                                && (last_amount_paid != Some(info.amount_paid)
+                                    || last_amount_issued != Some(info.amount_issued)) =>
+                        {
+                            println!(
+                                "Payment observed: amount_paid={}, amount_issued={}",
+                                info.amount_paid, info.amount_issued
+                            );
+                            last_amount_paid = Some(info.amount_paid);
+                            last_amount_issued = Some(info.amount_issued);
+                        }
+                        NotificationPayload::MintQuoteOnchainResponse(info)
+                            if info.quote == quote_id
+                                && (last_amount_paid != Some(info.amount_paid)
+                                    || last_amount_issued != Some(info.amount_issued)) =>
+                        {
+                            if info.amount_paid == Amount::ZERO {
+                                println!("Waiting for onchain payment...");
+                            } else if info.amount_paid > info.amount_issued {
+                                println!(
+                                    "Payment confirmed: amount_paid={}, amount_issued={} (minting...)",
+                                    info.amount_paid, info.amount_issued
+                                );
+                            } else {
+                                println!(
+                                    "Payment observed: amount_paid={}, amount_issued={}",
+                                    info.amount_paid, info.amount_issued
+                                );
+                            }
+                            last_amount_paid = Some(info.amount_paid);
+                            last_amount_issued = Some(info.amount_issued);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }))
 }

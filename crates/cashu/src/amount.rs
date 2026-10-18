@@ -48,7 +48,6 @@ pub enum Error {
 /// Note: `PartialOrd` is implemented manually for `Amount<CurrencyUnit>` to return `None`
 /// when comparing amounts with different units. `Ord` is only implemented for `Amount<()>`.
 #[derive(Debug, Hash, PartialEq, Eq)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct Amount<U = ()> {
     value: u64,
     unit: U,
@@ -204,6 +203,12 @@ impl Amount<()> {
     /// Returns an error if the amount cannot be fully represented
     /// with the available denominations.
     pub fn split(&self, fee_and_amounts: &FeeAndAmounts) -> Result<Vec<Self>, Error> {
+        if fee_and_amounts.amounts.contains(&0) {
+            return Err(Error::InvalidAmount(
+                "denominations must be greater than zero".to_owned(),
+            ));
+        }
+
         let parts: Vec<Self> = fee_and_amounts
             .amounts
             .iter()
@@ -234,6 +239,12 @@ impl Amount<()> {
         let mut parts = match target {
             SplitTarget::None => self.split(fee_and_amounts)?,
             SplitTarget::Value(amount) => {
+                if amount.eq(&Amount::ZERO) {
+                    return Err(Error::InvalidAmount(
+                        "SplitTarget::Value amount must be greater than zero".to_owned(),
+                    ));
+                }
+
                 if self.le(amount) {
                     return self.split(fee_and_amounts);
                 }
@@ -423,7 +434,7 @@ impl Amount<CurrencyUnit> {
     /// ```
     /// # use cashu::{Amount, nuts::CurrencyUnit};
     /// let sat_amount = Amount::new(1000, CurrencyUnit::Sat);
-    /// let custom = Amount::new(50, CurrencyUnit::Custom("BTC".into()));
+    /// let custom = Amount::new(50, CurrencyUnit::custom("BTC"));
     /// ```
     pub fn new(value: u64, unit: CurrencyUnit) -> Self {
         Self { value, unit }
@@ -531,6 +542,10 @@ impl Amount<CurrencyUnit> {
 
     /// Convert to a different unit
     ///
+    /// Millisatoshis converted to satoshis are rounded down. Use
+    /// [`Self::convert_to_ceil`] when the converted amount must cover the
+    /// entire original amount.
+    ///
     /// # Example
     /// ```
     /// # use cashu::{Amount, nuts::CurrencyUnit};
@@ -554,6 +569,35 @@ impl Amount<CurrencyUnit> {
         };
 
         Ok(Amount::new(converted_value, target_unit.clone()))
+    }
+
+    /// Convert to a different unit, rounding up any fractional target units.
+    ///
+    /// Millisatoshis converted to satoshis are rounded up. Same-unit
+    /// conversions and satoshi-to-millisatoshi conversions remain exact.
+    /// For outgoing payments, add the principal and fees before converting
+    /// so the combined total is rounded only once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported unit conversions or if the converted
+    /// amount would overflow.
+    ///
+    /// # Example
+    /// ```
+    /// # use cashu::{Amount, nuts::CurrencyUnit};
+    /// let msat = Amount::new(1_001, CurrencyUnit::Msat);
+    /// let sat = msat.convert_to_ceil(&CurrencyUnit::Sat).unwrap();
+    /// assert_eq!(sat, Amount::new(2, CurrencyUnit::Sat));
+    /// ```
+    pub fn convert_to_ceil(&self, target_unit: &CurrencyUnit) -> Result<Self, Error> {
+        match (&self.unit, target_unit) {
+            (CurrencyUnit::Msat, CurrencyUnit::Sat) => Ok(Self::new(
+                self.value.div_ceil(MSAT_IN_SAT),
+                CurrencyUnit::Sat,
+            )),
+            _ => self.convert_to(target_unit),
+        }
     }
 
     /// Returns a string representation that includes the unit
@@ -1052,6 +1096,61 @@ mod tests {
         let converted = amount.convert_to(&CurrencyUnit::Msat).unwrap();
         assert_eq!(converted.value(), 5000);
         assert_eq!(converted.unit(), &CurrencyUnit::Msat);
+    }
+
+    #[test]
+    fn test_amount_conversion_rounding() {
+        for (msat, floor, ceil) in [
+            (0, 0, 0),
+            (1, 0, 1),
+            (999, 0, 1),
+            (1_000, 1, 1),
+            (1_001, 1, 2),
+            (1_999, 1, 2),
+            (2_000, 2, 2),
+            (u64::MAX, u64::MAX / 1_000, u64::MAX / 1_000 + 1),
+        ] {
+            let amount = Amount::new(msat, CurrencyUnit::Msat);
+            assert_eq!(
+                amount.convert_to(&CurrencyUnit::Sat).unwrap(),
+                Amount::new(floor, CurrencyUnit::Sat)
+            );
+            assert_eq!(
+                amount.convert_to_ceil(&CurrencyUnit::Sat).unwrap(),
+                Amount::new(ceil, CurrencyUnit::Sat)
+            );
+        }
+    }
+
+    #[test]
+    fn test_amount_convert_to_ceil_exact_conversions_and_errors() {
+        for unit in [CurrencyUnit::Sat, CurrencyUnit::Msat, CurrencyUnit::Usd] {
+            let amount = Amount::new(u64::MAX, unit.clone());
+            assert_eq!(amount.convert_to_ceil(&unit).unwrap(), amount);
+        }
+
+        let largest_sat = u64::MAX / MSAT_IN_SAT;
+        for sat in [0, 1, largest_sat] {
+            assert_eq!(
+                Amount::new(sat, CurrencyUnit::Sat)
+                    .convert_to_ceil(&CurrencyUnit::Msat)
+                    .unwrap(),
+                Amount::new(sat * MSAT_IN_SAT, CurrencyUnit::Msat)
+            );
+        }
+        assert!(matches!(
+            Amount::new(largest_sat + 1, CurrencyUnit::Sat).convert_to_ceil(&CurrencyUnit::Msat),
+            Err(Error::AmountOverflow)
+        ));
+        for (from, to) in [
+            (CurrencyUnit::Msat, CurrencyUnit::Usd),
+            (CurrencyUnit::Usd, CurrencyUnit::Sat),
+        ] {
+            assert!(matches!(
+                Amount::new(1, from).convert_to_ceil(&to),
+                Err(Error::CannotConvertUnits)
+            ));
+        }
     }
 
     #[test]
@@ -1689,7 +1788,7 @@ mod tests {
 
     #[test]
     fn test_amount_new_with_custom_unit() {
-        let custom_unit = CurrencyUnit::Custom("BTC".to_string());
+        let custom_unit = CurrencyUnit::Custom("BTC".into());
         let amount = Amount::new(50, custom_unit.clone());
 
         assert_eq!(amount.value(), 50);
@@ -2083,7 +2182,7 @@ mod tests {
         let amount = Amount::new(100, CurrencyUnit::Usd);
         assert_eq!(amount.display_with_unit(), "100 usd");
 
-        let amount = Amount::new(123, CurrencyUnit::Custom("BTC".to_string()));
+        let amount = Amount::new(123, CurrencyUnit::Custom("BTC".into()));
         assert_eq!(amount.display_with_unit(), "123 btc");
     }
 
@@ -2450,6 +2549,18 @@ mod tests {
         );
     }
 
+    /// Tests split_targeted() with SplitTarget::Value(0).
+    /// A zero target value is invalid and must not enter the targeted split loop.
+    #[test]
+    fn test_split_targeted_value_zero_errors() {
+        let fee_and_amounts: FeeAndAmounts = (0, vec![1, 2, 4, 8, 16, 32]).into();
+
+        let result =
+            Amount::from(10).split_targeted(&SplitTarget::Value(Amount::ZERO), &fee_and_amounts);
+
+        assert!(matches!(result, Err(Error::InvalidAmount(_))));
+    }
+
     // =========================================================================
     // split_with_fee() tests for restricted keysets
     // =========================================================================
@@ -2517,5 +2628,17 @@ mod tests {
             Amount::try_sum(proofs.iter().copied()).unwrap(),
             Amount::from(5)
         );
+    }
+
+    /// A keyset may advertise a zero denomination. Dividing by it panics, so
+    /// the split rejects the keyset instead of trusting it.
+    #[test]
+    fn test_split_rejects_zero_denomination() {
+        let fee_and_amounts: FeeAndAmounts = (0, vec![0, 1, 2]).into();
+
+        assert!(matches!(
+            Amount::from(3).split(&fee_and_amounts),
+            Err(Error::InvalidAmount(_))
+        ));
     }
 }
