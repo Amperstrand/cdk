@@ -120,7 +120,8 @@ jobs:
           install -D -m 0755 packaging/files/etc/init.d/cdk-mintd-wrt    "$PAYLOAD/etc/init.d/cdk-mintd-wrt"
           install -D -m 0644 packaging/files/etc/config/firewall-cdk-mintd "$PAYLOAD/etc/config/firewall-cdk-mintd"
           install -D -m 0644 packaging/files/etc/tollgate/mintd.toml       "$PAYLOAD/etc/tollgate/mintd.toml"
-          install -D -m 0644 LICENSE "$PAYLOAD/usr/share/doc/cdk-mintd-wrt/LICENSE"
+          install -D -m 0644 LICENSE-MIT "$PAYLOAD/usr/share/doc/cdk-mintd-wrt/LICENSE-MIT"
+          install -D -m 0644 LICENSE-APACHE "$PAYLOAD/usr/share/doc/cdk-mintd-wrt/LICENSE-APACHE"
 
           mkdir -p artifacts
           env \
