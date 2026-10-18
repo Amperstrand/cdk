@@ -3,6 +3,7 @@ name: Build OpenWrt Package
 on:
   push:
     branches: [experimentalaislop]
+  workflow_dispatch:
 
 env:
   PACKAGE_NAME: "cdk-mintd-wrt"
