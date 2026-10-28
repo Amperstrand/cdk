@@ -984,15 +984,26 @@ impl Mint {
                 );
 
                 if !input.is_batch() {
+                    // AMPESTRAND fix/duplicate-outputs-error-identity: a
+                    // duplicate on the blinded-message/signature inserts is
+                    // the NUT-19 11003 condition (outputs already signed —
+                    // e.g. a restored wallet re-deriving an exposed range).
+                    // Propagating the raw Database::Duplicate mapped it to
+                    // InvoiceAlreadyPaid, which wallets cannot distinguish
+                    // from a quote-level refusal — the wallet-side
+                    // fresh-counter recovery never triggers and the wallet
+                    // bricks against the mint (reproduced 2026-10-28).
                     tx.add_blinded_messages(Some(quote_id), input.outputs(), &operation)
-                        .await?;
+                        .await
+                        .map_err(|_| Error::BlindedMessageAlreadySigned)?;
 
                     tx.add_blind_signatures(
                         &blinded_secrets,
                         &all_blind_signatures,
                         Some(quote_id.clone()),
                     )
-                    .await?;
+                    .await
+                    .map_err(|_| Error::BlindedMessageAlreadySigned)?;
                 }
 
                 mint_quote.add_issuance(amount_issued)?;
