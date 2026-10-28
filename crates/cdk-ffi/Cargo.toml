@@ -9,7 +9,11 @@ description = "FFI bindings for cdk wallet"
 homepage = "https://github.com/cashubtc/cdk"
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+# AMPESTRAND experimental/arch: cdylib dropped — linking a .so needs a
+# target libc at build time, which cross builds do not have; the Go
+# bindings consume the STATICLIB. Restore cdylib only for desktop .so
+# release builds.
+crate-type = ["staticlib", "rlib"]
 name = "cdk_ffi"
 
 [dependencies]

@@ -170,3 +170,6 @@ strip = "debuginfo" # Strip debug info, keep symbol names for backtraces
 
 [workspace.metadata.crane]
 name = "cdk-workspace"
+
+[patch.crates-io]
+nostr-relay-pool = { path = "third_party/nostr-relay-pool" }
