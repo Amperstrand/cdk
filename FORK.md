@@ -32,3 +32,18 @@ Upstream drift is re-based (not merged) at each sync; the carried set is
 the endpoint, not the history. **Drift-report threshold for this fork:
 5 commits** (was effectively "whenever noticed" — the 2026-10 sync found
 614). Local commits beyond 5 without an upstream sync = the report fires.
+
+## Consumers and lanes (added 2026-11-18, amperstrand-ops#97)
+
+Two lanes, two disciplines:
+
+- **`tollgate` branch — the production lane.** Rev-pinned exactly by
+  [`cdk-walletd`](https://github.com/Amperstrand/cdk-walletd) (its
+  `PIN.md`: never a moving ref; bumps = deliberate upstream tag merges
+  gated by the parity suite). Currently `9f6d3a37` = upstream `v0.18.2`,
+  zero divergence. Pin staleness is governed by PIN.md's bump policy,
+  not by the drift report.
+- **Default branch (`experimentalaislop`) — the cashu-audit lane.**
+  Re-synced deliberately (2026-10-18 614-find, 2026-11-02); the
+  `fork_drift.py` threshold for this fork (150, amperstrand-ops#97)
+  encodes that cadence, ~2+ weeks of upstream movement.
