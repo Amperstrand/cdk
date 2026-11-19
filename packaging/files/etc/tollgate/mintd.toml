@@ -1,12 +1,19 @@
 # CDK Mint Daemon — OpenWrt Default Config
-# Minimal config for TollGate testing: fakewallet + sqlite
+# Minimal config for the TollGate bench mint: fakewallet + sqlite.
 # The mint is accessible at http://tollgate.lan:8085/
+#
+# Schema: crates/cdk-mintd/src/config.rs `Settings` at this branch's
+# synced cdk version (FORK.md rule: fields re-validated at each re-sync).
+# NOTE: since the database-backed config model, this file is NOT a startup
+# argument — the init script stages it with `config apply --file` and the
+# daemon reads its resolved configuration from the work-dir database.
+# `[ln]` no longer exists: backend selection is `[[payment_backend]]`.
 
 [info]
 url = "http://tollgate.lan:8085/"
 listen_host = "0.0.0.0"
 listen_port = 8085
-mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+mnemonic = "file:/etc/tollgate/mintd.mnemonic"
 
 [info.quote_ttl]
 mint_ttl = 600
@@ -17,11 +24,12 @@ backend = "memory"
 ttl = 60
 tti = 60
 
+[[payment_backend]]
+backend = "fakewallet"
+unit = "sat"
+
 [database]
 engine = "sqlite"
-
-[ln]
-ln_backend = "fakewallet"
 
 [fake_wallet]
 supported_units = ["sat"]
