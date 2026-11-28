@@ -26,6 +26,14 @@ pub trait Database<Err>: Debug
 where
     Err: Into<Error> + From<Error>,
 {
+    /// Release database resources after callers have stopped wallet operations.
+    ///
+    /// The default does nothing. SQL backends permanently close their shared pool,
+    /// including clones, and wait for outstanding database operations and cleanup.
+    async fn close(&self) -> Result<(), Err> {
+        Ok(())
+    }
+
     /// Get mint from storage
     async fn get_mint(&self, mint_url: MintUrl) -> Result<Option<MintInfo>, Err>;
 
@@ -44,7 +52,9 @@ where
     /// Get mint quotes from storage
     async fn get_mint_quotes(&self) -> Result<Vec<WalletMintQuote>, Err>;
     /// Get unissued mint quotes from storage
-    /// Returns bolt11 quotes where nothing has been issued yet (amount_issued = 0) and all bolt12 quotes.
+    /// Returns bolt11 quotes where nothing has been issued yet (amount_issued = 0) or a paid
+    /// amount is still left to issue (amount_paid > amount_issued), and all quotes of other
+    /// payment methods (bolt12, onchain, custom), which can be paid more than once.
     /// Includes unpaid bolt11 quotes to allow checking with the mint if they've been paid (wallet state may be outdated).
     async fn get_unissued_mint_quotes(&self) -> Result<Vec<WalletMintQuote>, Err>;
 
@@ -117,6 +127,17 @@ where
 
     /// Atomically increment a namespaced derivation counter and return its new value.
     async fn increment_derivation_counter(&self, namespace: &str, count: u32) -> Result<u32, Err>;
+
+    /// Atomically reserve and return an unused derivation index at least `minimum_index`.
+    ///
+    /// Advance the namespaced counter to `max(counter, minimum_index) + 1` in
+    /// one database operation. Return an error without modifying the counter
+    /// if its next value cannot be represented as a `u32`.
+    async fn reserve_derivation_index(
+        &self,
+        namespace: &str,
+        minimum_index: u32,
+    ) -> Result<u32, Err>;
 
     /// Add Mint to storage
     async fn add_mint(&self, mint_url: MintUrl, mint_info: Option<MintInfo>) -> Result<(), Err>;

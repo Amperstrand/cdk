@@ -26,7 +26,6 @@ pub mod token;
 pub mod types;
 pub mod wallet;
 pub mod wallet_repository;
-mod wallet_trait;
 
 pub use database::*;
 pub use error::*;
@@ -573,6 +572,7 @@ mod tests {
             unit: CurrencyUnit::Sat,
             active: true,
             input_fee_ppk: 0,
+            final_expiry: None,
         })
         .expect_err("invalid keyset ID should return an error");
 
@@ -586,6 +586,7 @@ mod tests {
             unit: CurrencyUnit::Sat,
             active: true,
             input_fee_ppk: 0,
+            final_expiry: None,
         })
         .expect_err("empty keyset ID should return an error");
 

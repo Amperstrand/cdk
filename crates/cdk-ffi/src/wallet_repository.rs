@@ -35,6 +35,20 @@ pub struct WalletRepository {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl WalletRepository {
+    /// Create receive requests using CDK's NUT-18 builder.
+    /// With nostr_pubkey, the app receives using its own identity and no wait info is returned.
+    /// Without it, Nostr transport generates an ephemeral identity.
+    pub async fn create_request(
+        &self,
+        params: CreateRequestParams,
+    ) -> Result<CreateRequestResult, FfiError> {
+        let (payment_request, nostr_wait_info) = self.inner.create_request(params.into()).await?;
+        Ok(CreateRequestResult::from_inner(
+            payment_request,
+            nostr_wait_info,
+        ))
+    }
+
     /// Create a new WalletRepository from locally persisted wallet state.
     ///
     /// Construction does not make network requests to configured mints.
@@ -215,9 +229,7 @@ impl WalletRepository {
             .get_or_create_wallet(cdk_mint_url, unit.into(), config)
             .await?;
 
-        Ok(Arc::new(crate::wallet::Wallet::from_inner(Arc::new(
-            wallet,
-        ))))
+        Ok(Arc::new(crate::wallet::Wallet::from_inner(wallet)))
     }
 
     /// Remove mint from WalletRepository
@@ -349,7 +361,7 @@ impl WalletRepository {
         let wallets = self.inner.get_wallets().await;
         wallets
             .into_iter()
-            .map(|w| Arc::new(crate::wallet::Wallet::from_inner(Arc::new(w))))
+            .map(|w| Arc::new(crate::wallet::Wallet::from_inner(w)))
             .collect()
     }
 
@@ -364,9 +376,7 @@ impl WalletRepository {
         let cdk_mint_url: cdk::mint_url::MintUrl = mint_url.try_into()?;
         let unit_cdk: cdk::nuts::CurrencyUnit = unit.into();
         let wallet = self.inner.get_wallet(&cdk_mint_url, &unit_cdk).await?;
-        Ok(Arc::new(crate::wallet::Wallet::from_inner(Arc::new(
-            wallet,
-        ))))
+        Ok(Arc::new(crate::wallet::Wallet::from_inner(wallet)))
     }
 
     /// Get token data, including the expected redemption fee, without redeeming it.

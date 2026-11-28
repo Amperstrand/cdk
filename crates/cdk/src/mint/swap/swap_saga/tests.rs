@@ -4,22 +4,29 @@
 //! without requiring external dependencies like payment backends.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use cdk_common::nuts::{Proofs, ProofsMethods};
-use cdk_common::{Amount, State};
+use cdk_common::nuts::{BlindSignature, BlindedMessage, Proofs, ProofsMethods};
+use cdk_common::{Amount, CurrencyUnit, MintRequest, QuoteId, State, SwapRequest};
+use cdk_signatory::signatory::{
+    ReconstructDleqArguments, RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets,
+};
 
 use super::SwapSaga;
 use crate::mint::swap::Mint;
-use crate::mint::Verification;
+use crate::mint::{MintInput, Verification};
 use crate::test_helpers::mint::{
-    clear_fail_for, create_test_blinded_messages, create_test_mint, set_fail_for,
+    clear_fail_for, create_test_blinded_messages, create_test_mint,
+    create_test_mint_with_signatory, set_fail_for,
 };
 
 /// Helper to create a verification result for testing
-fn create_verification(amount: Amount) -> Verification {
-    Verification {
-        amount: amount.with_unit(cdk_common::nuts::CurrencyUnit::Sat),
-    }
+fn create_verification(proofs: &Proofs, amount: Amount) -> Verification {
+    Verification::new(
+        amount.with_unit(cdk_common::nuts::CurrencyUnit::Sat),
+        proofs,
+    )
+    .expect("proof ys")
 }
 
 /// Helper to create test proofs for swapping using the mint's process
@@ -28,7 +35,7 @@ async fn create_swap_inputs(mint: &Mint, amount: Amount) -> (Proofs, Verificatio
         .await
         .expect("Failed to create test proofs");
 
-    let verification = create_verification(amount);
+    let verification = create_verification(&proofs, amount);
 
     (proofs, verification)
 }
@@ -124,6 +131,74 @@ async fn test_swap_saga_full_flow_success() {
             "Input proofs should be marked as spent"
         );
     }
+}
+
+#[tokio::test]
+async fn test_swap_signs_accepted_outputs_after_keyset_rotation() {
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(64);
+    let (input_proofs, input_verification) = create_swap_inputs(&mint, amount).await;
+    let (outputs, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+    let keyset_id = outputs[0].keyset_id;
+
+    let saga = SwapSaga::new(&mint, mint.localstore(), mint.pubsub_manager())
+        .setup_swap(&input_proofs, &outputs, None, input_verification)
+        .await
+        .unwrap();
+
+    mint.rotate_keyset(
+        CurrencyUnit::Sat,
+        vec![1, 2, 4, 8, 16, 32, 64],
+        0,
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!mint.get_keyset_info(&keyset_id).unwrap().active);
+
+    let (mut mixed_outputs, _) = create_test_blinded_messages(&mint, Amount::from(1))
+        .await
+        .unwrap();
+    mixed_outputs.extend(outputs.clone());
+
+    for new_outputs in [outputs.clone(), mixed_outputs] {
+        let err = mint
+            .process_swap_request(SwapRequest::new(input_proofs.clone(), new_outputs.clone()))
+            .await
+            .expect_err("new swaps must reject inactive outputs");
+        assert!(matches!(err, cdk_common::Error::InactiveKeyset));
+
+        let err = mint
+            .process_mint_request(MintInput::Single(MintRequest {
+                quote: QuoteId::new(),
+                outputs: new_outputs,
+                signature: None,
+            }))
+            .await
+            .expect_err("new mint requests must reject inactive outputs");
+        assert!(matches!(err, cdk_common::Error::InactiveKeyset));
+    }
+
+    let response = saga
+        .sign_outputs()
+        .await
+        .expect("accepted outputs must still sign after rotation")
+        .finalize()
+        .await
+        .unwrap();
+    assert_eq!(response.signatures.len(), outputs.len());
+    assert!(response
+        .signatures
+        .iter()
+        .all(|sig| sig.keyset_id == keyset_id));
+    let states = mint
+        .localstore()
+        .get_proofs_states(&input_proofs.ys().unwrap())
+        .await
+        .unwrap();
+    assert!(states.iter().all(|state| *state == Some(State::Spent)));
+    mint.stop().await.unwrap();
 }
 
 /// Tests the Initial -> SetupComplete state transition.
@@ -267,9 +342,10 @@ async fn test_swap_saga_duplicate_inputs() {
     let mint = create_test_mint().await.unwrap();
 
     let amount = Amount::from(100);
-    let (mut input_proofs, input_verification) = create_swap_inputs(&mint, amount).await;
+    let (mut input_proofs, _) = create_swap_inputs(&mint, amount).await;
 
     input_proofs.push(input_proofs[0].clone());
+    let input_verification = create_verification(&input_proofs, amount);
 
     let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
 
@@ -331,6 +407,107 @@ async fn test_swap_saga_duplicate_outputs() {
         .await;
 
     assert!(result.is_err(), "Setup should fail with duplicate outputs");
+}
+
+/// Tests that outputs already used by an earlier swap are rejected as already
+/// signed.
+///
+/// # What This Tests
+/// - The database unique constraint catches outputs from an earlier request
+/// - setup_swap() reports NUT-00 error 11003 (`BlindedMessageAlreadySigned`)
+///   rather than 11008 (`DuplicateOutputs`), which is reserved for the same
+///   output appearing twice within one request
+///
+/// # Success Criteria
+/// - The first swap succeeds
+/// - The second swap with fresh inputs and the same outputs fails with
+///   `BlindedMessageAlreadySigned`
+#[tokio::test]
+async fn test_swap_saga_rejects_outputs_signed_by_earlier_swap() {
+    let mint = create_test_mint().await.unwrap();
+
+    let amount = Amount::from(100);
+    let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+
+    let (first_inputs, first_verification) = create_swap_inputs(&mint, amount).await;
+    SwapSaga::new(&mint, mint.localstore(), mint.pubsub_manager())
+        .setup_swap(
+            &first_inputs,
+            &output_blinded_messages,
+            None,
+            first_verification,
+        )
+        .await
+        .expect("First setup should succeed")
+        .sign_outputs()
+        .await
+        .expect("First signing should succeed")
+        .finalize()
+        .await
+        .expect("First finalize should succeed");
+
+    let (second_inputs, second_verification) = create_swap_inputs(&mint, amount).await;
+    let result = SwapSaga::new(&mint, mint.localstore(), mint.pubsub_manager())
+        .setup_swap(
+            &second_inputs,
+            &output_blinded_messages,
+            None,
+            second_verification,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(cdk_common::Error::BlindedMessageAlreadySigned)),
+        "Reused outputs should be rejected as already signed, got: {:?}",
+        result.err()
+    );
+}
+
+/// Tests that outputs reserved by a swap that has not signed them yet are
+/// rejected as pending.
+///
+/// # What This Tests
+/// - setup_swap() stores the outputs with no signature before signing starts
+/// - A second swap reusing those outputs gets NUT-00 error 11004
+///   (`OutputsPending`), not 11003 (`BlindedMessageAlreadySigned`)
+///
+/// # Success Criteria
+/// - The first setup succeeds and is left unsigned
+/// - The second setup with fresh inputs and the same outputs fails with
+///   `OutputsPending`
+#[tokio::test]
+async fn test_swap_saga_rejects_outputs_pending_in_earlier_swap() {
+    let mint = create_test_mint().await.unwrap();
+
+    let amount = Amount::from(100);
+    let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+
+    let (first_inputs, first_verification) = create_swap_inputs(&mint, amount).await;
+    let _pending_swap = SwapSaga::new(&mint, mint.localstore(), mint.pubsub_manager())
+        .setup_swap(
+            &first_inputs,
+            &output_blinded_messages,
+            None,
+            first_verification,
+        )
+        .await
+        .expect("First setup should succeed");
+
+    let (second_inputs, second_verification) = create_swap_inputs(&mint, amount).await;
+    let result = SwapSaga::new(&mint, mint.localstore(), mint.pubsub_manager())
+        .setup_swap(
+            &second_inputs,
+            &output_blinded_messages,
+            None,
+            second_verification,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(cdk_common::Error::OutputsPending)),
+        "Outputs reserved by an unsigned swap should be rejected as pending, got: {:?}",
+        result.err()
+    );
 }
 
 /// Tests that unbalanced swap requests are rejected (outputs > inputs).
@@ -467,7 +644,7 @@ async fn test_swap_saga_empty_inputs() {
     let empty_proofs = Proofs::new();
     let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
     // Verification must match the actual input amount (zero for empty proofs)
-    let verification = create_verification(Amount::from(0));
+    let verification = create_verification(&empty_proofs, Amount::from(0));
 
     let db = mint.localstore();
     let pubsub = mint.pubsub_manager();
@@ -532,7 +709,7 @@ async fn test_swap_saga_both_empty() {
 
     let empty_proofs = Proofs::new();
     let empty_blinded_messages = vec![];
-    let verification = create_verification(Amount::from(0));
+    let verification = create_verification(&empty_proofs, Amount::from(0));
 
     let db = mint.localstore();
     let pubsub = mint.pubsub_manager();
@@ -2045,7 +2222,7 @@ async fn test_operation_id_uniqueness_and_tracking() {
 
     // Verify each set of proofs can now be used in new swaps
     let (new_outputs_1, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
-    let verification = create_verification(amount);
+    let verification = create_verification(&proofs_1, amount);
 
     let pubsub = mint.pubsub_manager();
     let new_saga = SwapSaga::new(&mint, db, pubsub);
@@ -3020,4 +3197,203 @@ async fn test_saga_deletion_failure_handling() {
     //
     // This would require adding a TEST_FAIL_DELETE_SAGA env var check in the
     // database implementation's delete_saga method.
+}
+
+/// Tests that a rolled back swap tells proof state subscribers the inputs are
+/// spendable again.
+///
+/// Setup publishes every input as `PENDING`. When finalize fails, the
+/// compensation deletes the proofs, so a subscriber must also see them
+/// become `UNSPENT` instead of staying on the last `PENDING` event.
+#[tokio::test]
+async fn test_swap_saga_compensation_publishes_unspent_inputs() {
+    use cdk_common::nuts::nut17::{Kind, NotificationPayload};
+    use cdk_common::subscription::{Params, SubId};
+
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(100);
+    let (input_proofs, input_verification) = create_swap_inputs(&mint, amount).await;
+    let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+    let ys = input_proofs.ys().unwrap();
+
+    let mut subscription = mint
+        .pubsub_manager()
+        .subscribe(Params {
+            kind: Kind::ProofState,
+            filters: ys.iter().map(|y| y.to_string()).collect(),
+            id: Arc::new(SubId::from("swap-rollback")),
+        })
+        .unwrap();
+
+    let saga = SwapSaga::new(&mint, mint.localstore(), mint.pubsub_manager())
+        .setup_swap(
+            &input_proofs,
+            &output_blinded_messages,
+            None,
+            input_verification,
+        )
+        .await
+        .expect("Setup should succeed")
+        .sign_outputs()
+        .await
+        .expect("Signing should succeed");
+
+    set_fail_for("ADD_SIGNATURES");
+    let result = saga.finalize().await;
+    clear_fail_for("ADD_SIGNATURES");
+    assert!(result.is_err(), "Finalize should fail");
+
+    // Every input must end on UNSPENT after its PENDING event
+    let mut last_states = std::collections::HashMap::new();
+    while last_states.len() < ys.len() || last_states.values().any(|state| *state != State::Unspent)
+    {
+        let event = tokio::time::timeout(Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("rolled back inputs must be published as unspent")
+            .expect("subscription closed");
+        let NotificationPayload::ProofState(proof_state) = event.into_inner() else {
+            panic!("expected proof state notification");
+        };
+        last_states.insert(proof_state.y, proof_state.state);
+    }
+    assert!(ys.iter().all(|y| last_states[y] == State::Unspent));
+}
+
+/// A single armed pause point for a `BlindSignGate::blind_sign` call.
+struct SignGate {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Delegates to the real signatory but can hold the next `blind_sign` call
+/// open, parking a swap between its setup and finalize transactions.
+struct BlindSignGate {
+    inner: Arc<dyn Signatory + Send + Sync>,
+    gate: tokio::sync::Mutex<Option<SignGate>>,
+}
+
+impl BlindSignGate {
+    /// Arm the next `blind_sign` call to pause. Returns a receiver that fires
+    /// once the call is parked, and a sender that releases it.
+    async fn arm(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.gate.lock().await = Some(SignGate {
+            reached: reached_tx,
+            release: release_rx,
+        });
+        (reached_rx, release_tx)
+    }
+}
+
+#[async_trait::async_trait]
+impl Signatory for BlindSignGate {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    async fn blind_sign(
+        &self,
+        blinded_messages: Vec<BlindedMessage>,
+    ) -> Result<Vec<BlindSignature>, cdk_common::Error> {
+        let gate = self.gate.lock().await.take();
+        if let Some(gate) = gate {
+            let _ = gate.reached.send(());
+            let _ = gate.release.await;
+        }
+        self.inner.blind_sign(blinded_messages).await
+    }
+
+    async fn verify_proofs(&self, proofs: Proofs) -> Result<(), cdk_common::Error> {
+        self.inner.verify_proofs(proofs).await
+    }
+
+    async fn keysets(&self) -> Result<SignatoryKeysets, cdk_common::Error> {
+        self.inner.keysets().await
+    }
+
+    async fn subscribe_keysets(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<SignatoryKeysets>, cdk_common::Error> {
+        self.inner.subscribe_keysets().await
+    }
+
+    async fn rotate_keyset(
+        &self,
+        args: RotateKeyArguments,
+    ) -> Result<SignatoryKeySet, cdk_common::Error> {
+        self.inner.rotate_keyset(args).await
+    }
+
+    async fn reconstruct_dleq(
+        &self,
+        args: Vec<ReconstructDleqArguments>,
+    ) -> Result<Vec<BlindSignature>, cdk_common::Error> {
+        self.inner.reconstruct_dleq(args).await
+    }
+}
+
+/// Tests that a swap completes even when the caller drops its future, as
+/// happens when an HTTP client disconnects mid-request.
+///
+/// The caller's future is dropped while blind signing is parked, after the
+/// setup transaction has committed. The swap must still finalize instead of
+/// leaving the inputs pending until the next mint restart.
+#[tokio::test]
+async fn test_swap_completes_when_caller_is_dropped() {
+    let gate_slot = Arc::new(std::sync::Mutex::new(None));
+    let mint = create_test_mint_with_signatory(|inner| {
+        let gate = Arc::new(BlindSignGate {
+            inner,
+            gate: tokio::sync::Mutex::new(None),
+        });
+        *gate_slot.lock().expect("gate slot") = Some(Arc::clone(&gate));
+        gate
+    })
+    .await
+    .unwrap();
+    let gate = gate_slot.lock().expect("gate slot").take().expect("gate");
+
+    let amount = Amount::from(100);
+    let (input_proofs, _) = create_swap_inputs(&mint, amount).await;
+    let (outputs, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+    let ys = input_proofs.ys().unwrap();
+
+    let (reached, release) = gate.arm().await;
+
+    // Drop the caller's future once signing is parked.
+    tokio::select! {
+        _ = mint.process_swap_request(SwapRequest::new(input_proofs, outputs)) => {
+            panic!("swap must not finish while signing is gated");
+        }
+        reached = reached => reached.expect("swap reached the signing gate"),
+    }
+
+    release.send(()).expect("release the signing gate");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let states = mint.localstore().get_proofs_states(&ys).await.unwrap();
+            if states.iter().all(|state| *state == Some(State::Spent)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropped swap must still finalize and spend its inputs");
+
+    assert!(
+        mint.localstore()
+            .get_incomplete_sagas(cdk_common::mint::OperationKind::Swap)
+            .await
+            .unwrap()
+            .is_empty(),
+        "finalized swap must not leave a saga behind"
+    );
 }

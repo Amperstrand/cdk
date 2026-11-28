@@ -251,6 +251,13 @@ where
 {
     type Err = database::Error;
 
+    async fn close(&self) -> Result<(), Error> {
+        self.pool
+            .close()
+            .await
+            .map_err(|error| Error::Database(Box::new(error)))
+    }
+
     async fn begin_transaction<'a>(
         &'a self,
     ) -> Result<Box<dyn MintAuthTransaction<database::Error> + Send + Sync + 'a>, database::Error>
@@ -381,8 +388,6 @@ where
                 keyset_id,
                 amount,
                 c,
-                dleq_e,
-                dleq_s,
                 blinded_message,
             FROM
                 blind_signature

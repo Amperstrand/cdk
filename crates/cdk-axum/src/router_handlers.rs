@@ -4,13 +4,12 @@ use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use cdk::error::ErrorResponse;
+use cdk::mint::MintServer;
 use cdk::nuts::nut21::{Method, ProtectedEndpoint, RoutePath};
 use cdk::nuts::{
     CheckStateRequest, CheckStateResponse, Id, KeysResponse, KeysetResponse, MintInfo,
     RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
 };
-use cdk::util::unix_time;
-use paste::paste;
 use tracing::instrument;
 
 use crate::auth::AuthHeader;
@@ -20,72 +19,36 @@ use crate::MintState;
 /// Macro to add cache to endpoint
 #[macro_export]
 macro_rules! post_cache_wrapper {
-    ($handler:ident, $request_type:ty, $response_type:ty) => {
-        paste! {
-            /// Cache wrapper function for $handler:
-            /// Wrap $handler into a function that caches responses using the request as key
-            pub async fn [<cache_ $handler>](
-                auth: AuthHeader,
-                state: State<MintState>,
-                payload: Json<$request_type>
-            ) -> Result<Json<$response_type>, Response> {
-                use std::ops::Deref;
-                let json_extracted_payload = payload.deref();
-                let State(mint_state) = state.clone();
-                let cache_key = match mint_state.cache.calculate_key(&json_extracted_payload) {
-                    Some(key) => key,
-                    None => {
-                        // Could not calculate key, just return the handler result
-                        return $handler(auth, state, payload).await;
-                    }
-                };
-                if let Some(cached_response) = mint_state.cache.get::<$response_type>(&cache_key).await {
-                    return Ok(Json(cached_response));
+    ($cached_handler:ident, $handler:ident, $request_type:ty, $response_type:ty) => {
+        /// Cache wrapper function for $handler:
+        /// Wrap $handler into a function that caches responses using the request as key
+        pub async fn $cached_handler(
+            auth: AuthHeader,
+            state: State<MintState>,
+            payload: Json<$request_type>,
+        ) -> Result<Json<$response_type>, Response> {
+            use std::ops::Deref;
+            let json_extracted_payload = payload.deref();
+            let State(mint_state) = state.clone();
+            let cache_key = match mint_state.cache.calculate_key(&json_extracted_payload) {
+                Some(key) => key,
+                None => {
+                    // Could not calculate key, just return the handler result
+                    return $handler(auth, state, payload).await;
                 }
-                let response = $handler(auth, state, payload).await?;
-                mint_state.cache.set(cache_key, &response.deref()).await;
-                Ok(response)
+            };
+            if let Some(cached_response) = mint_state.cache.get::<$response_type>(&cache_key).await
+            {
+                return Ok(Json(cached_response));
             }
+            let response = $handler(auth, state, payload).await?;
+            mint_state.cache.set(cache_key, &response.deref()).await;
+            Ok(response)
         }
     };
 }
 
-/// Macro to add cache to endpoint with prefer header support (for async operations)
-#[macro_export]
-macro_rules! post_cache_wrapper_with_prefer {
-    ($handler:ident, $request_type:ty, $response_type:ty) => {
-        paste! {
-            /// Cache wrapper function for $handler with PreferHeader support:
-            /// Wrap $handler into a function that caches responses using the request as key
-            pub async fn [<cache_ $handler>](
-                auth: AuthHeader,
-                prefer: PreferHeader,
-                state: State<MintState>,
-                payload: Json<$request_type>
-            ) -> Result<Json<$response_type>, Response> {
-                use std::ops::Deref;
-
-                let json_extracted_payload = payload.deref();
-                let State(mint_state) = state.clone();
-                let cache_key = match mint_state.cache.calculate_key(&json_extracted_payload) {
-                    Some(key) => key,
-                    None => {
-                        // Could not calculate key, just return the handler result
-                        return $handler(auth, prefer, state, payload).await;
-                    }
-                };
-                if let Some(cached_response) = mint_state.cache.get::<$response_type>(&cache_key).await {
-                    return Ok(Json(cached_response));
-                }
-                let response = $handler(auth, prefer, state, payload).await?;
-                mint_state.cache.set(cache_key, &response.deref()).await;
-                Ok(response)
-            }
-        }
-    };
-}
-
-post_cache_wrapper!(post_swap, SwapRequest, SwapResponse);
+post_cache_wrapper!(cache_post_swap, post_swap, SwapRequest, SwapResponse);
 
 /// Get the public keys of the newest mint keyset
 ///
@@ -159,7 +122,7 @@ pub(crate) async fn post_check(
         .await
         .map_err(into_response)?;
 
-    let state = state.mint.check_state(&payload).await.map_err(|err| {
+    let state = state.mint.post_check_state(payload).await.map_err(|err| {
         tracing::error!("Could not check state of proofs");
         into_response(err)
     })?;
@@ -172,18 +135,10 @@ pub(crate) async fn post_check(
 pub(crate) async fn get_mint_info(
     State(state): State<MintState>,
 ) -> Result<Json<MintInfo>, Response> {
-    Ok(Json(
-        state
-            .mint
-            .mint_info()
-            .await
-            .map_err(|err| {
-                tracing::error!("Could not get mint info: {}", err);
-                into_response(err)
-            })?
-            .clone()
-            .time(unix_time()),
-    ))
+    Ok(Json(state.mint.get_mint_info().await.map_err(|err| {
+        tracing::error!("Could not get mint info: {}", err);
+        into_response(err)
+    })?))
 }
 
 /// Swap inputs for outputs of the same value
@@ -206,14 +161,10 @@ pub(crate) async fn post_swap(
         .await
         .map_err(into_response)?;
 
-    let swap_response = state
-        .mint
-        .process_swap_request(payload)
-        .await
-        .map_err(|err| {
-            tracing::error!("Could not process swap request: {}", err);
-            into_response(err)
-        })?;
+    let swap_response = state.mint.post_swap(payload).await.map_err(|err| {
+        tracing::error!("Could not process swap request: {}", err);
+        into_response(err)
+    })?;
 
     Ok(Json(swap_response))
 }
@@ -234,7 +185,7 @@ pub(crate) async fn post_restore(
         .await
         .map_err(into_response)?;
 
-    let restore_response = state.mint.restore(payload).await.map_err(|err| {
+    let restore_response = state.mint.post_restore(payload).await.map_err(|err| {
         tracing::error!("Could not process restore: {}", err);
         into_response(err)
     })?;

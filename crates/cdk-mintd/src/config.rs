@@ -10,6 +10,37 @@ use cdk_common::redact::url_for_logs;
 use config::{Config, ConfigError, File, FileFormat};
 use serde::{Deserialize, Serialize};
 
+/// Keyset version selector used in mintd configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeysetVersion {
+    /// V1 keyset (Version00)
+    V1,
+    /// V2 keyset (Version01)
+    V2,
+}
+
+impl std::str::FromStr for KeysetVersion {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            _ => Err(format!("Unknown keyset version: {s} (expected v1 or v2)")),
+        }
+    }
+}
+
+impl From<KeysetVersion> for cdk::nuts::nut02::KeySetVersion {
+    fn from(version: KeysetVersion) -> Self {
+        match version {
+            KeysetVersion::V1 => Self::Version00,
+            KeysetVersion::V2 => Self::Version01,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LoggingOutput {
@@ -60,6 +91,13 @@ pub struct Info {
     pub input_fee_ppk: Option<u64>,
     /// Use keyset v2
     pub use_keyset_v2: Option<bool>,
+    /// Keyset version for new keysets: "v1" or "v2".
+    /// Takes precedence over `use_keyset_v2`.
+    pub keyset_version: Option<KeysetVersion>,
+    /// How often, in milliseconds, the embedded signatory reloads keysets from
+    /// the database. Unset or `0` disables it; set an interval only when several
+    /// mints or signatories share one database.
+    pub keyset_refresh_interval_ms: Option<u64>,
 
     pub http_cache: cache::Config,
 
@@ -90,6 +128,8 @@ impl Default for Info {
             mnemonic: None,
             input_fee_ppk: None,
             use_keyset_v2: None,
+            keyset_version: None,
+            keyset_refresh_interval_ms: None,
             http_cache: cache::Config::default(),
             enable_info_page: Some(true),
             logging: LoggingConfig::default(),
@@ -117,6 +157,11 @@ impl std::fmt::Debug for Info {
             .field("mnemonic", &mnemonic_display)
             .field("input_fee_ppk", &self.input_fee_ppk)
             .field("use_keyset_v2", &self.use_keyset_v2)
+            .field("keyset_version", &self.keyset_version)
+            .field(
+                "keyset_refresh_interval_ms",
+                &self.keyset_refresh_interval_ms,
+            )
             .field("http_cache", &self.http_cache)
             .field("logging", &self.logging)
             .field("enable_info_page", &self.enable_info_page)
@@ -684,10 +729,6 @@ pub struct LdkNode {
     pub ldk_node_port: Option<u16>,
     /// LDK node announcement addresses
     pub ldk_node_announce_addresses: Option<Vec<String>>,
-    /// Gossip source type (p2p or rgs)
-    pub gossip_source_type: Option<String>,
-    /// Rapid Gossip Sync URL (when gossip_source_type = "rgs")
-    pub rgs_url: Option<String>,
     /// Webserver host (defaults to 127.0.0.1)
     #[serde(default = "default_webserver_host")]
     pub webserver_host: Option<String>,
@@ -718,8 +759,6 @@ impl Default for LdkNode {
             ldk_node_host: None,
             log_dir_path: None,
             ldk_node_port: None,
-            gossip_source_type: None,
-            rgs_url: None,
             webserver_host: default_webserver_host(),
             webserver_port: default_webserver_port(),
             ldk_node_mnemonic: None,
@@ -755,8 +794,6 @@ impl fmt::Debug for LdkNode {
                 "ldk_node_announce_addresses",
                 &self.ldk_node_announce_addresses,
             )
-            .field("gossip_source_type", &self.gossip_source_type)
-            .field("rgs_url", &self.rgs_url.as_deref().map(url_for_logs))
             .field("webserver_host", &self.webserver_host)
             .field("webserver_port", &self.webserver_port)
             .field("ldk_node_mnemonic", &"[REDACTED]")
@@ -875,12 +912,12 @@ impl Default for FakeWallet {
 
 // Helper functions to provide default values
 // Common fee defaults for all backends
-#[cfg(any(feature = "cln", feature = "lnd"))]
+#[cfg(any(feature = "cln", feature = "lnd", feature = "bdk"))]
 fn default_fee_percent() -> f32 {
     0.02
 }
 
-#[cfg(any(feature = "cln", feature = "lnd"))]
+#[cfg(any(feature = "cln", feature = "lnd", feature = "bdk"))]
 fn default_reserve_fee_min() -> Amount {
     2.into()
 }
@@ -1233,6 +1270,14 @@ pub struct MintManagementRpc {
     pub allow_mint_quote_payment_override: bool,
 }
 
+/// Fields that were removed from the configuration but are still accepted
+/// (and ignored) so stored or imported documents that set them keep loading.
+const REMOVED_IGNORED_FIELDS: &[&str] = &[
+    // LDK Node always uses P2P gossip; Rapid Gossip Sync is no longer supported.
+    "ldk_node.gossip_source_type",
+    "ldk_node.rgs_url",
+];
+
 impl Settings {
     /// Parses settings from an in-memory TOML import document.
     pub fn try_from_toml(document: &str) -> Result<Self, ConfigError> {
@@ -1260,7 +1305,9 @@ impl Settings {
         let mut unknown_fields = Vec::new();
         let settings = serde_ignored::deserialize(configuration, |path| {
             let path = path.to_string().replace(".?.", ".");
-            if !allowed_unknown_fields.contains(&path.as_str()) {
+            if REMOVED_IGNORED_FIELDS.contains(&path.as_str()) {
+                tracing::warn!("Ignoring removed configuration field `{}`", path);
+            } else if !allowed_unknown_fields.contains(&path.as_str()) {
                 unknown_fields.push(path);
             }
         })?;
@@ -1402,6 +1449,23 @@ impl Settings {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn keyset_version_parses_from_toml_and_env_strings() {
+        let info: Info = toml::from_str(r#"keyset_version = "v2""#).expect("info");
+        assert_eq!(info.keyset_version, Some(KeysetVersion::V2));
+        assert_eq!(Info::default().keyset_version, None);
+        assert!(toml::from_str::<Info>(r#"keyset_version = "v4""#).is_err());
+
+        for (input, expected) in [
+            ("v1", cdk::nuts::nut02::KeySetVersion::Version00),
+            ("V2", cdk::nuts::nut02::KeySetVersion::Version01),
+        ] {
+            let version: KeysetVersion = input.parse().expect("version");
+            assert_eq!(cdk::nuts::nut02::KeySetVersion::from(version), expected);
+        }
+        assert!("01".parse::<KeysetVersion>().is_err());
+    }
 
     #[test]
     fn postgres_tls_defaults_preserve_connection_url_policy() {
@@ -1548,6 +1612,71 @@ listen_por = 8085
         assert!(!message.contains("info.signatory_url"));
     }
 
+    #[cfg(feature = "ldk-node")]
+    #[test]
+    fn removed_ldk_node_gossip_fields_are_ignored() {
+        Settings::try_from_toml(
+            r#"
+[ldk_node]
+gossip_source_type = "rgs"
+rgs_url = "https://rgs.example.com/snapshot"
+"#,
+        )
+        .expect("removed gossip fields must still parse");
+    }
+
+    #[test]
+    fn keyset_refresh_interval_is_off_by_default() {
+        assert_eq!(Info::default().keyset_refresh_interval_ms, None);
+    }
+
+    #[test]
+    fn keyset_refresh_interval_parses_from_toml() {
+        let settings = Settings::try_from_toml(
+            r#"
+[info]
+url = "https://mint.example.com"
+keyset_refresh_interval_ms = 5000
+"#,
+        )
+        .expect("document should parse");
+
+        assert_eq!(settings.info.keyset_refresh_interval_ms, Some(5000));
+    }
+
+    #[test]
+    fn keyset_refresh_interval_env_override_keeps_value_when_unparsable() {
+        let _guard = config_env_lock();
+        std::env::remove_var(crate::env_vars::ENV_KEYSET_REFRESH_INTERVAL_MS);
+
+        std::env::set_var(crate::env_vars::ENV_KEYSET_REFRESH_INTERVAL_MS, "2500");
+        assert_eq!(
+            Info::default()
+                .from_env()
+                .expect("valid environment")
+                .keyset_refresh_interval_ms,
+            Some(2500)
+        );
+
+        std::env::set_var(
+            crate::env_vars::ENV_KEYSET_REFRESH_INTERVAL_MS,
+            "not-a-number",
+        );
+        let configured = Info {
+            keyset_refresh_interval_ms: Some(2500),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured
+                .from_env()
+                .expect("valid environment")
+                .keyset_refresh_interval_ms,
+            Some(2500)
+        );
+
+        std::env::remove_var(crate::env_vars::ENV_KEYSET_REFRESH_INTERVAL_MS);
+    }
+
     fn config_env_lock() -> std::sync::MutexGuard<'static, ()> {
         // Share the single process-wide env lock with the rest of the crate's
         // tests. `std::env` is global, so config.rs and lib.rs tests must
@@ -1665,7 +1794,6 @@ listen_por = 8085
             ),
             electrum_url: Some("ssl://electrum-user:electrum-secret@example.com:50002".to_string()),
             bitcoind_rpc_password: Some("rpc-password-secret".to_string()),
-            rgs_url: Some("https://rgs-user:rgs-secret@example.com/snapshot".to_string()),
             ldk_node_mnemonic: Some("mnemonic-secret-words".to_string()),
             ..Default::default()
         };
@@ -1675,14 +1803,11 @@ listen_por = 8085
         assert!(debug.contains("regtest"));
         assert!(debug.contains("https://example.com/esplora"));
         assert!(debug.contains("ssl://example.com:50002"));
-        assert!(debug.contains("https://example.com/snapshot"));
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("esplora-user"));
         assert!(!debug.contains("esplora-secret"));
         assert!(!debug.contains("electrum-user"));
         assert!(!debug.contains("electrum-secret"));
-        assert!(!debug.contains("rgs-user"));
-        assert!(!debug.contains("rgs-secret"));
         assert!(!debug.contains("rpc-password-secret"));
         assert!(!debug.contains("mnemonic-secret-words"));
     }

@@ -15,7 +15,9 @@ pub use cdk_common::quote_id::QuoteId;
 use cdk_common::stream::{BackoffPolicy, SupervisedStream};
 #[cfg(feature = "prometheus")]
 use cdk_prometheus::MintMetricGuard;
-use cdk_signatory::signatory::{Signatory, SignatoryKeySet, SignatoryKeysets};
+use cdk_signatory::signatory::{
+    ReconstructDleqArguments, Signatory, SignatoryKeySet, SignatoryKeysets,
+};
 use futures::{Stream, StreamExt};
 use nut21::ProtectedEndpoint;
 use subscription::PubSubManager;
@@ -37,6 +39,7 @@ mod melt;
 mod payment_backend;
 mod proofs;
 mod saga_recovery;
+mod server;
 mod start_up_check;
 mod subscription;
 mod swap;
@@ -47,6 +50,7 @@ pub use cdk_common::mint::{MeltQuote, MintKeySetInfo, MintQuote};
 pub use cdk_common::mint_quote::{MintQuoteRequest, MintQuoteResponse};
 pub use issue::MintInput;
 pub use melt::PendingMelt;
+pub use server::MintServer;
 pub use verification::Verification;
 
 const CDK_MINT_PRIMARY_NAMESPACE: &str = "cdk_mint";
@@ -55,7 +59,6 @@ const CDK_MINT_CONFIG_KV_KEY: &str = "mint_info";
 const CDK_MINT_QUOTE_TTL_KV_KEY: &str = "quote_ttl";
 
 /// Cashu Mint
-#[derive(Clone)]
 pub struct Mint {
     /// Signatory backend.
     ///
@@ -387,8 +390,12 @@ impl Mint {
         let payment_processors = Arc::new(payment_processors);
 
         Ok(Self {
-            signatory,
-            pubsub_manager: PubSubManager::new((localstore.clone(), payment_processors.clone())),
+            signatory: Arc::clone(&signatory),
+            pubsub_manager: PubSubManager::new((
+                Arc::clone(&localstore),
+                Arc::clone(&payment_processors),
+                signatory,
+            )),
             localstore,
             oidc_client: computed_info.nuts.nut21.as_ref().map(|nut21| {
                 OidcClient::new(
@@ -425,7 +432,7 @@ impl Mint {
     /// Currently manages:
     /// - Payment processor initialization and startup
     /// - Invoice payment monitoring across all configured payment processors
-    pub async fn start(&self) -> Result<(), Error> {
+    pub async fn start(self: &Arc<Self>) -> Result<(), Error> {
         // Recover from incomplete swap sagas
         // This cleans up incomplete swap operations using persisted saga state
         if let Err(e) = self.recover_from_incomplete_sagas().await {
@@ -480,7 +487,7 @@ impl Mint {
         let shutdown_notify = Arc::new(Notify::new());
 
         // Clone required components for the background task
-        let mint_clone = Arc::new(self.clone());
+        let mint_clone = Arc::clone(self);
         let payment_processors = self.payment_processors.clone();
         let localstore = Arc::clone(&self.localstore);
         let pubsub_manager = Arc::clone(&self.pubsub_manager);
@@ -1112,17 +1119,25 @@ impl Mint {
             return Ok(());
         };
 
-        let payment_response = mint.check_melt_payment_status(&quote).await?;
-
-        saga_recovery::process_melt_saga_failure_event(
-            &saga,
-            &mut quote,
-            &payment_response,
-            localstore,
-            pubsub_manager,
-            mint,
-        )
-        .await
+        let Some(mut lease) = melt::lease::MeltLease::claim(localstore, &mut quote).await? else {
+            return Ok(());
+        };
+        let result = lease
+            .run(async {
+                let payment_response = mint.check_melt_payment_status(&quote).await?;
+                saga_recovery::process_melt_saga_outcome_with_lease(
+                    &saga,
+                    &mut quote,
+                    &payment_response,
+                    localstore,
+                    pubsub_manager,
+                    mint,
+                )
+                .await
+            })
+            .await;
+        lease.release().await;
+        result
     }
 
     /// Handle payment notification without needing full Mint instance
@@ -1361,13 +1376,21 @@ impl Mint {
     }
 
     /// Restore
+    ///
+    /// Signatures are returned for every known blinded secret, expired keysets
+    /// included, so a recovering wallet can still account for what it was
+    /// issued. DLEQ proofs are rebuilt here. If the signatory or its keys are
+    /// unavailable, the stored signatures are returned without DLEQ proofs.
+    /// A stored signature that fails validation is rejected.
     #[instrument(skip_all)]
     pub async fn restore(&self, request: RestoreRequest) -> Result<RestoreResponse, Error> {
         #[cfg(feature = "prometheus")]
         let metrics = MintMetricGuard::new("restore");
 
         let result = async {
-            let output_len = request.outputs.len();
+            let blinded_messages = request.outputs;
+
+            let output_len = blinded_messages.len();
 
             if output_len == 0 {
                 return Ok(RestoreResponse {
@@ -1376,7 +1399,7 @@ impl Mint {
                 });
             }
 
-            // Check max outputs limit
+            // Bound the request before doing any DB work
             if output_len > self.max_outputs {
                 tracing::warn!(
                     "Restore request exceeds max outputs limit: {} > {}",
@@ -1389,60 +1412,54 @@ impl Mint {
                 });
             }
 
-            let mut outputs = Vec::with_capacity(output_len);
-            let mut signatures = Vec::with_capacity(output_len);
-
-            // Build a position map to track original request order for verification
-            let position_map: HashMap<PublicKey, usize> = request
-                .outputs
-                .iter()
-                .enumerate()
-                .map(|(idx, output)| (output.blinded_secret, idx))
-                .collect();
-
-            let blinded_message: Vec<PublicKey> =
-                request.outputs.iter().map(|b| b.blinded_secret).collect();
+            let blinded_secrets: Vec<PublicKey> =
+                blinded_messages.iter().map(|b| b.blinded_secret).collect();
 
             let blinded_signatures = self
                 .localstore
-                .get_blind_signatures(&blinded_message)
+                .get_blind_signatures(&blinded_secrets)
                 .await?;
-
             if blinded_signatures.len() != output_len {
                 return Err(Error::Internal);
             }
 
+            let mut outputs = Vec::with_capacity(output_len);
+            let mut dleq_args = Vec::with_capacity(output_len);
+
             for (blinded_message, blinded_signature) in
-                request.outputs.into_iter().zip(blinded_signatures)
+                blinded_messages.into_iter().zip(blinded_signatures)
             {
                 if let Some(blinded_signature) = blinded_signature {
+                    dleq_args.push(ReconstructDleqArguments {
+                        blind_signature: blinded_signature,
+                        blind_secret: blinded_message.blinded_secret,
+                    });
                     outputs.push(blinded_message);
-                    signatures.push(blinded_signature);
                 }
             }
 
-            // Verify response outputs maintain the same relative order as the request
-            // This ensures the NUT-09 spec requirement that outputs[i] corresponds to signatures[i]
-            let mut last_position: Option<usize> = None;
-            for output in &outputs {
-                let current_position =
-                    position_map.get(&output.blinded_secret).ok_or_else(|| {
-                        tracing::error!("Restore response contains output not in original request");
-                        Error::Internal
-                    })?;
+            let signatures = if dleq_args.is_empty() {
+                Vec::new()
+            } else {
+                let fallback: Vec<BlindSignature> = dleq_args
+                    .iter()
+                    .map(|a| a.blind_signature.clone())
+                    .collect();
 
-                if let Some(last_pos) = last_position {
-                    if *current_position <= last_pos {
+                match self.signatory.reconstruct_dleq(dleq_args).await {
+                    Ok(signatures) => signatures,
+                    Err(Error::SignatureMissingOrInvalid) => {
                         tracing::error!(
-                            "Restore response outputs are out of order: position {} after {}",
-                            current_position,
-                            last_pos
+                            "Stored signature failed DLEQ reconstruction during restore"
                         );
-                        return Err(Error::Internal);
+                        return Err(Error::SignatureMissingOrInvalid);
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to reconstruct DLEQ proofs on restore: {err}");
+                        fallback
                     }
                 }
-                last_position = Some(*current_position);
-            }
+            };
 
             Ok(RestoreResponse {
                 outputs,
@@ -1526,7 +1543,9 @@ mod tests {
 
     use super::*;
     use crate::mint::melt::melt_saga::{MeltSaga, PaymentOutcome};
-    use crate::test_helpers::mint::{create_test_mint, mint_test_proofs};
+    use crate::test_helpers::mint::{
+        create_test_blinded_messages, create_test_mint, mint_test_proofs,
+    };
 
     #[derive(Default)]
     struct MintConfig<'a> {
@@ -1545,14 +1564,18 @@ mod tests {
     /// driven by the test. Injected snapshots are delivered verbatim through
     /// `subscribe_keysets`, so the mint's drain task can be exercised in
     /// isolation from `DbSignatory`'s rotation logic.
-    struct MockSignatory {
+    pub struct MockSignatory {
         updates: watch::Sender<SignatoryKeysets>,
+        reconstruct_error: Option<fn() -> Error>,
     }
 
     impl MockSignatory {
-        fn new(initial: SignatoryKeysets) -> Self {
+        pub fn new(initial: SignatoryKeysets) -> Self {
             let (updates, _) = watch::channel(initial);
-            Self { updates }
+            Self {
+                updates,
+                reconstruct_error: None,
+            }
         }
 
         /// Inject a new keyset snapshot through the subscription.
@@ -1589,12 +1612,22 @@ mod tests {
         async fn rotate_keyset(&self, _args: RotateKeyArguments) -> Result<SignatoryKeySet, Error> {
             Err(Error::Custom("unsupported in mock".to_string()))
         }
+
+        async fn reconstruct_dleq(
+            &self,
+            args: Vec<ReconstructDleqArguments>,
+        ) -> Result<Vec<BlindSignature>, Error> {
+            match self.reconstruct_error {
+                Some(error) => Err(error()),
+                None => Ok(args.into_iter().map(|a| a.blind_signature).collect()),
+            }
+        }
     }
 
     /// Produce a sequence of valid, distinct keyset snapshots by rotating a real
     /// `DbSignatory` `count` times and reading the full set after each rotation.
     /// Each rotation makes a new active Sat keyset, so the snapshots differ.
-    async fn rotated_snapshots(count: usize) -> Vec<SignatoryKeysets> {
+    pub async fn rotated_snapshots(count: usize) -> Vec<SignatoryKeysets> {
         let store = Arc::new(
             cdk_sqlite::mint::memory::empty()
                 .await
@@ -1638,7 +1671,7 @@ mod tests {
     }
 
     /// Build a mint around an arbitrary signatory, with a fresh empty store.
-    async fn create_mint_with_signatory(signatory: Arc<dyn Signatory + Send + Sync>) -> Mint {
+    async fn create_mint_with_signatory(signatory: Arc<dyn Signatory + Send + Sync>) -> Arc<Mint> {
         let localstore = Arc::new(
             new_with_state(
                 Default::default(),
@@ -1662,6 +1695,7 @@ mod tests {
             1000,
         )
         .await
+        .map(Arc::new)
         .unwrap()
     }
 
@@ -2002,6 +2036,13 @@ mod tests {
         async fn rotate_keyset(&self, args: RotateKeyArguments) -> Result<SignatoryKeySet, Error> {
             self.inner.rotate_keyset(args).await
         }
+
+        async fn reconstruct_dleq(
+            &self,
+            args: Vec<ReconstructDleqArguments>,
+        ) -> Result<Vec<BlindSignature>, Error> {
+            self.inner.reconstruct_dleq(args).await
+        }
     }
 
     /// Regression test for the two-writer keyset race. A mint-initiated rotation
@@ -2110,7 +2151,7 @@ mod tests {
         mint.stop().await.expect("mint should stop");
     }
 
-    async fn create_mint(config: MintConfig<'_>) -> Mint {
+    async fn create_mint(config: MintConfig<'_>) -> Arc<Mint> {
         let localstore = Arc::new(
             new_with_state(
                 config.active_keysets,
@@ -2158,6 +2199,7 @@ mod tests {
             1000,
         )
         .await
+        .map(Arc::new)
         .unwrap()
     }
 
@@ -2255,54 +2297,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_with_empty_keyset_cache() {
-        let mock = Arc::new(MockSignatory::new(SignatoryKeysets {
-            pubkey: SecretKey::generate().public_key(),
-            keysets: Vec::new(),
-        }));
-        let mint = create_mint_with_signatory(mock).await;
+    async fn restore_reconstructs_original_dleq() {
+        let mint = create_test_mint().await.unwrap();
+        let (mut outputs, _) = create_test_blinded_messages(&mint, Amount::from(3))
+            .await
+            .unwrap();
+        outputs.reverse();
+        let signatures = mint.blind_sign(outputs.clone()).await.unwrap();
+        assert!(signatures.iter().all(|signature| signature.dleq.is_some()));
 
-        let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
-        let output = BlindedMessage::new(
-            Amount::from(1),
-            keyset_id,
-            SecretKey::generate().public_key(),
-        );
-        let signature = BlindSignature {
-            amount: Amount::from(1),
-            keyset_id,
-            c: SecretKey::generate().public_key(),
-            dleq: None,
-        };
-
+        let blinded_secrets: Vec<_> = outputs.iter().map(|output| output.blinded_secret).collect();
         let mut tx = mint.localstore.begin_transaction().await.unwrap();
-        tx.add_blind_signatures(
-            &[output.blinded_secret],
-            std::slice::from_ref(&signature),
-            None,
-        )
-        .await
-        .unwrap();
+        tx.add_blind_signatures(&blinded_secrets, &signatures, None)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
 
-        mint.start()
+        let stored = mint
+            .localstore
+            .get_blind_signatures(&blinded_secrets)
             .await
-            .expect("mint should start without keysets");
-        assert!(mint.keysets.load().is_empty());
+            .unwrap();
+        assert!(stored
+            .iter()
+            .all(|signature| signature.as_ref().unwrap().dleq.is_none()));
 
+        // Recovery requests do not need to know the originally signed amounts.
+        for output in &mut outputs {
+            output.amount = Amount::ZERO;
+        }
         let response = mint
             .restore(RestoreRequest {
-                outputs: vec![output.clone()],
+                outputs: outputs.clone(),
             })
             .await
-            .expect("restore should succeed without cached keysets");
+            .unwrap();
+        assert_eq!(response.outputs, outputs);
+        assert_eq!(response.signatures, signatures);
+        mint.stop().await.unwrap();
+    }
 
-        mint.stop().await.expect("mint should stop");
+    #[tokio::test]
+    async fn restore_rejects_invalid_stored_signature() {
+        let mint = create_test_mint().await.unwrap();
+        let (outputs, _) = create_test_blinded_messages(&mint, Amount::from(3))
+            .await
+            .unwrap();
+        let mut signatures = mint.blind_sign(outputs.clone()).await.unwrap();
+        signatures[1].c = SecretKey::generate().public_key();
 
-        assert!(
-            !response.signatures.is_empty(),
-            "Restore should return stored signatures without cached keysets"
-        );
+        let blinded_secrets: Vec<_> = outputs.iter().map(|output| output.blinded_secret).collect();
+        let mut tx = mint.localstore.begin_transaction().await.unwrap();
+        tx.add_blind_signatures(&blinded_secrets, &signatures, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let result = mint.restore(RestoreRequest { outputs }).await;
+        assert!(matches!(result, Err(Error::SignatureMissingOrInvalid)));
+        mint.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_without_dleq_when_signatory_unavailable() {
+        let errors: [fn() -> Error; 2] = [
+            || Error::UnknownKeySet,
+            || Error::SendError("signatory unavailable".to_string()),
+        ];
+        for error in errors {
+            let mut mock = MockSignatory::new(SignatoryKeysets {
+                pubkey: SecretKey::generate().public_key(),
+                keysets: Vec::new(),
+            });
+            mock.reconstruct_error = Some(error);
+            let mint = create_mint_with_signatory(Arc::new(mock)).await;
+
+            let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
+            let output = BlindedMessage::new(
+                Amount::from(1),
+                keyset_id,
+                SecretKey::generate().public_key(),
+            );
+            let signature = BlindSignature {
+                amount: Amount::from(1),
+                keyset_id,
+                c: SecretKey::generate().public_key(),
+                dleq: None,
+            };
+
+            let mut tx = mint.localstore.begin_transaction().await.unwrap();
+            tx.add_blind_signatures(
+                &[output.blinded_secret],
+                std::slice::from_ref(&signature),
+                None,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+
+            mint.start()
+                .await
+                .expect("mint should start without keysets");
+            assert!(mint.keysets.load().is_empty());
+
+            let response = mint
+                .restore(RestoreRequest {
+                    outputs: vec![output.clone()],
+                })
+                .await
+                .expect("restore should succeed without cached keysets");
+
+            mint.stop().await.expect("mint should stop");
+
+            assert_eq!(response.outputs, vec![output]);
+            assert_eq!(response.signatures, vec![signature]);
+        }
     }
 
     #[tokio::test]
@@ -2347,11 +2456,7 @@ mod tests {
         let melt_request = create_test_melt_request(&proofs, &quote);
 
         let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
-        let saga = MeltSaga::new(
-            Arc::new(mint.clone()),
-            mint.localstore(),
-            mint.pubsub_manager(),
-        );
+        let saga = MeltSaga::new(Arc::clone(&mint), mint.localstore(), mint.pubsub_manager());
         let setup_saga = saga
             .setup_melt(
                 &melt_request,
@@ -2399,7 +2504,7 @@ mod tests {
         .unwrap();
 
         Mint::handle_successful_melt_payment_event(
-            &Arc::new(mint.clone()),
+            &mint,
             &mint.localstore,
             &mint.pubsub_manager,
             &quote.id,
@@ -2448,7 +2553,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         Mint::handle_successful_melt_payment_event(
-            &Arc::new(mint.clone()),
+            &mint,
             &mint.localstore,
             &mint.pubsub_manager,
             &quote.id,
@@ -2473,11 +2578,7 @@ mod tests {
         let melt_request = create_test_melt_request(&proofs, &quote);
 
         let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
-        let saga = MeltSaga::new(
-            Arc::new(mint.clone()),
-            mint.localstore(),
-            mint.pubsub_manager(),
-        );
+        let saga = MeltSaga::new(Arc::clone(&mint), mint.localstore(), mint.pubsub_manager());
         let _setup_saga = saga
             .setup_melt(
                 &melt_request,
@@ -2507,7 +2608,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         Mint::handle_failed_melt_payment_event(
-            &Arc::new(mint.clone()),
+            &mint,
             &mint.localstore,
             &mint.pubsub_manager,
             &quote.id,
@@ -2791,5 +2892,42 @@ mod tests {
             "expected ExpiredKeyset error, got: {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn verify_inputs_rejects_duplicate_inputs() {
+        let mint = create_test_mint().await.unwrap();
+        let mut proofs = mint_test_proofs(&mint, Amount::from(8)).await.unwrap();
+        let duplicate = proofs[0].clone();
+        proofs.push(duplicate);
+
+        let ys = proofs.ys().unwrap();
+        assert!(matches!(
+            Mint::check_inputs_unique(&ys),
+            Err(Error::DuplicateInputs)
+        ));
+
+        let result = mint.verify_inputs(&proofs).await;
+        assert!(
+            matches!(result, Err(Error::DuplicateInputs)),
+            "expected DuplicateInputs error, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_inputs_returns_ys_in_input_order() {
+        let mint = create_test_mint().await.unwrap();
+        let mut proofs = mint_test_proofs(&mint, Amount::from(15)).await.unwrap();
+        assert!(proofs.len() > 1, "test needs several proofs");
+        // Use an order that differs from how the proofs were minted.
+        proofs.reverse();
+
+        let verification = mint.verify_inputs(&proofs).await.unwrap();
+
+        assert_eq!(verification.ys().len(), proofs.len());
+        for (proof, y) in proofs.iter().zip(verification.ys()) {
+            assert_eq!(proof.y().unwrap(), *y);
+        }
     }
 }

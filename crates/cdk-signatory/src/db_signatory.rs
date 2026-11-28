@@ -3,7 +3,7 @@
 //! It is named db_signatory because it uses a database to persist state. The
 //! database is a persistence layer only: it is read once on boot to hydrate the
 //! in-memory keysets and written only when rotating keys. Every other operation
-//! is served from and mutates in-memory state. See ADR-0003.
+//! is served from and mutates in-memory state.
 //!
 //! Boot is strict: `new` attempts the initial keyset load from the database
 //! once and bubbles up any error, so a failed load fails construction rather
@@ -25,9 +25,12 @@ use tokio::sync::{watch, Mutex};
 use tracing::instrument;
 
 use crate::common::{
-    check_unit_string_collision, create_new_keyset, derivation_path_from_unit, init_keysets,
+    check_unit_string_collision, create_new_keyset, derivation_path_from_unit, derive_keyset,
+    init_keysets,
 };
-use crate::signatory::{RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets};
+use crate::signatory::{
+    ReconstructDleqArguments, RotateKeyArguments, Signatory, SignatoryKeySet, SignatoryKeysets,
+};
 
 /// Immutable in-memory view of the keysets, swapped atomically on every change.
 ///
@@ -233,8 +236,7 @@ impl DbSignatory {
         let db_active_keysets = tx.get_active_keysets().await?;
         let db_infos = tx.get_keyset_infos().await?;
 
-        self.publish_snapshot(epoch, db_active_keysets, db_infos);
-        Ok(())
+        self.publish_snapshot(epoch, db_active_keysets, db_infos)
     }
 
     /// Build a keyset snapshot for `epoch` and publish it, reusing keys already
@@ -254,7 +256,7 @@ impl DbSignatory {
         epoch: u64,
         db_active_keysets: HashMap<CurrencyUnit, Id>,
         db_infos: Vec<MintKeySetInfo>,
-    ) {
+    ) -> Result<(), Error> {
         let current = self.keysets.load();
         let mut by_id = HashMap::with_capacity(db_infos.len());
         let mut active_by_unit = HashMap::new();
@@ -266,7 +268,7 @@ impl DbSignatory {
             }
             let keyset = match current.by_id.get(&id) {
                 Some((_, keyset)) => keyset.clone(),
-                None => self.generate_keyset(&info),
+                None => self.generate_keyset(&info)?,
             };
             by_id.insert(id, (info, keyset));
         }
@@ -281,7 +283,7 @@ impl DbSignatory {
             let current = self.keysets.load();
             if current.epoch.is_some_and(|cur| epoch <= cur) {
                 // A concurrent reload already published an equal-or-newer view.
-                return;
+                return Ok(());
             }
             let prev = self.keysets.compare_and_swap(&current, snapshot.clone());
             if Arc::ptr_eq(&prev, &current) {
@@ -291,6 +293,7 @@ impl DbSignatory {
             // and CAS. Retry to re-check its epoch against ours.
         }
         self.publish_latest();
+        Ok(())
     }
 
     /// Publish the latest stored keyset snapshot to watch subscribers.
@@ -308,17 +311,8 @@ impl DbSignatory {
         });
     }
 
-    fn generate_keyset(&self, keyset_info: &MintKeySetInfo) -> MintKeySet {
-        MintKeySet::generate_from_xpriv(
-            &self.secp_ctx,
-            self.xpriv,
-            &keyset_info.amounts,
-            keyset_info.unit.clone(),
-            keyset_info.derivation_path.clone(),
-            keyset_info.input_fee_ppk,
-            keyset_info.final_expiry,
-            keyset_info.id.get_version(),
-        )
+    fn generate_keyset(&self, keyset_info: &MintKeySetInfo) -> Result<MintKeySet, Error> {
+        derive_keyset(&self.secp_ctx, self.xpriv, keyset_info)
     }
 
     /// Snapshot the current keysets from memory (lock-free).
@@ -360,9 +354,6 @@ impl Signatory for DbSignatory {
                 } = blinded_message;
 
                 let (info, key) = keysets.by_id.get(&keyset_id).ok_or(Error::UnknownKeySet)?;
-                if !info.active {
-                    return Err(Error::InactiveKeyset);
-                }
                 if info.is_expired() {
                     return Err(Error::ExpiredKeyset);
                 }
@@ -497,6 +488,39 @@ impl Signatory for DbSignatory {
 
         Ok(signatory_keyset)
     }
+
+    async fn reconstruct_dleq(
+        &self,
+        args: Vec<ReconstructDleqArguments>,
+    ) -> Result<Vec<BlindSignature>, Error> {
+        let keysets = self.keysets.load();
+        let mut reconstructed = Vec::with_capacity(args.len());
+
+        for arg in args {
+            let (mut blind_signature, blind_secret) = (arg.blind_signature, arg.blind_secret);
+
+            let (_, key) = keysets
+                .by_id
+                .get(&blind_signature.keyset_id)
+                .ok_or(Error::UnknownKeySet)?;
+
+            let key_pair = key
+                .keys
+                .get(&blind_signature.amount)
+                .ok_or(Error::UnknownKeySet)?;
+
+            let restored_signature = sign_message(&key_pair.secret_key, &blind_secret)?;
+
+            if blind_signature.c != restored_signature {
+                return Err(Error::SignatureMissingOrInvalid);
+            }
+
+            blind_signature.add_dleq_proof(&blind_secret, &key_pair.secret_key)?;
+            reconstructed.push(blind_signature);
+        }
+
+        Ok(reconstructed)
+    }
 }
 
 #[cfg(test)]
@@ -578,7 +602,7 @@ mod test {
 
     #[tokio::test]
     async fn rotation_reloads_peer_keyset_under_lock() {
-        // Two signatories sharing one database, the shape ADR-0004 enables.
+        // Two signatories sharing one database.
         // Neither has the periodic refresh enabled, so the only way instance A
         // learns of instance B's rotation before a restart is the under-lock
         // reload inside its own rotate_keyset.
@@ -769,7 +793,9 @@ mod test {
 
         let new_expiry = Some(unix_time() + 9_000);
         info.final_expiry = new_expiry;
-        signatory.publish_snapshot(epoch + 1, active, vec![info]);
+        signatory
+            .publish_snapshot(epoch + 1, active, vec![info])
+            .expect("keyset derives to its id");
 
         let published = signatory
             .keysets_snapshot()
@@ -781,6 +807,61 @@ mod test {
         assert_eq!(
             published.final_expiry, new_expiry,
             "published keyset must carry the info's final_expiry, not the cached key's"
+        );
+    }
+
+    /// Stored keysets must derive to their ids, so a seed or derivation change
+    /// fails loudly instead of serving different keys under the stored id.
+    #[tokio::test]
+    async fn load_rejects_keyset_that_derives_to_a_different_id() {
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let signatory = DbSignatory::new(
+            store.clone(),
+            b"test-seed-keyset-id-check",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("DbSignatory::new");
+        signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version01,
+                final_expiry: None,
+            })
+            .await
+            .expect("rotate_keyset");
+        drop(signatory);
+
+        DbSignatory::new(
+            store.clone(),
+            b"test-seed-keyset-id-check",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("the same seed derives the stored ids");
+
+        let result = DbSignatory::new(
+            store,
+            b"a-different-seed",
+            Default::default(),
+            Default::default(),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::NUT02(cdk_common::nut02::Error::IncorrectKeysetId))
+            ),
+            "expected IncorrectKeysetId, got: {:?}",
+            result.map(|_| ())
         );
     }
 
@@ -1605,5 +1686,74 @@ mod test {
             pubkey,
             "025b6c1ca8bb741a6f2321c953266df7bf3f3f2c3be8c54c0a6e41bb00976046a4".to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn reconstruct_dleq_batch_and_validation() {
+        let store = Arc::new(
+            cdk_sqlite::mint::memory::empty()
+                .await
+                .expect("in-memory db"),
+        );
+        let signatory = DbSignatory::new(
+            store,
+            b"test-seed-reconstruct-dleq",
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .expect("DbSignatory::new");
+
+        let keyset = signatory
+            .rotate_keyset(RotateKeyArguments {
+                unit: CurrencyUnit::Sat,
+                amounts: vec![1, 2, 4, 8],
+                input_fee_ppk: 0,
+                keyset_id_type: cdk_common::nut02::KeySetVersion::Version00,
+                final_expiry: None,
+            })
+            .await
+            .expect("rotate_keyset");
+
+        let secret1 = SecretKey::generate().public_key();
+        let secret2 = SecretKey::generate().public_key();
+        let messages = vec![
+            BlindedMessage::new(Amount::from(1), keyset.id, secret1),
+            BlindedMessage::new(Amount::from(2), keyset.id, secret2),
+        ];
+
+        let signed = signatory.blind_sign(messages).await.expect("blind_sign");
+        assert_eq!(signed.len(), 2);
+
+        let args: Vec<ReconstructDleqArguments> = signed
+            .iter()
+            .zip([secret1, secret2])
+            .map(|(sig, blind_secret)| {
+                let mut stripped = sig.clone();
+                stripped.dleq = None;
+                ReconstructDleqArguments {
+                    blind_signature: stripped,
+                    blind_secret,
+                }
+            })
+            .collect();
+
+        let reconstructed = signatory
+            .reconstruct_dleq(args.clone())
+            .await
+            .expect("reconstruct_dleq");
+        assert_eq!(reconstructed.len(), 2);
+
+        for (sig, secret) in reconstructed.iter().zip([secret1, secret2]) {
+            let mint_pk = *keyset.keys.get(&sig.amount).expect("amount key");
+            sig.verify_dleq(mint_pk, secret)
+                .expect("valid reconstructed dleq");
+        }
+
+        // Mismatched blind_secret must fail with SignatureMissingOrInvalid
+        let mut invalid_args = args;
+        invalid_args[1].blind_secret = SecretKey::generate().public_key();
+        let err = signatory.reconstruct_dleq(invalid_args).await;
+        assert!(matches!(err, Err(Error::SignatureMissingOrInvalid)));
     }
 }

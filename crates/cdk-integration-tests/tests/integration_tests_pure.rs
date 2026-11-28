@@ -24,9 +24,8 @@ use cashu::mint_url::MintUrl;
 use cashu::nuts::nut10::Conditions;
 use cashu::nuts::SigFlag;
 use cashu::{
-    BlindSignature, BlindedMessage, CurrencyUnit, Id, KeySet, KeySetInfo, MeltRequest,
-    NotificationPayload, PaymentMethod, PreMintSecrets, ProofState, SecretKey, SpendingConditions,
-    State, SwapRequest,
+    BlindedMessage, CurrencyUnit, Id, KeySet, KeySetInfo, MeltRequest, NotificationPayload,
+    PaymentMethod, PreMintSecrets, ProofState, SecretKey, SpendingConditions, State, SwapRequest,
 };
 use cdk::mint::Mint;
 use cdk::nuts::nut00::ProofsMethods;
@@ -35,7 +34,7 @@ use cdk::types::QuoteTTL;
 use cdk::wallet::types::{TransactionDirection, TransactionId, TransactionStatus};
 use cdk::wallet::{MintConnector, P2PKLockedProofSendMode, ReceiveOptions, SendMemo, SendOptions};
 use cdk::{Amount, StreamExt};
-use cdk_common::mint::OperationKind;
+use cdk_common::mint::{Operation, OperationKind};
 use cdk_common::payment::{
     MintPayment, OutgoingPaymentOptions, PaymentIdentifier, PaymentQuoteResponse,
 };
@@ -75,7 +74,7 @@ async fn test_swap_to_send() {
         .expect("Failed to create test wallet");
 
     // Alice gets 64 sats
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund wallet");
     let balance_alice = wallet_alice
@@ -201,7 +200,7 @@ async fn test_send_to_same_wallet_preserves_transaction_history() {
         .await
         .expect("Failed to create test wallet");
 
-    fund_wallet(wallet.clone(), 64, None)
+    fund_wallet(&wallet, 64, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -264,7 +263,7 @@ async fn test_mint_nut06() {
         .expect("Failed to create test wallet");
 
     // Alice gets 64 sats
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund wallet");
     let balance_alice = wallet_alice
@@ -337,7 +336,7 @@ async fn test_mint_double_spend() {
         .expect("Failed to create test wallet");
 
     // Alice gets 64 sats
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -395,7 +394,7 @@ async fn test_attempt_to_swap_by_overflowing() {
         .expect("Failed to create test wallet");
 
     // Alice gets 64 sats
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -463,7 +462,7 @@ async fn test_swap_unbalanced() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats
-    fund_wallet(wallet_alice.clone(), 100, None)
+    fund_wallet(&wallet_alice, 100, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -526,7 +525,7 @@ pub async fn test_p2pk_swap() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats
-    fund_wallet(wallet_alice.clone(), 100, None)
+    fund_wallet(&wallet_alice, 100, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -667,7 +666,7 @@ async fn test_swap_overpay_underpay_fee() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats
-    fund_wallet(wallet_alice.clone(), 1000, None)
+    fund_wallet(&wallet_alice, 1000, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -747,13 +746,9 @@ async fn test_mint_enforce_fee() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats
-    fund_wallet(
-        wallet_alice.clone(),
-        1010,
-        Some(SplitTarget::Value(Amount::ONE)),
-    )
-    .await
-    .expect("Failed to fund wallet");
+    fund_wallet(&wallet_alice, 1010, Some(SplitTarget::Value(Amount::ONE)))
+        .await
+        .expect("Failed to fund wallet");
 
     let mut proofs = wallet_alice
         .get_unspent_proofs()
@@ -853,12 +848,7 @@ async fn test_mint_max_outputs_exceeded_mint() {
 
     // Alice tries to mint 10 sats with split target 1 (requesting 10 outputs)
     // This should fail because max_outputs is 5
-    let result = fund_wallet(
-        wallet_alice.clone(),
-        10,
-        Some(SplitTarget::Value(Amount::ONE)),
-    )
-    .await;
+    let result = fund_wallet(&wallet_alice, 10, Some(SplitTarget::Value(Amount::ONE))).await;
 
     match result {
         Ok(_) => panic!("Mint allowed exceeding max outputs"),
@@ -889,13 +879,9 @@ async fn test_mint_max_inputs_exceeded_melt() {
         .expect("Failed to create test wallet");
 
     // Alice gets 10 sats with small outputs to have enough proofs
-    fund_wallet(
-        wallet_alice.clone(),
-        10,
-        Some(SplitTarget::Value(Amount::ONE)),
-    )
-    .await
-    .expect("Failed to fund wallet");
+    fund_wallet(&wallet_alice, 10, Some(SplitTarget::Value(Amount::ONE)))
+        .await
+        .expect("Failed to fund wallet");
 
     let proofs = wallet_alice
         .get_unspent_proofs()
@@ -939,7 +925,7 @@ async fn test_mint_max_outputs_exceeded_melt() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats
-    fund_wallet(wallet_alice.clone(), 100, None)
+    fund_wallet(&wallet_alice, 100, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -1001,13 +987,9 @@ async fn test_mint_max_inputs_exceeded() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats with small outputs to have enough proofs
-    fund_wallet(
-        wallet_alice.clone(),
-        100,
-        Some(SplitTarget::Value(Amount::ONE)),
-    )
-    .await
-    .expect("Failed to fund wallet");
+    fund_wallet(&wallet_alice, 100, Some(SplitTarget::Value(Amount::ONE)))
+        .await
+        .expect("Failed to fund wallet");
 
     let proofs = wallet_alice
         .get_unspent_proofs()
@@ -1057,7 +1039,7 @@ async fn test_mint_max_outputs_exceeded() {
         .expect("Failed to create test wallet");
 
     // Alice gets 50 sats
-    fund_wallet(wallet_alice.clone(), 50, None)
+    fund_wallet(&wallet_alice, 50, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -1124,13 +1106,9 @@ async fn test_mint_change_with_fee_melt() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats
-    fund_wallet(
-        wallet_alice.clone(),
-        100,
-        Some(SplitTarget::Value(Amount::ONE)),
-    )
-    .await
-    .expect("Failed to fund wallet");
+    fund_wallet(&wallet_alice, 100, Some(SplitTarget::Value(Amount::ONE)))
+        .await
+        .expect("Failed to fund wallet");
 
     let keyset_id = mint_bob.pubkeys().keysets.first().unwrap().id;
 
@@ -1210,7 +1188,7 @@ async fn test_concurrent_double_spend_swap() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats
-    fund_wallet(wallet_alice.clone(), 100, None)
+    fund_wallet(&wallet_alice, 100, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -1317,7 +1295,7 @@ async fn test_concurrent_double_spend_melt() {
         .expect("Failed to create test wallet");
 
     // Alice gets 100 sats
-    fund_wallet(wallet_alice.clone(), 100, None)
+    fund_wallet(&wallet_alice, 100, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -1434,7 +1412,7 @@ async fn test_p2pk_send_force_swap_with_fees() {
         .expect("Failed to create test wallet");
 
     // Fund wallet with 64 sats (normal proofs, no P2PK conditions)
-    fund_wallet(wallet.clone(), 64, None)
+    fund_wallet(&wallet, 64, None)
         .await
         .expect("Failed to fund wallet");
     assert_eq!(
@@ -1523,7 +1501,7 @@ async fn test_p2pk_send_force_swap_with_fees_include_fee() {
         .expect("Failed to create receiver wallet");
 
     // Fund sender with 64 sats
-    fund_wallet(wallet_sender.clone(), 64, None)
+    fund_wallet(&wallet_sender, 64, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -1923,6 +1901,85 @@ async fn test_fake_wallet_custom_mint_and_melt_flow() {
     assert_eq!(Some("paypal:merchant-request"), finalized.payment_proof());
 }
 
+/// A paid custom-method melt quote reports its change when its status is
+/// checked, like bolt11, bolt12 and onchain quotes do.
+#[tokio::test]
+async fn test_fake_wallet_custom_melt_quote_status_includes_change() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint.clone())
+        .await
+        .expect("Failed to create test wallet");
+    let method = PaymentMethod::Custom("paypal".to_string());
+
+    let mint_quote = wallet
+        .mint_quote(method.clone(), Some(Amount::from(64)), None, None)
+        .await
+        .expect("Failed to create custom mint quote");
+    wallet
+        .wait_and_mint_quote(
+            mint_quote,
+            SplitTarget::default(),
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("Failed to mint custom quote");
+
+    let melt_quote = wallet
+        .melt_quote(
+            method.clone(),
+            "paypal:merchant-request",
+            None,
+            Some(r#"{"amount":20}"#.to_string()),
+        )
+        .await
+        .expect("Failed to create custom melt quote");
+    let quote_id = cdk_common::QuoteId::from_str(&melt_quote.id).expect("valid quote id");
+
+    // Melt with all 64 sat and blank outputs so the mint owes change.
+    let proofs = wallet
+        .get_unspent_proofs()
+        .await
+        .expect("Could not get proofs");
+    assert_eq!(proofs.total_amount().unwrap(), Amount::from(64));
+    let keyset_id = mint.pubkeys().keysets.first().unwrap().id;
+    let blank_outputs = PreMintSecrets::blank(keyset_id, Amount::from(64))
+        .expect("Failed to create blank outputs")
+        .blinded_messages();
+    let melt_request = MeltRequest::new(quote_id.clone(), proofs, Some(blank_outputs));
+
+    let melt_response = mint
+        .melt(&melt_request)
+        .await
+        .expect("Failed to start melt")
+        .await
+        .expect("Failed to melt");
+    assert_eq!(
+        cdk_common::nuts::MeltQuoteState::Paid,
+        melt_response.state()
+    );
+    let melt_change = melt_response
+        .change()
+        .expect("the melt response should carry change")
+        .clone();
+    assert!(!melt_change.is_empty());
+
+    let status = mint
+        .check_melt_quote(&quote_id, Some(&method))
+        .await
+        .expect("Failed to check custom melt quote");
+
+    assert_eq!(cdk_common::nuts::MeltQuoteState::Paid, status.state());
+    assert_eq!(
+        status.change(),
+        Some(&melt_change),
+        "a paid custom melt quote should report the change it was settled with"
+    );
+}
+
 #[tokio::test]
 async fn test_batch_mint_unknown_quote() {
     setup_tracing();
@@ -2182,7 +2239,7 @@ async fn test_p2bk_send_and_receive() {
         .expect("Failed to create receiver wallet");
 
     // Fund sender with 64 sats
-    fund_wallet(wallet_sender.clone(), 64, None)
+    fund_wallet(&wallet_sender, 64, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -2257,7 +2314,7 @@ async fn test_p2bk_multi_key_receive() {
         .expect("Failed to create receiver wallet");
 
     // Fund sender with 64 sats
-    fund_wallet(wallet_sender.clone(), 64, None)
+    fund_wallet(&wallet_sender, 64, None)
         .await
         .expect("Failed to fund wallet");
 
@@ -2322,7 +2379,6 @@ async fn test_p2bk_multi_key_receive() {
 /// 3. Mints more tokens under the new active keyset
 /// 4. Creates a new wallet with the same seed but empty storage
 /// 5. Restores and verifies that proofs from BOTH keysets are recovered
-/// 6. Creates an expired-keyset fixture and verifies its stored signature can be restored
 #[tokio::test]
 async fn test_restore_after_keyset_rotation() {
     setup_tracing();
@@ -2339,7 +2395,7 @@ async fn test_restore_after_keyset_rotation() {
 
     // Mint 100 sats under the initial keyset
     let amount_before_rotation = 100;
-    fund_wallet(wallet.clone(), amount_before_rotation, None)
+    fund_wallet(&wallet, amount_before_rotation, None)
         .await
         .expect("Failed to fund wallet before rotation");
 
@@ -2357,7 +2413,7 @@ async fn test_restore_after_keyset_rotation() {
 
     // Mint 50 sats under the new active keyset
     let amount_after_rotation = 50;
-    fund_wallet(wallet.clone(), amount_after_rotation, None)
+    fund_wallet(&wallet, amount_after_rotation, None)
         .await
         .expect("Failed to fund wallet after rotation");
 
@@ -2379,43 +2435,57 @@ async fn test_restore_after_keyset_rotation() {
         Amount::from(total),
         "Restore should recover proofs from both active and inactive keysets"
     );
+}
 
-    // A fixed past timestamp makes the third keyset expired without waiting.
-    let third_keyset = mint
-        .rotate_keyset(CurrencyUnit::Sat, amounts, 0, true, Some(1))
+#[tokio::test]
+async fn test_restore_from_expired_keyset() {
+    use cdk::mint::MintBuilder;
+    use cdk_common::database::{MintDatabase, MintKeysDatabase};
+
+    let store = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
+    let mint = MintBuilder::new(store.clone())
+        .build_with_seed(store.clone(), b"restore-expired-keyset-test")
+        .await
+        .unwrap();
+
+    // A legacy keyset ID does not commit to expiry, so the fixture can expire it
+    // after signing without changing its identity or waiting on the clock.
+    let mut keyset = mint
+        .rotate_keyset(CurrencyUnit::Sat, vec![1], 0, false, None)
         .await
         .expect("Failed to rotate keyset");
 
-    assert!(mint
-        .get_keyset_info(&third_keyset.id)
-        .expect("Third keyset should be known to the mint")
-        .is_expired());
-
-    // Restore retrieves stored records, so a synthetic signature is sufficient.
     let output = BlindedMessage::new(
         Amount::from(1),
-        third_keyset.id,
+        keyset.id,
         SecretKey::generate().public_key(),
     );
-    let signature = BlindSignature {
-        amount: Amount::from(1),
-        keyset_id: third_keyset.id,
-        c: SecretKey::generate().public_key(),
-        dleq: None,
-    };
+    let signatures = mint.blind_sign(vec![output.clone()]).await.unwrap();
+    assert!(signatures[0].dleq.is_some());
 
-    let store = mint.localstore();
-    let mut tx = store.begin_transaction().await.unwrap();
-
-    tx.add_blind_signatures(
-        &[output.blinded_secret],
-        std::slice::from_ref(&signature),
-        None,
-    )
-    .await
-    .unwrap();
-
+    let mut tx = MintDatabase::begin_transaction(store.as_ref())
+        .await
+        .unwrap();
+    tx.add_blind_signatures(&[output.blinded_secret], &signatures, None)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
+
+    let mut tx = MintKeysDatabase::begin_transaction(store.as_ref())
+        .await
+        .unwrap();
+    keyset.final_expiry = Some(1);
+    tx.add_keyset_info(keyset.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+
+    // Rotation reloads the updated keyset info in both the signatory and mint.
+    mint.rotate_keyset(CurrencyUnit::Sat, vec![1], 0, true, None)
+        .await
+        .unwrap();
+    assert!(mint
+        .get_keyset_info(&keyset.id)
+        .expect("Expired keyset should be known to the mint")
+        .is_expired());
 
     let response = mint
         .restore(cashu::RestoreRequest {
@@ -2424,10 +2494,253 @@ async fn test_restore_after_keyset_rotation() {
         .await
         .expect("Mint restore failed for expired keyset");
 
-    assert!(
-        !response.signatures.is_empty(),
-        "Restore should return the stored signature from the expired keyset"
+    assert_eq!(response.outputs, vec![output]);
+    assert_eq!(response.signatures, signatures);
+}
+
+/// Restoring into a wallet in use must not hand back the proofs of a token
+/// that was sent but not claimed yet
+#[tokio::test]
+async fn test_restore_keeps_pending_spent_proofs() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint)
+        .await
+        .expect("Failed to create test wallet");
+    fund_wallet(&wallet, 100, None)
+        .await
+        .expect("Failed to fund wallet");
+
+    let _token = wallet
+        .prepare_send(Amount::from(40), SendOptions::default())
+        .await
+        .expect("Failed to prepare send")
+        .confirm(None)
+        .await
+        .expect("Failed to confirm send");
+
+    let balance_before = wallet.total_balance().await.unwrap();
+    let pending_before: HashSet<_, RandomState> = HashSet::from_iter(
+        wallet
+            .get_pending_spent_proofs()
+            .await
+            .unwrap()
+            .ys()
+            .unwrap(),
     );
+    assert!(!pending_before.is_empty());
+
+    let restored = wallet.restore().await.expect("Restore failed");
+
+    let pending_after: HashSet<_, RandomState> = HashSet::from_iter(
+        wallet
+            .get_pending_spent_proofs()
+            .await
+            .unwrap()
+            .ys()
+            .unwrap(),
+    );
+    assert_eq!(pending_after, pending_before);
+    assert_eq!(wallet.total_balance().await.unwrap(), balance_before);
+    // Scan totals still count the proofs the wallet already stores
+    assert_eq!(restored.unspent, Amount::from(100));
+}
+
+/// Restoring while a send is prepared must leave its proofs reserved
+#[tokio::test]
+async fn test_restore_keeps_reserved_proofs() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint)
+        .await
+        .expect("Failed to create test wallet");
+    fund_wallet(&wallet, 100, None)
+        .await
+        .expect("Failed to fund wallet");
+
+    let prepared = wallet
+        .prepare_send(Amount::from(40), SendOptions::default())
+        .await
+        .expect("Failed to prepare send");
+
+    let balance_before = wallet.total_balance().await.unwrap();
+    let reserved_before: HashSet<_, RandomState> =
+        HashSet::from_iter(wallet.get_reserved_proofs().await.unwrap().ys().unwrap());
+    assert!(!reserved_before.is_empty());
+
+    let restored = wallet.restore().await.expect("Restore failed");
+
+    let reserved_after: HashSet<_, RandomState> =
+        HashSet::from_iter(wallet.get_reserved_proofs().await.unwrap().ys().unwrap());
+    assert_eq!(reserved_after, reserved_before);
+    assert_eq!(wallet.total_balance().await.unwrap(), balance_before);
+    // Scan totals still count the proofs the wallet already stores
+    assert_eq!(restored.unspent, Amount::from(100));
+
+    // The send still owns its proofs, so cancelling releases them as usual
+    prepared.cancel().await.expect("Failed to cancel send");
+    assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(100));
+}
+
+/// Restoring into a wallet in use still adds the proofs it is missing
+#[tokio::test]
+async fn test_restore_adds_only_missing_proofs() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint)
+        .await
+        .expect("Failed to create test wallet");
+    fund_wallet(&wallet, 100, None)
+        .await
+        .expect("Failed to fund wallet");
+
+    let dropped = wallet
+        .get_unspent_proofs()
+        .await
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("Wallet should hold a proof");
+    wallet
+        .localstore
+        .update_proofs(vec![], vec![dropped.y().unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(
+        wallet.total_balance().await.unwrap(),
+        Amount::from(100).checked_sub(dropped.amount).unwrap()
+    );
+
+    let restored = wallet.restore().await.expect("Restore failed");
+
+    // The scan reports everything it found, not only the proof it added back
+    assert_eq!(restored.unspent, Amount::from(100));
+    assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(100));
+}
+
+/// Restore stores a proof the mint reports pending as `Pending` with no
+/// operation owner. Once the mint releases it, the next restore must make it
+/// spendable again and keep its other metadata.
+#[tokio::test]
+async fn test_restore_releases_unowned_pending_proofs() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint.clone())
+        .await
+        .expect("Failed to create test wallet");
+    fund_wallet(&wallet, 100, None)
+        .await
+        .expect("Failed to fund wallet");
+
+    // The wallet loses a proof the mint holds as pending, as it does for the
+    // inputs of a melt in flight.
+    let proof = wallet
+        .get_unspent_proofs()
+        .await
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("Wallet should hold a proof");
+    let y = proof.y().unwrap();
+    wallet
+        .localstore
+        .update_proofs(vec![], vec![y])
+        .await
+        .unwrap();
+
+    let store = mint.localstore();
+    let mut tx = store.begin_transaction().await.unwrap();
+    let mut pending = tx
+        .add_proofs(
+            vec![proof.clone()],
+            None,
+            &Operation::new_swap(Amount::ZERO, proof.amount, Amount::ZERO),
+        )
+        .await
+        .unwrap();
+    tx.update_proofs_state(&mut pending, State::Pending)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let restored = wallet.restore().await.expect("First restore failed");
+    assert_eq!(restored.pending, proof.amount);
+    let stored = wallet.localstore.get_proofs_by_ys(vec![y]).await.unwrap();
+    assert_eq!(stored[0].state, State::Pending);
+    assert_eq!(stored[0].used_by_operation, None);
+    let derivation_index = stored[0].derivation_index;
+    assert!(derivation_index.is_some());
+    assert_eq!(
+        wallet.total_balance().await.unwrap(),
+        Amount::from(100).checked_sub(proof.amount).unwrap()
+    );
+
+    // The mint releases the proof, as when the melt is rolled back
+    let mut tx = store.begin_transaction().await.unwrap();
+    tx.remove_proofs(&[y], None).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let restored = wallet.restore().await.expect("Second restore failed");
+    assert_eq!(restored.unspent, Amount::from(100));
+    let stored = wallet.localstore.get_proofs_by_ys(vec![y]).await.unwrap();
+    assert_eq!(stored[0].state, State::Unspent);
+    assert_eq!(stored[0].derivation_index, derivation_index);
+    assert_eq!(wallet.total_balance().await.unwrap(), Amount::from(100));
+}
+
+/// A pending proof owned by an operation is left to that operation's
+/// recovery, even when the mint reports it unspent
+#[tokio::test]
+async fn test_restore_keeps_operation_owned_pending_proofs() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint)
+        .await
+        .expect("Failed to create test wallet");
+    fund_wallet(&wallet, 100, None)
+        .await
+        .expect("Failed to fund wallet");
+
+    let y = wallet
+        .get_unspent_proofs()
+        .await
+        .unwrap()
+        .first()
+        .expect("Wallet should hold a proof")
+        .y()
+        .unwrap();
+    let mut proof_info = wallet.localstore.get_proofs_by_ys(vec![y]).await.unwrap()[0].clone();
+    let operation_id = uuid::Uuid::new_v4();
+    proof_info.state = State::Pending;
+    proof_info.used_by_operation = Some(operation_id);
+    let amount = proof_info.proof.amount;
+    wallet
+        .localstore
+        .update_proofs(vec![proof_info], vec![])
+        .await
+        .unwrap();
+
+    let restored = wallet.restore().await.expect("Restore failed");
+
+    let stored = wallet.localstore.get_proofs_by_ys(vec![y]).await.unwrap();
+    assert_eq!(stored[0].state, State::Pending);
+    assert_eq!(stored[0].used_by_operation, Some(operation_id));
+    assert_eq!(
+        wallet.total_balance().await.unwrap(),
+        Amount::from(100).checked_sub(amount).unwrap()
+    );
+    // Scan totals still count the proofs the wallet already stores
+    assert_eq!(restored.unspent, Amount::from(100));
 }
 
 #[derive(Debug, Default)]
@@ -2792,7 +3105,7 @@ async fn test_p2pk_send_options_signing_keys() {
         .expect("Failed to create bob wallet");
 
     // Fund alice with 64 sats (plain proofs)
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund alice");
 
@@ -2909,7 +3222,7 @@ async fn test_p2pk_signing_keys_exact_denomination_short_circuit() {
         .expect("Failed to create bob wallet");
 
     // Fund alice with 8 sats (plain proofs)
-    fund_wallet(wallet_alice.clone(), 8, None)
+    fund_wallet(&wallet_alice, 8, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3021,7 +3334,7 @@ async fn test_p2pk_locked_proof_sign_and_send_passthrough() {
         .expect("Failed to create bob wallet");
 
     // Fund alice with 8 sats (plain proofs)
-    fund_wallet(wallet_alice.clone(), 8, None)
+    fund_wallet(&wallet_alice, 8, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3123,7 +3436,7 @@ async fn test_p2pk_locked_proof_sign_and_send_rejects_sig_all() {
         .await
         .expect("Failed to create alice wallet");
 
-    fund_wallet(wallet_alice.clone(), 8, None)
+    fund_wallet(&wallet_alice, 8, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3233,7 +3546,7 @@ async fn test_p2pk_send_keyring_auto_detection() {
     let spending_conditions = SpendingConditions::new_p2pk(alice_pubkey, None);
 
     // Fund alice with plain proofs, then swap them for P2PK-locked proofs.
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3332,7 +3645,7 @@ async fn test_p2pk_unsignable_proof_falls_back_to_bearer() {
         .expect("Failed to create bob wallet");
 
     // Fund alice with 64 sats of plain bearer proofs.
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3427,7 +3740,7 @@ async fn test_malformed_p2pk_proof_falls_back_to_bearer() {
         .await
         .expect("Failed to create bob wallet");
 
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3520,7 +3833,7 @@ async fn test_p2pk_unsignable_proof_only_gives_insufficient_funds() {
         .expect("Failed to create alice wallet");
 
     // Fund alice with 64 sats, then swap all of them for proofs locked to an unknown key.
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3617,7 +3930,7 @@ async fn test_p2pk_partially_signable_proof_only_gives_insufficient_funds() {
     .unwrap();
     let spending_conditions = SpendingConditions::new_p2pk(alice_pubkey, Some(conditions));
 
-    fund_wallet(wallet_alice.clone(), 8, None)
+    fund_wallet(&wallet_alice, 8, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3692,7 +4005,7 @@ async fn test_p2pk_locked_proof_sign_and_send_rejects_partial_signatures() {
         .await
         .expect("Failed to create alice wallet");
 
-    fund_wallet(wallet_alice.clone(), 8, None)
+    fund_wallet(&wallet_alice, 8, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3802,7 +4115,7 @@ async fn test_p2pk_signing_keys_mixed_locked_and_unlocked_proofs() {
         .expect("Failed to create bob wallet");
 
     // Fund alice with 64 sats of plain (unlocked) proofs.
-    fund_wallet(wallet_alice.clone(), 64, None)
+    fund_wallet(&wallet_alice, 64, None)
         .await
         .expect("Failed to fund alice");
 
@@ -3904,5 +4217,75 @@ async fn test_p2pk_signing_keys_mixed_locked_and_unlocked_proofs() {
     assert_eq!(
         send_amount, received,
         "Bob should receive exactly the send amount"
+    );
+}
+
+/// An HTLC whose preimage was never revealed can be reclaimed through the
+/// refund path once its locktime has passed, signed with the refund key only
+#[tokio::test]
+async fn test_receive_expired_htlc_through_refund_path() {
+    use bitcoin::hashes::sha256::Hash as Sha256Hash;
+    use bitcoin::hashes::Hash;
+
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint.clone())
+        .await
+        .expect("Failed to create wallet");
+    fund_wallet(&wallet, 64, None)
+        .await
+        .expect("Failed to fund wallet");
+
+    // Lock to a receiver key with an unknown preimage, refundable to us
+    let refund_key = SecretKey::generate();
+    let hash = Sha256Hash::hash(&[7u8; 32]).to_string();
+    let conditions = Conditions {
+        locktime: Some(cdk_common::util::unix_time() + 2),
+        pubkeys: Some(vec![SecretKey::generate().public_key()]),
+        refund_keys: Some(vec![refund_key.public_key()]),
+        ..Default::default()
+    };
+    let token = wallet
+        .prepare_send(
+            Amount::from(10),
+            SendOptions {
+                conditions: Some(
+                    SpendingConditions::new_htlc_hash(&hash, Some(conditions)).unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("prepare_send should succeed")
+        .confirm(None)
+        .await
+        .expect("confirm should succeed");
+    let balance_after_send = wallet.total_balance().await.unwrap();
+
+    let refund_options = ReceiveOptions {
+        p2pk_signing_keys: vec![refund_key],
+        ..Default::default()
+    };
+
+    // Before the locktime only the receiver path is open
+    let early = wallet
+        .receive(&token.to_string(), refund_options.clone())
+        .await;
+    assert!(
+        matches!(early, Err(cdk::Error::PreimageNotProvided)),
+        "{early:?}"
+    );
+
+    sleep(Duration::from_secs(3)).await;
+
+    let received = wallet
+        .receive(&token.to_string(), refund_options)
+        .await
+        .expect("expired HTLC should be reclaimed through the refund path");
+    assert_eq!(received, Amount::from(10));
+    assert_eq!(
+        wallet.total_balance().await.unwrap(),
+        balance_after_send + received
     );
 }

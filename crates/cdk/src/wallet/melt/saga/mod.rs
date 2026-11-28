@@ -55,8 +55,17 @@ use crate::util::unix_time;
 use crate::wallet::blind_signature::{
     validate_mint_response_signatures, SignatureAmountValidation,
 };
-use crate::wallet::saga::{add_compensation, new_compensations, Compensations};
+use crate::wallet::saga::{
+    add_compensation, execute_compensations, new_compensations, Compensations,
+};
 use crate::{ensure_cdk, Amount, Error, Wallet};
+
+/// How many passes the input-fee fixed point gets before giving up.
+///
+/// Each pass strictly raises the estimate, and a pass adds at most one proof
+/// per denomination, so this bounds a pathological keyset instead of a real
+/// one. Shared by the prepare-side estimate and the confirm-side swap target.
+const MELT_INPUT_FEE_FIXED_POINT_LIMIT: u32 = 16;
 
 #[cfg(test)]
 mod change_fee_tests;
@@ -104,14 +113,8 @@ async fn finalize_melt_common<'a>(
     metadata: HashMap<String, String>,
     keyset_policy: KeysetLoadPolicy,
 ) -> Result<MeltSaga<'a, Finalized>, Error> {
-    let active_keyset_id = wallet.active_keyset_with_policy(keyset_policy).await?.id;
-    let active_keys = wallet
-        .keyset_with_policy(active_keyset_id, keyset_policy)
-        .await?
-        .keys;
-
     let change_proofs = match change {
-        Some(change) => {
+        Some(change) if !change.is_empty() => {
             let num_change_proof = change.len();
 
             let num_change_proof = match (
@@ -135,14 +138,20 @@ async fn finalize_melt_common<'a>(
             )
             .await?;
 
+            // The blanks' keyset signs the change, even if it has since rotated out (NUT-08).
+            let change_keys = wallet
+                .keyset_with_policy(premint_secrets.keyset_id, keyset_policy)
+                .await?
+                .keys;
+
             Some(construct_proofs(
                 change,
                 premint_secrets.rs()[..num_change_proof].to_vec(),
                 premint_secrets.secrets()[..num_change_proof].to_vec(),
-                &active_keys,
+                &change_keys,
             )?)
         }
-        None => None,
+        _ => None,
     };
 
     let proofs_total = final_proofs.total_amount()?;
@@ -305,6 +314,32 @@ impl<'a> MeltSaga<'a, Initial> {
         quote_id: &str,
         metadata: HashMap<String, String>,
     ) -> Result<MeltSaga<'a, Prepared>, Error> {
+        match self.prepare_inner(quote_id, metadata).await {
+            Ok(prepared) => Ok(prepared),
+            Err(err) => {
+                // `initialize_melt` reserves the quote before anything else,
+                // and every step after it (`keysets`, proof selection, the fee
+                // estimate, `reserve_proofs`, `add_saga`) can fail. Run the
+                // compensations so a failed prepare does not pin the quote to
+                // this operation until the next startup recovery sweep
+                // (#2771). Before the reservation there is nothing to undo,
+                // so this is a no-op then.
+                let mut compensations = self.compensations;
+                if let Err(e) = execute_compensations(&mut compensations).await {
+                    tracing::warn!("Failed to compensate melt prepare: {}", e);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Body of [`prepare`](Self::prepare). Kept separate so every error after
+    /// the quote reservation is compensated by the caller.
+    async fn prepare_inner(
+        &mut self,
+        quote_id: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<MeltSaga<'a, Prepared>, Error> {
         tracing::info!(
             "Preparing melt for quote {} with operation {}",
             quote_id,
@@ -320,11 +355,9 @@ impl<'a> MeltSaga<'a, Initial> {
 
         let keyset_policy = self.state_data.keyset_policy;
 
-        let active_keyset_ids = self
-            .wallet
-            .keysets(keyset_policy)
-            .await?
-            .into_iter()
+        let all_keysets = self.wallet.keysets(keyset_policy).await?;
+        let active_keyset_ids = all_keysets
+            .iter()
             .filter(|k| k.active.unwrap_or(false))
             .map(|k| k.id)
             .collect();
@@ -332,6 +365,16 @@ impl<'a> MeltSaga<'a, Initial> {
             .wallet
             .get_keyset_fees_and_amounts_with_policy(keyset_policy)
             .await?;
+        // Input fees need keyset information, not cached public keys.
+        let fee_metadata = self
+            .wallet
+            .metadata_cache
+            .load_cached(&self.wallet.localstore)
+            .await?;
+
+        // Share selection with sends and cloned wallets. All mint metadata is
+        // loaded before taking this lock, so no network request holds it.
+        let selection_guard = self.wallet.proof_selection_lock.lock().await;
 
         let available_proofs = self.wallet.get_unspent_proofs().await?;
         let derivation_indices = self.wallet.unspent_proof_derivation_indices().await?;
@@ -349,11 +392,6 @@ impl<'a> MeltSaga<'a, Initial> {
         if proofs_total == inputs_needed_amount {
             let proof_ys = exact_input_proofs.ys()?;
             let operation_id = self.state_data.operation_id;
-
-            self.wallet
-                .localstore
-                .reserve_proofs(proof_ys.clone(), &operation_id)
-                .await?;
 
             let saga = WalletSaga::new(
                 operation_id,
@@ -374,7 +412,14 @@ impl<'a> MeltSaga<'a, Initial> {
                 }),
             );
 
+            // Save recovery information before the reservation can commit.
             self.wallet.localstore.add_saga(saga.clone()).await?;
+
+            self.wallet
+                .localstore
+                .reserve_proofs(proof_ys.clone(), &operation_id)
+                .await?;
+            drop(selection_guard);
 
             add_compensation(
                 &mut self.compensations,
@@ -386,11 +431,13 @@ impl<'a> MeltSaga<'a, Initial> {
             )
             .await;
 
-            let input_fee = self.wallet.get_proofs_fee(&exact_input_proofs).await?.total;
+            let input_fee = fee_metadata
+                .proofs_fee(&exact_input_proofs.count_by_keyset())?
+                .total;
 
             return Ok(MeltSaga {
                 wallet: self.wallet,
-                compensations: self.compensations,
+                compensations: std::mem::take(&mut self.compensations),
                 state_data: Prepared {
                     operation_id: self.state_data.operation_id,
                     quote: quote_info,
@@ -405,25 +452,45 @@ impl<'a> MeltSaga<'a, Initial> {
             });
         }
 
-        let active_keyset_id = self
-            .wallet
-            .active_keyset_with_policy(keyset_policy)
-            .await?
+        let active_keyset_id = all_keysets
+            .iter()
+            .filter(|keyset| keyset.active.unwrap_or(false))
+            .min_by_key(|keyset| keyset.input_fee_ppk)
+            .ok_or(Error::NoActiveKeyset)?
             .id;
-        let fee_and_amounts = self
-            .wallet
-            .get_keyset_fees_and_amounts_by_id_with_policy(active_keyset_id, keyset_policy)
-            .await?;
+        let fee_and_amounts = keyset_fees_and_amounts
+            .get(&active_keyset_id)
+            .ok_or(Error::UnknownKeySet)?;
 
-        let estimated_output_count = inputs_needed_amount.split(&fee_and_amounts)?.len();
-        let estimated_melt_fee = self
-            .wallet
-            .get_keyset_count_fee_with_policy(
-                &active_keyset_id,
-                estimated_output_count as u64,
-                keyset_policy,
-            )
-            .await?;
+        // Size the swap target so it covers the input fee of its own
+        // outputs: iterate `T = needed + fee(split(T))` to a fixed point. A
+        // single estimate from `needed` alone under-counts when `needed + fee`
+        // splits into more proofs than `needed` does, so the swap lands short
+        // of what the melt requires and the mint refuses the melt after the
+        // swap fee is already spent (#2772). `estimated_melt_fee` rises each
+        // pass, so the loop converges.
+        let mut estimated_melt_fee = Amount::ZERO;
+        let mut fee_converged = false;
+        for _ in 0..MELT_INPUT_FEE_FIXED_POINT_LIMIT {
+            let target = inputs_needed_amount
+                .checked_add(estimated_melt_fee)
+                .ok_or(Error::AmountOverflow)?;
+            let count = target.split(fee_and_amounts)?.len() as u64;
+            let fee = fee_metadata
+                .proofs_fee(&[(active_keyset_id, count)].into_iter().collect())?
+                .total;
+            if fee <= estimated_melt_fee {
+                fee_converged = true;
+                break;
+            }
+            estimated_melt_fee = fee;
+        }
+        if !fee_converged {
+            // No fixed point: the keyset's fee grows with every extra proof,
+            // so no swap target covers its own outputs. Fail before selecting
+            // and reserving proofs.
+            return Err(Error::InsufficientFunds);
+        }
 
         let selection_amount = inputs_needed_amount
             .checked_add(estimated_melt_fee)
@@ -442,17 +509,12 @@ impl<'a> MeltSaga<'a, Initial> {
 
         let proofs_to_send = Proofs::new();
         let proofs_to_swap = input_proofs;
-        let swap_fee = self.wallet.get_proofs_fee(&proofs_to_swap).await?.total;
+        let swap_fee = fee_metadata
+            .proofs_fee(&proofs_to_swap.count_by_keyset())?
+            .total;
 
         let proof_ys = proofs_to_swap.ys()?;
         let operation_id = self.state_data.operation_id;
-
-        if !proof_ys.is_empty() {
-            self.wallet
-                .localstore
-                .reserve_proofs(proof_ys.clone(), &operation_id)
-                .await?;
-        }
 
         let saga = WalletSaga::new(
             operation_id,
@@ -473,7 +535,16 @@ impl<'a> MeltSaga<'a, Initial> {
             }),
         );
 
+        // Save recovery information before the reservation can commit.
         self.wallet.localstore.add_saga(saga.clone()).await?;
+
+        if !proof_ys.is_empty() {
+            self.wallet
+                .localstore
+                .reserve_proofs(proof_ys.clone(), &operation_id)
+                .await?;
+        }
+        drop(selection_guard);
 
         add_compensation(
             &mut self.compensations,
@@ -489,7 +560,7 @@ impl<'a> MeltSaga<'a, Initial> {
 
         Ok(MeltSaga {
             wallet: self.wallet,
-            compensations: self.compensations,
+            compensations: std::mem::take(&mut self.compensations),
             state_data: Prepared {
                 operation_id: self.state_data.operation_id,
                 quote: quote_info,
@@ -558,6 +629,39 @@ impl<'a> MeltSaga<'a, Initial> {
         crate::wallet::util::sign_proofs(&mut proofs, &signing_keys)?;
         crate::wallet::util::verify_locked_proofs(&proofs)?;
 
+        // Signing and the sig-flag check happen before the quote is reserved,
+        // so a failure there has nothing to undo. Everything after
+        // `initialize_melt` goes through the inner fn, whose errors are
+        // compensated here: the funds check, and the `?`s on
+        // `get_proofs_by_ys`, `add_saga`, `reserve_proofs`, `update_proofs` and
+        // `get_proofs_fee` (#2771).
+        match self
+            .prepare_with_proofs_inner(quote_id, proofs, options)
+            .await
+        {
+            Ok(prepared) => Ok(prepared),
+            Err(err) => {
+                // Move the queue out first, matching `prepare`: the inner
+                // method borrows `self`, so compensating through `self` after
+                // the call would not compile.
+                let mut compensations = self.compensations;
+                if let Err(e) = execute_compensations(&mut compensations).await {
+                    tracing::warn!("Failed to compensate melt prepare: {}", e);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Body of [`prepare_with_proofs`](Self::prepare_with_proofs). Kept
+    /// separate so every error after the quote reservation is compensated by
+    /// the caller.
+    async fn prepare_with_proofs_inner(
+        &mut self,
+        quote_id: &str,
+        proofs: Proofs,
+        options: MeltPrepareOptions,
+    ) -> Result<MeltSaga<'a, Prepared>, Error> {
         // Validate locked inputs before reserving the quote.
         let quote_info = self.initialize_melt(quote_id).await?;
 
@@ -569,6 +673,8 @@ impl<'a> MeltSaga<'a, Initial> {
             .checked_add(quote_info.fee_reserve)
             .ok_or(Error::AmountOverflow)?;
         if proofs_total < inputs_needed {
+            // The caller compensates, releasing the quote reserved by
+            // `initialize_melt`.
             return Err(Error::InsufficientFunds);
         }
 
@@ -603,11 +709,6 @@ impl<'a> MeltSaga<'a, Initial> {
                 .and_then(|existing| existing.derivation_index);
         }
 
-        self.wallet
-            .localstore
-            .update_proofs(proofs_info, vec![])
-            .await?;
-
         let saga = WalletSaga::new(
             operation_id,
             WalletSagaState::Melt(MeltSagaState::ProofsReserved),
@@ -627,8 +728,12 @@ impl<'a> MeltSaga<'a, Initial> {
             }),
         );
 
+        // Save recovery information before the reservation can commit.
         self.wallet.localstore.add_saga(saga.clone()).await?;
 
+        // Registered before reserving so a refused reservation still deletes
+        // the saga row. `release_proofs` only touches proofs owned by this
+        // operation, so it cannot release proofs reserved elsewhere.
         add_compensation(
             &mut self.compensations,
             Box::new(RevertProofReservation {
@@ -639,11 +744,30 @@ impl<'a> MeltSaga<'a, Initial> {
         )
         .await;
 
+        // Proofs the wallet already stores must be unspent. Reserve them
+        // atomically first: the upsert below would otherwise overwrite a
+        // spent proof, or one reserved by another operation, and a later
+        // cancel would release it as unspent.
+        let existing_ys: Vec<_> = existing_proofs.iter().map(|p| p.y).collect();
+        if !existing_ys.is_empty() {
+            self.wallet
+                .localstore
+                .reserve_proofs(existing_ys, &operation_id)
+                .await?;
+        }
+
+        // Every stored row is now reserved by this operation, so the upsert
+        // only adds external proofs and persists witnesses.
+        self.wallet
+            .localstore
+            .update_proofs(proofs_info, vec![])
+            .await?;
+
         let input_fee = self.wallet.get_proofs_fee(&proofs).await?.total;
 
         Ok(MeltSaga {
             wallet: self.wallet,
-            compensations: self.compensations,
+            compensations: std::mem::take(&mut self.compensations),
             state_data: Prepared {
                 operation_id: self.state_data.operation_id,
                 quote: quote_info,
@@ -778,12 +902,44 @@ impl<'a> MeltSaga<'a, Prepared> {
                 final_proofs.extend(self.state_data.proofs_to_swap.clone());
             } else {
                 // Current behavior: swap first to get optimal denominations
-                let target_swap_amount = quote_info
+                // The swap's own outputs charge an input fee that must be
+                // paid out of the swapped value, otherwise `final_proofs`
+                // lands short of `amount + fee_reserve + actual_input_fee`
+                // and the melt is refused after the swap fee is spent
+                // (#2772). Solve `T = needed + fee(split(T))` to a fixed
+                // point; `input_fee` stays as the floor so a conservative
+                // prepare-side reservation is never dropped.
+                let needed = quote_info
                     .amount
                     .checked_add(quote_info.fee_reserve)
-                    .ok_or(Error::AmountOverflow)?
-                    .checked_add(input_fee)
                     .ok_or(Error::AmountOverflow)?;
+                let mut target_swap_amount =
+                    needed.checked_add(input_fee).ok_or(Error::AmountOverflow)?;
+                let swap_output_fees = self
+                    .wallet
+                    .get_keyset_fees_and_amounts_by_id_with_policy(active_keyset_id, keyset_policy)
+                    .await?;
+                let mut target_converged = false;
+                for _ in 0..MELT_INPUT_FEE_FIXED_POINT_LIMIT {
+                    let count = target_swap_amount.split(&swap_output_fees)?.len() as u64;
+                    let fee = self
+                        .wallet
+                        .get_keyset_count_fee_with_policy(&active_keyset_id, count, keyset_policy)
+                        .await?;
+                    let next = needed.checked_add(fee).ok_or(Error::AmountOverflow)?;
+                    if next <= target_swap_amount {
+                        target_converged = true;
+                        break;
+                    }
+                    target_swap_amount = next;
+                }
+                if !target_converged {
+                    // No target covers its own outputs' fee. Refuse before the
+                    // swap goes out, so its fee is not spent on a melt the
+                    // wallet already knows it cannot afford.
+                    self.compensate().await;
+                    return Err(Error::InsufficientFunds);
+                }
 
                 tracing::debug!(
                     "Swapping {} proofs (total: {}) for target amount {}",
@@ -1424,15 +1580,82 @@ mod tests {
     use cdk_common::{MeltQuoteOnchainResponse, MeltQuoteResponse, MeltQuoteState, PaymentMethod};
     use uuid::Uuid;
 
-    use super::{finalize_melt_common, MeltSaga, MeltSagaResult};
+    use super::{construct_proofs, finalize_melt_common, MeltSaga, MeltSagaResult};
     use crate::nuts::{BlindSignature, PreMintSecrets};
     use crate::wallet::saga::new_compensations;
     use crate::wallet::test_utils::{
-        create_test_db, create_test_wallet_with_mock, test_keyset_id, test_melt_quote,
-        test_mint_url, test_proof_info, MockMintConnector,
+        create_test_db, create_test_wallet_with_mock, make_inactive_keyset, test_keyset,
+        test_keyset_id, test_melt_quote, test_mint_url, test_proof_info, MockMintConnector,
     };
     use crate::wallet::MeltConfirmOptions;
     use crate::{Amount, Error};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_preparations_reserve_disjoint_proofs() {
+        check_concurrent_preparations(2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_preparations_requiring_swap_reserve_disjoint_proofs() {
+        check_concurrent_preparations(4).await;
+    }
+
+    async fn check_concurrent_preparations(proof_amount: u64) {
+        let db = create_test_db().await;
+        let proofs = (0..4)
+            .map(|index| {
+                test_proof_info(test_keyset_id(), proof_amount, test_mint_url())
+                    .with_derivation_index(index)
+            })
+            .collect();
+        db.update_proofs(proofs, vec![]).await.unwrap();
+
+        let mut first_quote = test_melt_quote();
+        first_quote.amount = Amount::from(2);
+        first_quote.fee_reserve = Amount::ZERO;
+        let mut second_quote = first_quote.clone();
+        second_quote.id = Uuid::new_v4().to_string();
+        db.add_melt_quote(first_quote.clone()).await.unwrap();
+        db.add_melt_quote(second_quote.clone()).await.unwrap();
+
+        let client = Arc::new(MockMintConnector::new());
+        client.reset_default_mint_state();
+        let mut keyset = crate::wallet::test_utils::test_keyset();
+        keyset.input_fee_ppk = 0;
+        client.set_active_keyset(keyset);
+        let wallet = Arc::new(create_test_wallet_with_mock(db.clone(), client).await);
+        // Warm metadata so only proof selection and reservation overlap.
+        wallet.keysets(KeysetLoadPolicy::default()).await.unwrap();
+        let start = Arc::new(tokio::sync::Barrier::new(4));
+        let mut operations = Vec::new();
+        for quote_id in [None, None, Some(first_quote.id), Some(second_quote.id)] {
+            let wallet = wallet.clone();
+            let start = start.clone();
+            operations.push(tokio::spawn(async move {
+                start.wait().await;
+                match quote_id {
+                    Some(quote_id) => wallet
+                        .prepare_melt(&quote_id, HashMap::new())
+                        .await
+                        .unwrap()
+                        .operation_id(),
+                    None => wallet
+                        .prepare_send(Amount::from(2), Default::default())
+                        .await
+                        .unwrap()
+                        .operation_id(),
+                }
+            }));
+        }
+        let mut reserved_ys = std::collections::HashSet::new();
+        for operation in operations {
+            let operation = operation.await.unwrap();
+            let reserved = db.get_reserved_proofs(&operation).await.unwrap();
+            assert_eq!(reserved.len(), 1);
+            assert!(reserved_ys.insert(reserved[0].y));
+        }
+        assert_eq!(wallet.total_balance().await.unwrap(), Amount::ZERO);
+    }
 
     #[tokio::test]
     async fn test_prepare_melt_reserves_exact_input_proofs_for_operation() {
@@ -2042,6 +2265,153 @@ mod tests {
         );
     }
 
+    /// The mint returning no change signatures leaves nothing to unblind, so
+    /// needing the blanks' keyset here would fail a melt it already settled.
+    #[tokio::test]
+    async fn test_finalize_melt_without_change_needs_no_change_keyset() {
+        let unserved_keyset = make_inactive_keyset();
+        let no_change: [Option<Vec<BlindSignature>>; 2] = [None, Some(Vec::new())];
+
+        for change in no_change {
+            let db = create_test_db().await;
+            let mock_client = Arc::new(MockMintConnector::new());
+            mock_client.set_mint_keys_response(Ok(vec![test_keyset()]));
+            let wallet = create_test_wallet_with_mock(db, mock_client).await;
+
+            let quote = test_melt_quote();
+            let final_proofs = vec![test_proof_info(test_keyset_id(), 1008, test_mint_url()).proof];
+            let premint_secrets = PreMintSecrets::blank(unserved_keyset.id, Amount::from(8))
+                .expect("blank premint secrets");
+
+            let finalized = finalize_melt_common(
+                &wallet,
+                new_compensations(),
+                Uuid::new_v4(),
+                &quote,
+                &final_proofs,
+                &premint_secrets,
+                MeltQuoteState::Paid,
+                None,
+                change,
+                HashMap::new(),
+                Default::default(),
+            )
+            .await
+            .expect("a melt with no change does not need the blanks' keyset");
+
+            assert!(finalized.into_change().is_none());
+        }
+    }
+
+    /// The change outputs were blinded on the keyset the melt built them with,
+    /// so unblinding them with the active keyset's keys would store proofs that
+    /// look right and cannot be spent.
+    #[tokio::test]
+    async fn test_finalize_melt_unblinds_change_with_the_keyset_it_was_built_on() {
+        let change_keyset = make_inactive_keyset();
+
+        let db = create_test_db().await;
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.set_mint_keys_response(Ok(vec![test_keyset(), change_keyset.clone()]));
+        let wallet = create_test_wallet_with_mock(db, mock_client).await;
+
+        let quote = test_melt_quote();
+        let final_proofs = vec![test_proof_info(test_keyset_id(), 1008, test_mint_url()).proof];
+        let premint_secrets = PreMintSecrets::blank(change_keyset.id, Amount::from(8))
+            .expect("blank premint secrets");
+        let change = vec![BlindSignature {
+            amount: Amount::from(8),
+            keyset_id: change_keyset.id,
+            c: premint_secrets.blinded_messages()[0].blinded_secret,
+            dleq: None,
+        }];
+
+        let change_proofs = finalize_melt_common(
+            &wallet,
+            new_compensations(),
+            Uuid::new_v4(),
+            &quote,
+            &final_proofs,
+            &premint_secrets,
+            MeltQuoteState::Paid,
+            None,
+            Some(change.clone()),
+            HashMap::new(),
+            Default::default(),
+        )
+        .await
+        .expect("the change keyset is known to the wallet")
+        .into_change()
+        .expect("change proofs");
+
+        let rs = premint_secrets.rs()[..1].to_vec();
+        let secrets = premint_secrets.secrets()[..1].to_vec();
+        let expected = construct_proofs(
+            change.clone(),
+            rs.clone(),
+            secrets.clone(),
+            &change_keyset.keys,
+        )
+        .expect("the change keyset unblinds its own signatures");
+        let with_active_keys = construct_proofs(change, rs, secrets, &test_keyset().keys)
+            .expect("the active keyset has a key for this amount too");
+
+        assert_eq!(change_proofs[0].c, expected[0].c);
+        assert_ne!(
+            change_proofs[0].c, with_active_keys[0].c,
+            "the active keyset's keys must not be the ones used"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_melt_unblinds_change_with_its_own_keyset() {
+        let db = create_test_db().await;
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        // A newer keyset is active and the change keyset has rotated out
+        mock_client.enable_mint_signing();
+        let mut change_keyset = test_keyset();
+        change_keyset.active = Some(false);
+        mock_client.set_mint_keyset_response(Ok(change_keyset.clone()));
+        let wallet = create_test_wallet_with_mock(db, mock_client).await;
+
+        let quote = test_melt_quote();
+        let final_proofs = vec![test_proof_info(change_keyset.id, 1008, test_mint_url()).proof];
+        let premint_secrets =
+            PreMintSecrets::blank(change_keyset.id, Amount::from(8)).expect("blank premint");
+        let blinded = premint_secrets.blinded_messages()[0].blinded_secret;
+        let change = vec![BlindSignature {
+            amount: Amount::from(8),
+            keyset_id: change_keyset.id,
+            c: blinded,
+            dleq: None,
+        }];
+
+        let finalized = finalize_melt_common(
+            &wallet,
+            new_compensations(),
+            Uuid::new_v4(),
+            &quote,
+            &final_proofs,
+            &premint_secrets,
+            MeltQuoteState::Paid,
+            None,
+            Some(change),
+            HashMap::new(),
+            Default::default(),
+        )
+        .await
+        .expect("finalize");
+
+        let expected = cdk_common::dhke::unblind_message(
+            &blinded,
+            &premint_secrets.rs()[0],
+            &change_keyset.keys.amount_key(Amount::from(8)).expect("key"),
+        )
+        .expect("unblind");
+        assert_eq!(finalized.into_change().expect("change")[0].c, expected);
+    }
+
     #[tokio::test]
     async fn test_finalize_melt_persists_payment_proof_on_quote() {
         let db = create_test_db().await;
@@ -2104,5 +2474,134 @@ mod tests {
             .expect("quote should be stored");
         assert_eq!(stored_quote.state, MeltQuoteState::Paid);
         assert_eq!(stored_quote.payment_proof.as_deref(), Some("preimage123"));
+    }
+
+    // Regression coverage for #2771 on the automatic-selection path: a wallet
+    // a few sats short fails at proof selection, after `initialize_melt`
+    // reserved the quote. The retry of the same quote must fail for the same
+    // reason, not with `QuoteAlreadyInUse`.
+    #[tokio::test]
+    async fn prepare_insufficient_funds_releases_the_quote() {
+        let db = create_test_db().await;
+        let keyset_id = test_keyset_id();
+        // 64 sats cannot cover the quote's 1000 plus its 10 reserve.
+        db.update_proofs(
+            vec![test_proof_info(keyset_id, 64, test_mint_url())],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let first = MeltSaga::new(&wallet)
+            .prepare(&quote_id, HashMap::new())
+            .await;
+        assert!(
+            matches!(first, Err(Error::InsufficientFunds)),
+            "{:?}",
+            first.err()
+        );
+
+        // Same quote, same wallet: should fail for the same reason.
+        let second = MeltSaga::new(&wallet)
+            .prepare(&quote_id, HashMap::new())
+            .await;
+        assert!(
+            matches!(second, Err(Error::InsufficientFunds)),
+            "second prepare: {:?}",
+            second.err()
+        );
+
+        let quote = db.get_melt_quote(&quote_id).await.unwrap().unwrap();
+        assert!(
+            quote.used_by_operation.is_none(),
+            "failed prepare left the quote reserved by {:?}",
+            quote.used_by_operation
+        );
+    }
+
+    // Regression coverage for #2771: a failed `prepare_with_proofs` must not
+    // leave the quote reserved. Before the fix, `initialize_melt` pinned the
+    // quote to the failed operation and the next prepare saw
+    // `QuoteAlreadyInUse` until startup recovery swept the orphan.
+    #[tokio::test]
+    async fn prepare_with_proofs_insufficient_funds_releases_quote() {
+        let db = create_test_db().await;
+        let keyset_id = test_keyset_id();
+        let proof = test_proof_info(keyset_id, 64, test_mint_url()).proof;
+
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.reset_default_mint_state();
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client).await;
+
+        let first = MeltSaga::new(&wallet)
+            .prepare_with_proofs(&quote_id, vec![proof], MeltPrepareOptions::default())
+            .await;
+        assert!(
+            matches!(first, Err(Error::InsufficientFunds)),
+            "{:?}",
+            first.err()
+        );
+
+        // Same quote, same wallet: the reservation must be free again.
+        let quote = db.get_melt_quote(&quote_id).await.unwrap().unwrap();
+        assert!(
+            quote.used_by_operation.is_none(),
+            "failed prepare left the quote reserved by {:?}",
+            quote.used_by_operation
+        );
+    }
+    // Regression coverage for #2772: on a keyset charging 1000 ppk (1 sat per
+    // input), 1010 splits into 7 proofs but `1010 + 7` splits into 8, so the
+    // melt needs 1018. The old single-pass estimate left the swap one sat
+    // short and the mint refused the melt after the swap fee was paid.
+    #[tokio::test]
+    async fn melt_swap_covers_input_fee_of_swapped_outputs() {
+        let db = create_test_db().await;
+
+        let mock_client = Arc::new(MockMintConnector::new());
+        mock_client.enable_mint_signing();
+        let mut keyset = mock_client.keysets.lock().unwrap()[0].clone();
+        keyset.input_fee_ppk = 1000;
+        let keyset_id = keyset.id;
+        mock_client.set_active_keyset(keyset);
+
+        // One 2048-sat proof: plenty for 1000 + 10 reserve plus fees.
+        db.update_proofs(
+            vec![test_proof_info(keyset_id, 2048, test_mint_url())],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let quote = test_melt_quote();
+        let quote_id = quote.id.clone();
+        db.add_melt_quote(quote).await.unwrap();
+
+        let wallet = create_test_wallet_with_mock(db.clone(), mock_client.clone()).await;
+        let prepared = MeltSaga::new(&wallet)
+            .prepare(&quote_id, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(prepared.state_data.proofs_to_swap.len(), 1);
+
+        let result = prepared
+            .request_melt_with_options(MeltConfirmOptions::default())
+            .await;
+        assert!(
+            result.is_ok(),
+            "melt refused after swap: {:?}",
+            result.err()
+        );
     }
 }

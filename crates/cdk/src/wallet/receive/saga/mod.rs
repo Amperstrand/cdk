@@ -58,8 +58,8 @@ use crate::wallet::saga::{
     add_compensation, clear_compensations, execute_compensations, new_compensations, Compensations,
 };
 use crate::wallet::swap::ProofReservation;
-use crate::wallet::util::escape_log_value;
-use crate::{Amount, Error, Wallet, SECP256K1};
+use crate::wallet::util::{escape_log_value, p2bk_slot};
+use crate::{Amount, Error, Wallet};
 
 pub(crate) mod compensation;
 pub(crate) mod resume;
@@ -139,7 +139,7 @@ impl<'a> ReceiveSaga<'a, Initial> {
         let mut p2pk_signing_keys: HashMap<XOnlyPublicKey, SecretKey> = opts
             .p2pk_signing_keys
             .iter()
-            .map(|s| (s.x_only_public_key(&SECP256K1).0, s.clone()))
+            .map(|s| (s.x_only_public_key().0, s.clone()))
             .collect();
 
         // Process each proof: verify DLEQ, handle P2PK/HTLC
@@ -178,10 +178,15 @@ impl<'a> ReceiveSaga<'a, Initial> {
                             // HTLC data is a hash, not a pubkey.
                             // Add the pre-image and skip slot 0 pubkey.
                             let hashed_preimage = secret.secret_data().data();
-                            let preimage = hashed_to_preimage
-                                .get(hashed_preimage)
-                                .ok_or(Error::PreimageNotProvided)?;
-                            proof.add_preimage(preimage.to_string());
+                            match hashed_to_preimage.get(hashed_preimage) {
+                                Some(preimage) => proof.add_preimage(preimage.to_string()),
+                                // Without the preimage only the refund path can
+                                // spend it, which opens once the locktime passed
+                                None if conditions
+                                    .locktime
+                                    .is_some_and(|locktime| locktime < unix_time()) => {}
+                                None => return Err(Error::PreimageNotProvided),
+                            }
 
                             // For HTLC, there is no slot 0 pubkey. But slot index for the tags still starts at 1!
                         }
@@ -193,11 +198,13 @@ impl<'a> ReceiveSaga<'a, Initial> {
                         pubkeys.append(&mut refund_keys);
                     }
 
+                    if proof.p2pk_e.is_some() {
+                        if let Some(last_index) = pubkeys.len().checked_sub(1) {
+                            p2bk_slot(secret.kind(), last_index)?;
+                        }
+                    }
+
                     for (i, pubkey) in pubkeys.iter().enumerate() {
-                        let slot = match secret.kind() {
-                            Kind::P2PK => i as u8,
-                            _ => (i + 1) as u8, // HTLC skips slot 0 since it's a hash, not a pubkey
-                        };
                         let x_only_pubkey = pubkey.x_only_public_key();
 
                         if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -209,6 +216,7 @@ impl<'a> ReceiveSaga<'a, Initial> {
                         }
 
                         if let Some(ephemeral_key) = proof.p2pk_e {
+                            let slot = p2bk_slot(secret.kind(), i)?;
                             for signing_key in p2pk_signing_keys.values() {
                                 if let Ok(r) =
                                     crate::nuts::nut28::ecdh_kdf(signing_key, &ephemeral_key, slot)
@@ -581,7 +589,9 @@ mod tests {
 
     use crate::amount::SplitTarget;
     use crate::dhke::{hash_to_curve, sign_message};
-    use crate::nuts::{BlindSignature, PreMintSecrets, Proof, SecretKey, State, SwapResponse};
+    use crate::nuts::{
+        nut00, BlindSignature, PreMintSecrets, Proof, SecretKey, State, SwapResponse,
+    };
     use crate::wallet::test_utils::{
         create_test_db, create_test_wallet_with_mock_seed, test_keyset_id, test_proof,
         MockMintConnector,
@@ -660,6 +670,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(transaction.status, TransactionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn test_receive_rejects_duplicate_inputs_without_side_effects() {
+        for different_amount in [false, true] {
+            let (wallet, mock, input, signature) = receive_fixture().await;
+            let mut duplicate = input.clone();
+            if different_amount {
+                // Uniqueness depends on Y, not equality of the entire proof.
+                duplicate.amount = Amount::from(1);
+            }
+            mock.set_post_swap_response(Err(Error::DuplicateInputs));
+            let result = wallet
+                .receive_proofs(
+                    vec![input.clone(), duplicate],
+                    ReceiveOptions::default(),
+                    None,
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(Error::NUT00(nut00::Error::DuplicateProofs))),
+                "{result:?}"
+            );
+            assert!(mock.captured_swap_requests().is_empty());
+            assert!(wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(wallet
+                .localstore
+                .list_transactions(None, None, None)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(wallet
+                .localstore
+                .get_proofs(None, None, None, None)
+                .await
+                .unwrap()
+                .is_empty());
+
+            // Rejection must leave the original proof usable for a valid receive.
+            let amount = receive_response(&wallet, &mock, &input, vec![signature])
+                .await
+                .unwrap();
+            assert_eq!(amount, Amount::from(2));
+            assert_eq!(wallet.total_balance().await.unwrap(), amount);
+        }
     }
 
     #[tokio::test]

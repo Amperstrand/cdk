@@ -1,6 +1,6 @@
 #![doc = include_str!("./README.md")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -24,7 +24,6 @@ use zeroize::Zeroize;
 use crate::amount::SplitTarget;
 use crate::dhke::construct_proofs;
 use crate::error::Error;
-use crate::fees::calculate_fee;
 use crate::mint_url::MintUrl;
 use crate::nuts::nut00::token::Token;
 use crate::nuts::nut17::Kind;
@@ -76,7 +75,6 @@ pub mod test_utils;
 mod transactions;
 pub mod util;
 pub mod wallet_repository;
-mod wallet_trait;
 
 pub use auth::{AuthMintConnector, AuthWallet};
 #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
@@ -144,7 +142,7 @@ impl DerivationCounterNamespace {
 ///
 /// For pending mint quotes, call [`Wallet::mint_unissued_quotes`] which checks
 /// quote states with the mint and mints available tokens. This makes network calls.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Wallet {
     /// Mint Url
     pub mint_url: MintUrl,
@@ -156,6 +154,9 @@ pub struct Wallet {
     pub metadata_cache: Arc<MintMetadataCache>,
     /// The targeted amount of proofs to have at each size
     pub target_proof_count: usize,
+    // Keep automatic proof selection and reservation together for this wallet.
+    // The database still atomically rejects competing reservations from other wallets.
+    proof_selection_lock: tokio::sync::Mutex<()>,
     auth_wallet: Arc<TokioRwLock<Option<AuthWallet>>>,
     auth_connector: Option<Arc<dyn AuthMintConnector + Send + Sync>>,
     #[cfg(feature = "npubcash")]
@@ -437,23 +438,11 @@ impl Wallet {
         &self,
         proofs_per_keyset: HashMap<Id, u64>,
     ) -> Result<crate::fees::ProofsFeeBreakdown, Error> {
-        let mut fee_per_keyset = HashMap::new();
         let metadata = self
             .metadata_cache
             .load(&self.localstore, &self.client)
             .await?;
-
-        for keyset_id in proofs_per_keyset.keys() {
-            let mint_keyset_info = metadata
-                .keysets
-                .get(keyset_id)
-                .ok_or(Error::UnknownKeySet)?;
-            fee_per_keyset.insert(*keyset_id, mint_keyset_info.input_fee_ppk);
-        }
-
-        let fee_breakdown = calculate_fee(&proofs_per_keyset, &fee_per_keyset)?;
-
-        Ok(fee_breakdown)
+        metadata.proofs_fee(&proofs_per_keyset)
     }
 
     /// Get fee for count of proofs in a keyset
@@ -689,6 +678,13 @@ impl Wallet {
     /// Scans each keyset in batches of `opts.batch_size` blinded messages
     /// and stops after `opts.max_gap` consecutive empty batches. Lowering
     /// `batch_size` trades scan latency for a gentler request pattern.
+    ///
+    /// Proofs the wallet already stores are left as they are, so restoring
+    /// into a wallet in use does not release proofs held by a pending send or
+    /// another operation. The exception is a pending proof no operation owns,
+    /// which becomes unspent again once the mint reports it unspent. The
+    /// returned amounts are scan totals: they count every proof found with the
+    /// state the mint reports, including proofs the wallet already stores.
     #[instrument(skip(self))]
     pub async fn restore_with_opts(&self, opts: NUT13Options) -> Result<Restored, Error> {
         let opts = NUT13Options::new(opts.batch_size, opts.max_gap)?;
@@ -839,6 +835,37 @@ impl Wallet {
 
                 let states = self.check_proofs_spent(proofs.clone()).await?;
 
+                // The state of a proof the wallet already stores belongs to the
+                // operation using it. The mint reporting it unspent does not
+                // mean that operation is over, so only add proofs we don't have.
+                // A pending proof no operation owns has nothing to wait for (an
+                // earlier restore stores proofs the mint reports pending that
+                // way), so it becomes unspent again once the mint says so.
+                // Spent ones were already removed by `check_proofs_spent`.
+                // The returned totals still count every scanned proof.
+                let stored_proofs = self
+                    .localstore
+                    .get_proofs_by_ys(states.iter().map(|state| state.y).collect())
+                    .await?;
+                let known_ys: HashSet<_> = stored_proofs
+                    .iter()
+                    .map(|proof_info| proof_info.y)
+                    .collect();
+                let unowned_pending_ys: HashSet<_> = stored_proofs
+                    .iter()
+                    .filter(|proof_info| {
+                        proof_info.state == State::Pending && proof_info.used_by_operation.is_none()
+                    })
+                    .map(|proof_info| proof_info.y)
+                    .collect();
+                let released_ys: Vec<_> = states
+                    .iter()
+                    .filter(|state| {
+                        state.state == State::Unspent && unowned_pending_ys.contains(&state.y)
+                    })
+                    .map(|state| state.y)
+                    .collect();
+
                 let (unspent_proofs, updated_restored) = proofs
                     .into_iter()
                     .zip(states)
@@ -867,14 +894,18 @@ impl Wallet {
                                         .unspent
                                         .checked_add(proof_info.proof.amount)
                                         .ok_or(Error::AmountOverflow)?;
-                                    proofs.push(proof_info);
+                                    if !known_ys.contains(&proof_info.y) {
+                                        proofs.push(proof_info);
+                                    }
                                 }
                                 State::Pending => {
                                     restored_result.pending = restored_result
                                         .pending
                                         .checked_add(proof_info.proof.amount)
                                         .ok_or(Error::AmountOverflow)?;
-                                    proofs.push(proof_info);
+                                    if !known_ys.contains(&proof_info.y) {
+                                        proofs.push(proof_info);
+                                    }
                                 }
                                 _ => {
                                     unreachable!("These states are unknown to the mint and cannot be returned")
@@ -889,6 +920,12 @@ impl Wallet {
                 self.localstore
                     .update_proofs(unspent_proofs, vec![])
                     .await?;
+
+                if !released_ys.is_empty() {
+                    self.localstore
+                        .update_proofs_state(released_ys, State::Unspent)
+                        .await?;
+                }
 
                 empty_batch = 0;
                 start_counter = start_counter.saturating_add(batch_size);
@@ -1135,27 +1172,10 @@ impl Wallet {
         namespace: DerivationCounterNamespace,
         minimum_index: u32,
     ) -> Result<u32, Error> {
-        let namespace = namespace.as_str();
-        let current_counter = self
+        Ok(self
             .localstore
-            .increment_derivation_counter(namespace, 0)
-            .await?;
-        let catch_up = minimum_index.saturating_sub(current_counter);
-        let reservation_count = catch_up.checked_add(1).ok_or_else(|| {
-            Error::Custom(format!(
-                "Derivation counter namespace `{namespace}` has been exhausted"
-            ))
-        })?;
-        let next_counter = self
-            .localstore
-            .increment_derivation_counter(namespace, reservation_count)
-            .await?;
-
-        next_counter.checked_sub(1).ok_or_else(|| {
-            Error::Custom(format!(
-                "Derivation counter namespace `{namespace}` did not advance after reservation"
-            ))
-        })
+            .reserve_derivation_index(namespace.as_str(), minimum_index)
+            .await?)
     }
 
     /// gets public key by it's hex value
@@ -1210,12 +1230,78 @@ mod tests {
     use async_trait::async_trait;
     use bitcoin::bip32::DerivationPath;
     use bitcoin::secp256k1::Secp256k1;
+    use cdk_common::nut00::KnownMethod;
     use cdk_common::nut02::KeySetVersion;
-    use cdk_common::nuts::{KeySet, KeySetInfo, KeysetResponse, MintKeySet};
+    use cdk_common::nuts::{KeySet, KeySetInfo, KeysetResponse, MintKeySet, PaymentMethod};
 
     use super::*;
     use crate::nuts::{AuthToken, BlindSignature, BlindedMessage, PreMint, PreMintSecrets};
     use crate::secret::Secret;
+    use crate::wallet::test_utils::{MockMintConnector, TraceWriter};
+
+    async fn test_wallet() -> Wallet {
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        WalletBuilder::default()
+            .mint_url(MintUrl::from_str("https://mint.example.com").unwrap())
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([0u8; 64])
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rate_limiting_round_trips() {
+        let wallet = test_wallet().await;
+        assert!(Wallet::is_rate_limited(&wallet));
+
+        wallet.disable_rate_limiting();
+        assert!(!Wallet::is_rate_limited(&wallet));
+
+        wallet.set_rate_limiting_config(RateLimitConfig::default());
+        assert!(Wallet::is_rate_limited(&wallet));
+    }
+
+    #[tokio::test]
+    async fn flushing_an_untouched_wallet_returns() {
+        let wallet = test_wallet().await;
+        Wallet::flush_rate_limits(&wallet).await;
+    }
+
+    #[tokio::test]
+    async fn custom_payment_extra_is_omitted_from_mint_quote_spans() {
+        let extra = "private-custom-payment-extra";
+        let description = "public-description-marker";
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        let connector = Arc::new(MockMintConnector::new());
+        connector.push_post_mint_quote_response(Err(Error::UnsupportedPaymentMethod));
+        let wallet = WalletBuilder::default()
+            .mint_url(MintUrl::from_str("https://mint.example.com").unwrap())
+            .unit(CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([0u8; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap();
+        let capture = TraceWriter::default();
+        let subscriber = capture.subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let _ = Wallet::mint_quote(
+            &wallet,
+            PaymentMethod::Known(KnownMethod::Bolt11),
+            Some(Amount::from(7)),
+            Some(description.to_string()),
+            Some(extra.to_string()),
+        )
+        .await;
+
+        drop(guard);
+        let trace = capture.output();
+        assert!(trace.contains("mint_quote"));
+        assert!(trace.contains(description));
+        assert!(!trace.contains(extra));
+    }
 
     fn build_test_auth_keyset(seed_byte: u8) -> KeySet {
         let secp = Secp256k1::new();
@@ -1845,6 +1931,75 @@ mod tests {
             matches!(result, Err(Error::AmountOverflow)),
             "expected amount overflow, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn prefetched_proofs_fee_supports_keyset_info_without_keys() {
+        use crate::nuts::KeySetInfo;
+        use crate::wallet::test_utils::{
+            create_test_db, create_test_wallet_with_mock, test_keyset, test_mint_url,
+            MockMintConnector,
+        };
+
+        let db = create_test_db().await;
+        db.add_mint(test_mint_url(), None).await.unwrap();
+        let active = test_keyset();
+        let inactive_id: Id = "001711afb1de20cb".parse().unwrap();
+        db.add_mint_keysets(
+            test_mint_url(),
+            vec![
+                KeySetInfo {
+                    id: active.id,
+                    unit: active.unit.clone(),
+                    active: true,
+                    input_fee_ppk: 100,
+                    final_expiry: None,
+                },
+                KeySetInfo {
+                    id: inactive_id,
+                    unit: active.unit.clone(),
+                    active: false,
+                    input_fee_ppk: 1500,
+                    final_expiry: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        db.add_keys(active.clone()).await.unwrap();
+        let wallet = create_test_wallet_with_mock(db, Arc::new(MockMintConnector::new())).await;
+        let keysets = wallet.keysets(KeysetLoadPolicy::CacheOnly).await.unwrap();
+        assert_eq!(keysets.len(), 1);
+        assert_eq!(keysets[0].id, active.id);
+
+        let metadata = wallet
+            .metadata_cache
+            .load_cached(&wallet.localstore)
+            .await
+            .unwrap();
+        assert!(!metadata.keys.contains_key(&inactive_id));
+        let counts = HashMap::from([(active.id, 2), (inactive_id, 3)]);
+        let prefetched = metadata.proofs_fee(&counts).unwrap();
+        assert_eq!(prefetched.total, Amount::from(5));
+        assert_eq!(
+            prefetched,
+            wallet.get_proofs_fee_by_count(counts).await.unwrap()
+        );
+
+        let unknown_id: Id = "00ffffffffffffff".parse().unwrap();
+        let unknown = HashMap::from([(unknown_id, 1)]);
+        assert!(matches!(
+            metadata.proofs_fee(&unknown),
+            Err(Error::UnknownKeySet)
+        ));
+        assert!(matches!(
+            wallet.get_proofs_fee_by_count(unknown).await,
+            Err(Error::UnknownKeySet)
+        ));
+        assert!(matches!(
+            metadata.proofs_fee(&HashMap::from([(inactive_id, u64::MAX)])),
+            Err(Error::AmountOverflow)
+        ));
     }
 
     #[tokio::test]

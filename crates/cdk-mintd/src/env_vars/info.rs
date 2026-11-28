@@ -4,12 +4,13 @@ use std::env;
 use std::str::FromStr;
 
 use cdk_common::common::QuoteTTL;
+use config::ConfigError;
 
 use super::common::*;
 use crate::config::{Info, LoggingOutput};
 
 impl Info {
-    pub fn from_env(mut self) -> Self {
+    pub fn from_env(mut self) -> Result<Self, ConfigError> {
         // Required fields
         if let Ok(url) = env::var(ENV_URL) {
             self.url = url;
@@ -63,6 +64,29 @@ impl Info {
             }
         }
 
+        match env::var(ENV_KEYSET_VERSION) {
+            Ok(version) => {
+                self.keyset_version = Some(version.parse().map_err(|err| {
+                    ConfigError::Message(format!("Invalid {ENV_KEYSET_VERSION}: {err}"))
+                })?);
+            }
+            Err(env::VarError::NotPresent) => (),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::Message(format!(
+                    "Invalid {ENV_KEYSET_VERSION}: expected v1 or v2 as Unicode text"
+                )));
+            }
+        }
+
+        if let Ok(interval) = env::var(ENV_KEYSET_REFRESH_INTERVAL_MS) {
+            match interval.parse() {
+                Ok(interval_ms) => self.keyset_refresh_interval_ms = Some(interval_ms),
+                Err(err) => tracing::warn!(
+                    "Invalid {ENV_KEYSET_REFRESH_INTERVAL_MS} '{interval}' in environment variable: {err}"
+                ),
+            }
+        }
+
         // Logging configuration
         if let Ok(output_str) = env::var(ENV_LOGGING_OUTPUT) {
             if let Ok(output) = LoggingOutput::from_str(&output_str) {
@@ -106,6 +130,6 @@ impl Info {
             });
         }
 
-        self
+        Ok(self)
     }
 }

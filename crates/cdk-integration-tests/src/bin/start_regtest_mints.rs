@@ -279,8 +279,6 @@ async fn start_ldk_mint(
         storage_dir_path: Some(ldk_work_dir.to_string_lossy().to_string()),
         ldk_node_host: Some("127.0.0.1".to_string()),
         ldk_node_port: Some(ldk_node_p2p_port),
-        gossip_source_type: None,
-        rgs_url: None,
         webserver_host: Some("127.0.0.1".to_string()),
         webserver_port: Some(port + 1), // Use next port for web interface
         ldk_node_mnemonic: Some(mnemonics.ldk_node.to_string()),
@@ -473,6 +471,8 @@ fn create_ldk_settings(
             mnemonic: Some(mint_mnemonic.to_string()),
             input_fee_ppk: None,
             use_keyset_v2: None,
+            keyset_version: None,
+            keyset_refresh_interval_ms: None,
             http_cache: cdk_axum::cache::Config::default(),
             enable_info_page: None,
             logging: LoggingConfig::default(),
@@ -574,6 +574,8 @@ fn create_onchain_settings(port: u16, mint_mnemonic: &Mnemonic) -> cdk_mintd::co
             mnemonic: Some(mint_mnemonic.to_string()),
             input_fee_ppk: None,
             use_keyset_v2: None,
+            keyset_version: None,
+            keyset_refresh_interval_ms: None,
             http_cache: cdk_axum::cache::Config::default(),
             enable_info_page: None,
             logging: LoggingConfig::default(),
@@ -738,7 +740,6 @@ fn main() -> Result<()> {
                 user: "testuser".to_string(),
                 password: "testpass".to_string(),
             }),
-            cdk_ldk_node::GossipSource::P2P,
             ldk_work_dir.to_string_lossy().to_string(),
             cdk_common::common::FeeReserve {
                 min_fee_reserve: Amount::ZERO,
@@ -772,7 +773,6 @@ fn main() -> Result<()> {
                         user: "testuser".to_string(),
                         password: "testpass".to_string(),
                     }),
-                    cdk_ldk_node::GossipSource::P2P,
                     ldk_work_dir.to_string_lossy().to_string(),
                     cdk_common::common::FeeReserve {
                         min_fee_reserve: Amount::ZERO,

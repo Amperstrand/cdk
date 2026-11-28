@@ -15,13 +15,15 @@ use cdk_common::{Amount, CurrencyUnit, Error, PublicKey, QuoteId};
 use cdk_prometheus::METRICS;
 use cdk_signatory::signatory::SignatoryKeySet;
 
+use super::lease::{check_melt_lease, commit_melt_completion};
 use crate::mint::subscription::PubSubManager;
 use crate::mint::MeltQuote;
 use crate::Mint;
 
 /// Retrieves fee and amount configuration for the keyset matching the change outputs.
 ///
-/// Searches active keysets for one matching the first output's keyset_id.
+/// Searches keysets for one matching the first output's keyset_id, including
+/// keysets rotated after the melt was accepted.
 /// Used during change calculation for melts.
 ///
 /// # Arguments
@@ -40,7 +42,7 @@ pub fn get_keyset_fee_and_amounts(
         .load()
         .iter()
         .filter_map(|keyset| {
-            if keyset.active && Some(keyset.id) == outputs.first().map(|x| x.keyset_id) {
+            if Some(keyset.id) == outputs.first().map(|x| x.keyset_id) {
                 Some((keyset.input_fee_ppk, keyset.amounts.clone()).into())
             } else {
                 None
@@ -161,6 +163,7 @@ pub async fn rollback_melt_quote(
         input_ys,
         blinded_secrets,
         operation_id,
+        &operation_id.to_string(),
         None,
     )
     .await
@@ -174,6 +177,7 @@ pub(crate) async fn rollback_setup_melt_quote(
     input_ys: &[PublicKey],
     blinded_secrets: &[PublicKey],
     operation_id: &uuid::Uuid,
+    lock_token: &str,
 ) -> Result<(), Error> {
     if input_ys.is_empty() && blinded_secrets.is_empty() {
         return Ok(());
@@ -188,6 +192,7 @@ pub(crate) async fn rollback_setup_melt_quote(
         input_ys,
         blinded_secrets,
         operation_id,
+        lock_token,
         Some(mint_types::MeltSagaState::SetupComplete),
     )
     .await
@@ -201,6 +206,7 @@ pub(crate) async fn rollback_failed_melt_quote(
     input_ys: &[PublicKey],
     blinded_secrets: &[PublicKey],
     operation_id: &uuid::Uuid,
+    lock_token: &str,
 ) -> Result<(), Error> {
     if input_ys.is_empty() && blinded_secrets.is_empty() {
         return Ok(());
@@ -215,11 +221,13 @@ pub(crate) async fn rollback_failed_melt_quote(
         input_ys,
         blinded_secrets,
         operation_id,
+        lock_token,
         Some(mint_types::MeltSagaState::PaymentFailed),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rollback_melt_quote_inner(
     mut tx: DynMintTransaction,
     pubsub: &PubSubManager,
@@ -227,6 +235,7 @@ async fn rollback_melt_quote_inner(
     input_ys: &[PublicKey],
     blinded_secrets: &[PublicKey],
     operation_id: &uuid::Uuid,
+    lock_token: &str,
     required_saga_state: Option<mint_types::MeltSagaState>,
 ) -> Result<(), Error> {
     if input_ys.is_empty() && blinded_secrets.is_empty() {
@@ -261,6 +270,10 @@ async fn rollback_melt_quote_inner(
             return Ok(());
         }
         Some(saga) => {
+            if let Some(quote) = locked_quotes.target.as_ref() {
+                check_melt_lease(&mut tx, quote, lock_token).await?;
+            }
+
             if let Some(required_state) = required_saga_state {
                 if saga.state != mint_types::SagaStateEnum::Melt(required_state.clone()) {
                     tracing::info!(
@@ -292,6 +305,7 @@ async fn rollback_melt_quote_inner(
     let quote_option = if let Some(mut quote) = locked_quotes.target {
         match quote.state {
             MeltQuoteState::Pending => {
+                quote.melt_lock = String::new();
                 tx.update_melt_quote_state(&mut quote, MeltQuoteState::Unpaid, None)
                     .await?;
                 Some(quote)
@@ -357,7 +371,7 @@ async fn rollback_melt_quote_inner(
         // Continue anyway - saga cleanup is best-effort
     }
 
-    tx.commit().await?;
+    commit_melt_completion(tx, quote_id, lock_token).await?;
 
     // Publish proof state changes
     if proofs_recovered {
@@ -766,7 +780,7 @@ pub(crate) async fn finalize_melt_core(
         // Payment is already done - continue finalization but no change will be returned
     }
 
-    // Update quote state to Paid
+    // Keep ownership until finalization cleanup commits.
     if let Err(err) = tx
         .update_melt_quote_state(&mut quote, MeltQuoteState::Paid, payment_proof.clone())
         .await
@@ -872,6 +886,17 @@ pub async fn finalize_melt_quote(
 
     let locked_quote = load_melt_quotes_exclusively(&mut tx, &quote.id).await?;
 
+    let owner = if quote.melt_lock.is_empty() {
+        operation_id.map(|id| id.to_string()).unwrap_or_default()
+    } else {
+        quote.melt_lock.clone()
+    };
+    if locked_quote.state != MeltQuoteState::Paid || locked_quote.is_locked() {
+        check_melt_lease(&mut tx, &locked_quote, &owner).await?;
+    } else if !settlement_matches(&locked_quote) {
+        return Err(Error::PaidQuote);
+    }
+
     // Get melt request info
     let melt_request_info = match tx.get_melt_request_and_blinded_messages(&quote.id).await? {
         Some(info) => info,
@@ -902,8 +927,7 @@ pub async fn finalize_melt_quote(
                 tx.rollback().await?;
             }
 
-            let sigs = db.get_blind_signatures_for_quote(&quote.id).await?;
-            return Ok(if sigs.is_empty() { None } else { Some(sigs) });
+            return Mint::load_quote_change_with_dleq(db, &mint.signatory, &quote.id).await;
         }
     };
 
@@ -926,8 +950,7 @@ pub async fn finalize_melt_quote(
             tx.rollback().await?;
         }
 
-        let sigs = db.get_blind_signatures_for_quote(&quote.id).await?;
-        return Ok(if sigs.is_empty() { None } else { Some(sigs) });
+        return Mint::load_quote_change_with_dleq(db, &mint.signatory, &quote.id).await;
     }
 
     #[cfg(feature = "prometheus")]
@@ -1014,10 +1037,18 @@ pub async fn finalize_melt_quote(
                 return Err(Error::PaidQuote);
             }
 
-            let sigs = db.get_blind_signatures_for_quote(&quote.id).await?;
-            return Ok(if sigs.is_empty() { None } else { Some(sigs) });
+            return Mint::load_quote_change_with_dleq(db, &mint.signatory, &quote.id).await;
         }
     };
+
+    // Paid cleanup is idempotent, but a recovery owner still takes precedence.
+    let current = tx
+        .get_melt_quote(&quote.id)
+        .await?
+        .ok_or(Error::UnknownQuote)?;
+    if current.is_locked() {
+        check_melt_lease(&mut tx, &current, &owner).await?;
+    }
 
     let change_amount_for_log = change_sigs
         .as_ref()
@@ -1091,8 +1122,10 @@ pub async fn finalize_melt_quote(
         }
     }
 
+    tx.unlock_melt_quote(&quote.id, &owner).await?;
+
     // Commit TX2 (change signatures + operation record + melt request + saga cleanup)
-    tx.commit().await?;
+    commit_melt_completion(tx, &quote.id, &owner).await?;
 
     // Publish quote status change
     pubsub.melt_quote_status(

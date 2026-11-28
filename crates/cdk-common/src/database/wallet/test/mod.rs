@@ -414,6 +414,82 @@ where
     assert!(!quotes.is_empty());
 }
 
+/// Unissued mint quotes include every quote that can be paid more than once
+///
+/// Bolt12, onchain (NUT-30) and custom methods can receive further payments
+/// after a first mint, so they must stay in the list for the wallet to pick up
+/// the new amount. A bolt11 quote stays in the list while part of what was paid
+/// is still to issue, and is done once it has been issued in full.
+pub async fn get_unissued_mint_quotes_includes_reusable_methods<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let mint_url = test_mint_url();
+
+    let reusable_quote = |payment_method: cashu::PaymentMethod| {
+        let mut quote = test_mint_quote(mint_url.clone());
+        quote.payment_method = payment_method;
+        quote.amount = None;
+        quote.state = MintQuoteState::Paid;
+        quote.amount_paid = Amount::from(15);
+        quote.amount_issued = Amount::from(10);
+        quote
+    };
+
+    let bolt12 = reusable_quote(cashu::PaymentMethod::Known(KnownMethod::Bolt12));
+    let onchain = reusable_quote(cashu::PaymentMethod::Known(KnownMethod::Onchain));
+    let custom = reusable_quote(cashu::PaymentMethod::Custom("paypal".to_string()));
+
+    let mut unpaid_bolt11 = test_mint_quote(mint_url.clone());
+    unpaid_bolt11.state = MintQuoteState::Unpaid;
+
+    // Paid in full but only partly issued: the rest is still to mint
+    let mut partially_issued_bolt11 = test_mint_quote(mint_url.clone());
+    partially_issued_bolt11.state = MintQuoteState::Paid;
+    partially_issued_bolt11.amount_paid = Amount::from(100);
+    partially_issued_bolt11.amount_issued = Amount::from(40);
+
+    let mut issued_bolt11 = test_mint_quote(mint_url);
+    issued_bolt11.state = MintQuoteState::Issued;
+    issued_bolt11.amount_paid = Amount::from(1000);
+    issued_bolt11.amount_issued = Amount::from(1000);
+
+    for quote in [
+        &bolt12,
+        &onchain,
+        &custom,
+        &unpaid_bolt11,
+        &partially_issued_bolt11,
+        &issued_bolt11,
+    ] {
+        db.add_mint_quote(quote.clone()).await.unwrap();
+    }
+
+    let unissued: Vec<String> = db
+        .get_unissued_mint_quotes()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|quote| quote.id)
+        .collect();
+
+    for quote in [&bolt12, &onchain, &custom, &unpaid_bolt11] {
+        assert!(
+            unissued.contains(&quote.id),
+            "{} quote should be unissued",
+            quote.payment_method
+        );
+    }
+    assert!(
+        unissued.contains(&partially_issued_bolt11.id),
+        "partially issued bolt11 quote should be unissued"
+    );
+    assert!(
+        !unissued.contains(&issued_bolt11.id),
+        "issued bolt11 quote should not be unissued"
+    );
+}
+
 /// Test getting mint quote in transaction
 pub async fn get_mint_quote_in_transaction<DB>(db: DB)
 where
@@ -582,6 +658,35 @@ where
     assert_eq!(retrieved.version, 1);
     assert_eq!(retrieved.state, MeltQuoteState::Paid);
     assert_ne!(retrieved.amount, Amount::from(999));
+}
+
+/// Test that updating a melt quote without a payment proof keeps the stored one
+pub async fn add_melt_quote_keeps_payment_proof<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let mut quote = test_melt_quote();
+    quote.state = MeltQuoteState::Paid;
+    quote.payment_proof = Some("preimage".to_string());
+    db.add_melt_quote(quote.clone()).await.unwrap();
+
+    // A later status update that does not carry the payment proof
+    let mut update = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    update.payment_proof = None;
+    db.add_melt_quote(update).await.unwrap();
+
+    let retrieved = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    assert_eq!(retrieved.payment_proof, Some("preimage".to_string()));
+    assert_eq!(retrieved.state, MeltQuoteState::Paid);
+    assert_eq!(retrieved.version, 1);
+
+    // A new payment proof still replaces the stored one
+    let mut update = retrieved;
+    update.payment_proof = Some("other".to_string());
+    db.add_melt_quote(update).await.unwrap();
+
+    let retrieved = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    assert_eq!(retrieved.payment_proof, Some("other".to_string()));
 }
 
 // =============================================================================
@@ -927,6 +1032,57 @@ where
     assert_eq!(counters, (1..=8).collect::<Vec<_>>());
 }
 
+/// Catch-up and reservation are a single atomic operation, without skipped indexes.
+pub async fn reserve_derivation_index_is_atomic<DB>(db: DB)
+where
+    DB: Database<crate::database::Error> + Sync,
+{
+    let (a, b, c, d, e, f, g, h) = tokio::join!(
+        db.reserve_derivation_index("p2pk", 6),
+        db.reserve_derivation_index("p2pk", 6),
+        db.reserve_derivation_index("p2pk", 6),
+        db.reserve_derivation_index("p2pk", 6),
+        db.reserve_derivation_index("p2pk", 6),
+        db.reserve_derivation_index("p2pk", 6),
+        db.reserve_derivation_index("p2pk", 6),
+        db.reserve_derivation_index("p2pk", 6),
+    );
+    let mut indexes = [a, b, c, d, e, f, g, h].map(Result::unwrap);
+    indexes.sort_unstable();
+    assert_eq!(indexes, [6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(db.reserve_derivation_index("p2pk", 6).await.unwrap(), 14);
+    assert_eq!(db.reserve_derivation_index("p2pk", 30).await.unwrap(), 30);
+    assert_eq!(db.reserve_derivation_index("p2pk", 0).await.unwrap(), 31);
+    assert_eq!(db.reserve_derivation_index("other", 0).await.unwrap(), 0);
+}
+
+/// Exhaustion must fail without advancing or wrapping the persisted counter.
+pub async fn derivation_reservation_exhaustion_preserves_counter<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    use crate::database::Error;
+    assert!(matches!(
+        db.reserve_derivation_index("test", u32::MAX).await,
+        Err(Error::AmountOverflow)
+    ));
+    assert_eq!(db.increment_derivation_counter("test", 0).await.unwrap(), 0);
+    assert_eq!(
+        db.reserve_derivation_index("test", u32::MAX - 1)
+            .await
+            .unwrap(),
+        u32::MAX - 1
+    );
+    assert!(matches!(
+        db.reserve_derivation_index("test", 0).await,
+        Err(Error::AmountOverflow)
+    ));
+    assert_eq!(
+        db.increment_derivation_counter("test", 0).await.unwrap(),
+        u32::MAX
+    );
+}
+
 // =============================================================================
 // Transaction Tests
 // =============================================================================
@@ -947,6 +1103,66 @@ where
     let retrieved = db.get_transaction(tx_id).await.unwrap();
     assert!(retrieved.is_some());
     assert_eq!(retrieved.unwrap().id(), tx_id);
+}
+
+/// Preserve duplicates and ordering in transaction history.
+pub async fn transaction_proof_identifiers<DB>(db: DB)
+where
+    DB: Database<crate::database::Error>,
+{
+    let secp = SecretKey::generate().public_key();
+    let second = SecretKey::generate().public_key();
+    // Cross multiple SQL insert batches, including a partial final batch.
+    let many = (0..601)
+        .map(|index| if index % 2 == 0 { second } else { secp })
+        .collect();
+    let cases = [
+        vec![],
+        vec![secp],
+        vec![second],
+        vec![second, secp, second],
+        many,
+    ];
+    let mut expected = Vec::new();
+    for ys in cases {
+        let mut transaction = test_transaction(test_mint_url(), TransactionDirection::Incoming);
+        transaction.saga_id = Some(uuid::Uuid::new_v4());
+        transaction.ys = ys;
+        db.add_transaction(transaction.clone()).await.unwrap();
+        let stored = db.get_transaction(transaction.id()).await.unwrap().unwrap();
+        assert_eq!(stored.ys, transaction.ys);
+        expected.push(transaction);
+    }
+    let listed = db.list_transactions(None, None, None).await.unwrap();
+    assert_eq!(listed.len(), expected.len());
+    for transaction in &expected {
+        assert_eq!(
+            listed
+                .iter()
+                .find(|stored| stored.id() == transaction.id())
+                .unwrap()
+                .ys,
+            transaction.ys
+        );
+    }
+
+    let mut updated = expected.pop().unwrap();
+    let id = updated.id();
+    updated.ys = vec![secp, second];
+    db.add_transaction(updated.clone()).await.unwrap();
+    assert_eq!(
+        db.get_transaction(id).await.unwrap().unwrap().ys,
+        updated.ys
+    );
+    updated.ys.clear();
+    db.add_transaction(updated).await.unwrap();
+    assert!(db.get_transaction(id).await.unwrap().unwrap().ys.is_empty());
+    db.remove_transaction(id).await.unwrap();
+    assert!(db.get_transaction(id).await.unwrap().is_none());
+    assert_eq!(
+        db.list_transactions(None, None, None).await.unwrap().len(),
+        expected.len()
+    );
 }
 
 /// Test updating a transaction's status through the idempotent add operation.
@@ -1759,6 +1975,7 @@ macro_rules! wallet_db_test {
             get_keys_in_transaction,
             remove_keys,
             add_and_get_mint_quote,
+            get_unissued_mint_quotes_includes_reusable_methods,
             get_mint_quote_in_transaction,
             remove_mint_quote,
             add_and_get_melt_quote,
@@ -1766,6 +1983,7 @@ macro_rules! wallet_db_test {
             remove_melt_quote,
             add_mint_quote_optimistic_locking,
             add_melt_quote_optimistic_locking,
+            add_melt_quote_keeps_payment_proof,
             add_and_get_proofs,
             get_proofs_in_transaction,
             update_proofs,
@@ -1779,7 +1997,10 @@ macro_rules! wallet_db_test {
             increment_derivation_counter,
             derivation_counters_are_independent,
             derivation_counter_is_atomic,
+            reserve_derivation_index_is_atomic,
+            derivation_reservation_exhaustion_preserves_counter,
             add_and_get_transaction,
+            transaction_proof_identifiers,
             update_transaction_status,
             same_proofs_in_different_sagas,
             list_transactions,
@@ -1803,16 +2024,17 @@ macro_rules! wallet_db_test {
         );
     };
     ($make_db_fn:ident, $($name:ident),+ $(,)?) => {
-        ::paste::paste! {
+        /// Generated wallet database conformance tests
+        mod wallet_db_tests {
             $(
                 #[tokio::test]
-                async fn [<wallet_ $name>]() {
+                async fn $name() {
                     use std::time::{SystemTime, UNIX_EPOCH};
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .expect("Time went backwards");
 
-                    cdk_common::database::wallet::test::$name($make_db_fn(format!("test_{}_{}", now.as_nanos(), stringify!($name))).await).await;
+                    cdk_common::database::wallet::test::$name(super::$make_db_fn(format!("test_{}_{}", now.as_nanos(), stringify!($name))).await).await;
                 }
             )+
         }

@@ -2,6 +2,7 @@
 //!
 //! <https://github.com/cashubtc/nuts/blob/main/04.md>
 
+use std::collections::HashSet;
 use std::fmt;
 #[cfg(feature = "mint")]
 use std::str::FromStr;
@@ -17,7 +18,7 @@ use crate::nut00::KnownMethod;
 use crate::quote_id::QuoteId;
 #[cfg(feature = "mint")]
 use crate::quote_id::QuoteIdError;
-use crate::util::serde_helpers::deserialize_empty_string_as_none;
+use crate::util::serde_helpers::{deserialize_empty_map_as_null, deserialize_empty_string_as_none};
 use crate::{Amount, PublicKey};
 
 /// NUT04 Error
@@ -184,6 +185,17 @@ impl Serialize for MintMethodSettings {
 
 struct MintMethodSettingsVisitor;
 
+/// Recognized keys checked for duplicates; unknown keys are ignored
+const MINT_METHOD_SETTINGS_FIELDS: &[&str] = &[
+    "method",
+    "unit",
+    "method_name",
+    "min_amount",
+    "max_amount",
+    "description",
+    "options",
+];
+
 impl<'de> Visitor<'de> for MintMethodSettingsVisitor {
     type Value = MintMethodSettings;
 
@@ -203,42 +215,37 @@ impl<'de> Visitor<'de> for MintMethodSettingsVisitor {
         let mut description: Option<bool> = None;
         let mut confirmations: Option<u32> = None;
 
+        // Recognized keys seen so far, so repeated keys are rejected even when a
+        // value is `null`
+        let mut seen_fields: HashSet<&'static str> = HashSet::new();
+
         while let Some(key) = map.next_key::<String>()? {
+            if let Some(field) = MINT_METHOD_SETTINGS_FIELDS
+                .iter()
+                .find(|field| **field == key)
+            {
+                if !seen_fields.insert(field) {
+                    return Err(de::Error::duplicate_field(field));
+                }
+            }
+
             match key.as_str() {
                 "method" => {
-                    if method.is_some() {
-                        return Err(de::Error::duplicate_field("method"));
-                    }
                     method = Some(map.next_value()?);
                 }
                 "unit" => {
-                    if unit.is_some() {
-                        return Err(de::Error::duplicate_field("unit"));
-                    }
                     unit = Some(map.next_value()?);
                 }
                 "method_name" => {
-                    if method_name.is_some() {
-                        return Err(de::Error::duplicate_field("method_name"));
-                    }
                     method_name = map.next_value()?;
                 }
                 "min_amount" => {
-                    if min_amount.is_some() {
-                        return Err(de::Error::duplicate_field("min_amount"));
-                    }
-                    min_amount = Some(map.next_value()?);
+                    min_amount = map.next_value()?;
                 }
                 "max_amount" => {
-                    if max_amount.is_some() {
-                        return Err(de::Error::duplicate_field("max_amount"));
-                    }
-                    max_amount = Some(map.next_value()?);
+                    max_amount = map.next_value()?;
                 }
                 "description" => {
-                    if description.is_some() {
-                        return Err(de::Error::duplicate_field("description"));
-                    }
                     description = Some(map.next_value()?);
                 }
                 "confirmations" => {
@@ -417,7 +424,12 @@ pub struct MintQuoteCustomRequest {
     /// custom payment methods to include additional data (e.g., ehash share).
     /// This enables proper validation layering: the mint verifies well-defined
     /// fields while passing extra through to the payment processor.
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "serde_json::Value::is_null",
+        deserialize_with = "deserialize_empty_map_as_null"
+    )]
     pub extra: serde_json::Value,
 }
 
@@ -479,7 +491,12 @@ pub struct MintQuoteCustomResponse<Q> {
     ///
     /// These fields are flattened into the JSON representation, allowing
     /// custom payment methods to include additional data without nesting.
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "serde_json::Value::is_null",
+        deserialize_with = "deserialize_empty_map_as_null"
+    )]
     pub extra: serde_json::Value,
 }
 
@@ -987,6 +1004,74 @@ mod tests {
     }
 
     #[test]
+    fn test_mint_method_settings_null_amount_limits_deserialize_as_none() {
+        let json_str = r#"{
+            "method": "bolt11",
+            "unit": "sat",
+            "min_amount": null,
+            "max_amount": null
+        }"#;
+
+        let settings: MintMethodSettings = from_str(json_str).unwrap();
+
+        assert_eq!(settings.min_amount, None);
+        assert_eq!(settings.max_amount, None);
+
+        let serialized = to_string(&settings).unwrap();
+        let parsed: serde_json::Value = from_str(&serialized).unwrap();
+
+        assert!(parsed.get("min_amount").is_none());
+        assert!(parsed.get("max_amount").is_none());
+    }
+
+    #[test]
+    fn test_mint_method_settings_rejects_duplicate_nullable_fields() {
+        for (field, value) in [
+            ("method_name", r#""Lightning""#),
+            ("min_amount", "100"),
+            ("max_amount", "100"),
+        ] {
+            for (first, second) in [
+                ("null", value),
+                (value, "null"),
+                ("null", "null"),
+                (value, value),
+            ] {
+                let json_str = format!(
+                    r#"{{"method":"bolt11","unit":"sat","{field}":{first},"{field}":{second}}}"#
+                );
+
+                let err = from_str::<MintMethodSettings>(&json_str).unwrap_err();
+
+                assert!(
+                    err.to_string()
+                        .contains(&format!("duplicate field `{field}`")),
+                    "{field}: {first} then {second} should be rejected, got: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mint_method_settings_rejects_duplicate_options() {
+        let json_str = r#"{"method":"bolt11","unit":"sat","options":{"description":true},"options":{"description":true}}"#;
+
+        let err = from_str::<MintMethodSettings>(json_str).unwrap_err();
+
+        assert!(err.to_string().contains("duplicate field `options`"));
+    }
+
+    #[test]
+    fn test_mint_method_settings_ignores_duplicate_unknown_fields() {
+        let json_str =
+            r#"{"method":"bolt11","unit":"sat","min_amount":100,"extra":1,"extra":null}"#;
+
+        let settings: MintMethodSettings = from_str(json_str).unwrap();
+
+        assert_eq!(settings.min_amount, Some(Amount::from(100)));
+    }
+
+    #[test]
     fn test_mint_method_settings_omitted_method_name_uses_derived_name() {
         let json_str = r#"{
             "method": "apple-pay",
@@ -1310,5 +1395,71 @@ mod tests {
             settings.remove_settings(&CurrencyUnit::Sat, &PaymentMethod::BOLT11),
             None
         );
+    }
+
+    #[test]
+    fn custom_mint_quote_extra_round_trips_as_null_when_absent() {
+        let request = MintQuoteCustomRequest {
+            amount: Some(Amount::from(100)),
+            unit: CurrencyUnit::Sat,
+            description: None,
+            pubkey: None,
+            extra: serde_json::Value::Null,
+        };
+
+        let decoded: MintQuoteCustomRequest =
+            from_str(&to_string(&request).expect("serializes")).expect("parses");
+        assert_eq!(decoded, request);
+
+        let response = MintQuoteCustomResponse {
+            quote: "q1".to_string(),
+            request: "pay://abc".to_string(),
+            method: PaymentMethod::Custom("paypal".to_string()),
+            amount: Some(Amount::from(100)),
+            amount_paid: Amount::ZERO,
+            amount_issued: Amount::ZERO,
+            updated_at: 0,
+            unit: Some(CurrencyUnit::Sat),
+            expiry: Some(9999),
+            pubkey: None,
+            extra: serde_json::Value::Null,
+        };
+
+        let decoded: MintQuoteCustomResponse<String> =
+            from_str(&to_string(&response).expect("serializes")).expect("parses");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn custom_mint_quote_extra_round_trips_when_populated() {
+        let request = MintQuoteCustomRequest {
+            amount: Some(Amount::from(100)),
+            unit: CurrencyUnit::Sat,
+            description: None,
+            pubkey: None,
+            extra: json!({"ehash_share": "abc", "ref": 42}),
+        };
+
+        let decoded: MintQuoteCustomRequest =
+            from_str(&to_string(&request).expect("serializes")).expect("parses");
+        assert_eq!(decoded, request);
+
+        let response = MintQuoteCustomResponse {
+            quote: "q1".to_string(),
+            request: "pay://abc".to_string(),
+            method: PaymentMethod::Custom("paypal".to_string()),
+            amount: Some(Amount::from(100)),
+            amount_paid: Amount::ZERO,
+            amount_issued: Amount::ZERO,
+            updated_at: 0,
+            unit: Some(CurrencyUnit::Sat),
+            expiry: Some(9999),
+            pubkey: None,
+            extra: json!({"payment_url": "https://example.com", "ref": 42}),
+        };
+
+        let decoded: MintQuoteCustomResponse<String> =
+            from_str(&to_string(&response).expect("serializes")).expect("parses");
+        assert_eq!(decoded, response);
     }
 }

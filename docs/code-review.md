@@ -49,7 +49,7 @@ Review CDK changes for observable correctness, Cashu interoperability, safe upgr
 
 ## Wallet API and bindings
 
-- Keep changes to the CDK Wallet API synchronized with `crates/cdk-ffi/src/wallet.rs`, `wallet_trait.rs`, and the conversions under `types/`.
+- Keep changes to the CDK Wallet API synchronized with `crates/cdk-ffi/src/wallet.rs` and the conversions under `types/`.
 - Keep protocol/business logic in the canonical Rust implementation. Bindings should adapt that implementation rather than maintain a second version in another language or a binding-specific Rust crate.
 - Validate generated bindings and the target-language call path when conversions, ownership, errors, async behavior, or packaging change. Rust compilation alone does not verify a usable foreign-language API.
 
@@ -60,6 +60,7 @@ Review CDK changes for observable correctness, Cashu interoperability, safe upgr
 - Prioritize repeated database/network operations, lock contention, and substantial allocations. Do not trade understandable APIs for excessive generics merely to avoid a small allocation. Performance claims need evidence.
 - Follow CODE_STYLE.md and automated formatting/linting. Do not mechanically suggest `fold` over `map().sum()`, or invent performance differences between equivalent iterator forms.
 - Use fully qualified `tracing::*` for diagnostics. Preserve intentional CLI/user-facing output. Prefer comments explaining invariants and reasons, and avoid redundant comments or dead commented-out code.
+- Comments should describe current behavior, constraints, or rationale. Avoid references to previous implementations, the current PR, or work "still under development"; keep development history and future plans in issues or PR discussions. Preserve temporal wording when it explains runtime ordering, such as quotes issued before disabling.
 - Keep feature work rebased rather than merging main, following DEVELOPMENT.md. Use JJ-native local operations in JJ workspaces. Treat history cleanup as workflow feedback, not a runtime defect.
 
 ## Tests and evidence

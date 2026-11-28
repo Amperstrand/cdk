@@ -128,6 +128,34 @@ impl MintInput {
     }
 }
 
+/// NUT-29 batch bounds for a list of quote ids.
+///
+/// Ordered empty, over-size, duplicate to match the order the HTTP routes have
+/// always rejected in, so consolidating the check does not change which error a
+/// request that violates two bounds at once gets back.
+fn check_batch_ids(quote_ids: &[QuoteId], max_batch_size: Option<u64>) -> Result<(), Error> {
+    if quote_ids.is_empty() {
+        return Err(Error::UnknownQuote);
+    }
+
+    if let Some(max_batch_size) = max_batch_size {
+        let max = usize::try_from(max_batch_size).unwrap_or(usize::MAX);
+        if quote_ids.len() > max {
+            return Err(Error::BatchSizeExceeded {
+                actual: quote_ids.len(),
+                max,
+            });
+        }
+    }
+
+    let unique_ids: std::collections::HashSet<_> = quote_ids.iter().collect();
+    if unique_ids.len() != quote_ids.len() {
+        return Err(Error::DuplicateQuoteIds);
+    }
+
+    Ok(())
+}
+
 impl Mint {
     /// Validates that a mint request meets all requirements
     ///
@@ -151,10 +179,6 @@ impl Mint {
 
         let nut04 = &mint_info.nuts.nut04;
         ensure_cdk!(!nut04.disabled, Error::MintingDisabled);
-
-        let disabled = nut04.disabled;
-
-        ensure_cdk!(!disabled, Error::MintingDisabled);
 
         let settings = nut04
             .get_settings(&unit, &payment_method)
@@ -576,7 +600,7 @@ impl Mint {
         let metrics = super::MintMetricGuard::new("check_mint_quote");
         let result: Result<MintQuoteResponse<QuoteId>, Error> = async {
             Ok(self
-                .check_mint_quotes(std::slice::from_ref(quote_id))
+                .check_mint_quotes(std::slice::from_ref(quote_id), None)
                 .await?
                 .first()
                 .ok_or(Error::UnknownQuote)?
@@ -604,6 +628,35 @@ impl Mint {
         Ok(quote.payment_method)
     }
 
+    /// Rejects a request whose quotes were not created for the route's payment
+    /// method, so a caller cannot drive a quote through another method's
+    /// endpoint.
+    ///
+    /// Auth is scoped per method, so this runs before any state work, and it
+    /// lives on the mint so no transport carries its own copy. Callers that
+    /// load the quotes anyway pass the method to the call that reads them
+    /// instead ([`Mint::check_mint_quotes`]); this standalone form is for the
+    /// callers that cannot, because minting has to verify the method before it
+    /// issues and the NUT-19 cached routes before they compute a cache key.
+    pub async fn ensure_mint_quote_methods<M>(
+        &self,
+        method: M,
+        quote_ids: &[QuoteId],
+    ) -> Result<(), Error>
+    where
+        M: Into<PaymentMethod>,
+    {
+        let method = method.into();
+
+        for quote_id in quote_ids {
+            if self.get_mint_quote_method(quote_id).await? != method {
+                return Err(Error::InvalidPaymentMethod);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Checks the status of multiple mint quotes (NUT-29 batch quote check)
     ///
     /// Validates that all quotes exist and returns their current states.
@@ -611,14 +664,26 @@ impl Mint {
     ///
     /// # Arguments
     /// * `quote_ids` - The list of quote IDs to check
+    /// * `expected_method` - When given, the payment method every quote must
+    ///   have been created for, checked before any quote is touched
     ///
     /// # Returns
     /// * `Vec<MintQuoteResponse<QuoteId>>` - Current states of all quotes in order
     /// * `Error` if any quote doesn't exist
+    ///
+    /// Bounds only emptiness and duplicates, deliberately not the NUT-29 size
+    /// limit: a caller must bound the list with
+    /// [`Mint::validate_batch_quote_ids`] first. Reading `mint_info()` here
+    /// instead would make the HTTP batch route pay that read twice and would
+    /// reorder which error an over-size, duplicated batch gets back.
+    ///
+    /// Takes `expected_method` rather than leaving the caller to check the
+    /// scoping separately, which cost a second read of every quote.
     #[instrument(skip(self))]
     pub async fn check_mint_quotes(
         &self,
         quote_ids: &[QuoteId],
+        expected_method: Option<&PaymentMethod>,
     ) -> Result<Vec<MintQuoteResponse<QuoteId>>, Error> {
         #[cfg(feature = "prometheus")]
         let metrics = super::MintMetricGuard::new("check_mint_quotes");
@@ -633,15 +698,26 @@ impl Mint {
                 return Err(Error::DuplicateQuoteIds);
             }
 
-            let mut responses = Vec::with_capacity(quote_ids.len());
+            let quotes = self
+                .localstore
+                .get_mint_quotes_by_ids(quote_ids)
+                .await?
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or(Error::UnknownQuote)?;
 
-            for quote_id in quote_ids {
-                let mut quote = self
-                    .localstore
-                    .get_mint_quote(quote_id)
-                    .await?
-                    .ok_or(Error::UnknownQuote)?;
+            if let Some(expected_method) = expected_method {
+                if quotes
+                    .iter()
+                    .any(|quote| &quote.payment_method != expected_method)
+                {
+                    return Err(Error::InvalidPaymentMethod);
+                }
+            }
 
+            let mut responses = Vec::with_capacity(quotes.len());
+
+            for mut quote in quotes {
                 self.check_mint_quote_paid(&mut quote).await?;
 
                 responses.push(quote.try_into()?);
@@ -657,6 +733,16 @@ impl Mint {
         }
 
         result
+    }
+
+    /// Enforces the NUT-29 batch bounds on a list of quote ids.
+    ///
+    /// Lives on the mint rather than in a route so every transport gets the
+    /// configured limit, and so it can run before any per-quote database work:
+    /// the callers that follow it load every quote in the list.
+    pub async fn validate_batch_quote_ids(&self, quote_ids: &[QuoteId]) -> Result<(), Error> {
+        let max_batch_size = self.mint_info().await?.nuts.nut29.max_batch_size;
+        check_batch_ids(quote_ids, max_batch_size)
     }
 
     /// Processes a mint request to issue new tokens
@@ -693,15 +779,7 @@ impl Mint {
                     return Err(Error::UnsupportedPaymentMethod);
                 }
 
-                if let Some(max_batch_size) = settings.max_batch_size {
-                    let max = usize::try_from(max_batch_size).unwrap_or(usize::MAX);
-                    if batch.quotes.len() > max {
-                        return Err(Error::BatchSizeExceeded {
-                            actual: batch.quotes.len(),
-                            max,
-                        });
-                    }
-                }
+                check_batch_ids(&batch.quotes, settings.max_batch_size)?;
 
                 Some(settings)
             } else {
@@ -947,7 +1025,8 @@ impl Mint {
                 let batch_operation =
                     Operation::new_batch_mint(outputs_amount.clone().into(), batch_method.clone());
                 tx.add_blinded_messages(None, input.outputs(), &batch_operation)
-                    .await?;
+                    .await
+                    .map_err(Mint::map_add_blinded_messages_error)?;
                 tx.add_blind_signatures(&blinded_secrets, &all_blind_signatures, None)
                     .await?;
                 let fee_by_keyset = std::collections::HashMap::new();
@@ -988,7 +1067,8 @@ impl Mint {
 
                 if !input.is_batch() {
                     tx.add_blinded_messages(Some(quote_id), input.outputs(), &operation)
-                        .await?;
+                        .await
+                        .map_err(Mint::map_add_blinded_messages_error)?;
 
                     tx.add_blind_signatures(
                         &blinded_secrets,
@@ -1063,9 +1143,9 @@ mod batch_mint_tests {
     use async_trait::async_trait;
     use bip39::Mnemonic;
     use cdk_common::amount::SplitTarget;
-    use cdk_common::mint::MintQuote;
+    use cdk_common::mint::{MintQuote, Operation};
     use cdk_common::nut00::KnownMethod;
-    use cdk_common::nuts::PreMintSecrets;
+    use cdk_common::nuts::{BlindedMessage, PreMintSecrets};
     use cdk_common::payment::{
         self, CreateIncomingPaymentResponse, Event, IncomingPaymentOptions, MakePaymentResponse,
         MintPayment, OnchainSettings, OutgoingPaymentOptions, PaymentIdentifier,
@@ -1081,6 +1161,7 @@ mod batch_mint_tests {
     use lightning::offers::offer::Offer;
     use tokio::time::sleep;
 
+    use super::check_batch_ids;
     use crate::mint::payment_backend::MINT_QUOTE_PAYMENT_CHECK_INTERVAL_SECS;
     use crate::mint::verification::MAX_CUSTOM_PAYMENT_METHOD_LEN;
     use crate::mint::{Mint, MintBuilder, MintMeltLimits, MintQuoteRequest};
@@ -1161,7 +1242,7 @@ mod batch_mint_tests {
         }
     }
 
-    async fn create_test_mint() -> Mint {
+    async fn create_test_mint() -> Arc<Mint> {
         create_test_mint_with_onchain_limits(1, 10_000).await
     }
 
@@ -1195,7 +1276,7 @@ mod batch_mint_tests {
         ));
     }
 
-    async fn create_test_mint_with_onchain_limits(onchain_min: u64, onchain_max: u64) -> Mint {
+    async fn create_test_mint_with_onchain_limits(onchain_min: u64, onchain_max: u64) -> Arc<Mint> {
         create_test_mint_with_onchain_limits_and_counter(onchain_min, onchain_max)
             .await
             .0
@@ -1204,7 +1285,7 @@ mod batch_mint_tests {
     async fn create_test_mint_with_onchain_limits_and_counter(
         onchain_min: u64,
         onchain_max: u64,
-    ) -> (Mint, Arc<AtomicUsize>) {
+    ) -> (Arc<Mint>, Arc<AtomicUsize>) {
         let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
 
         let mut mint_builder = MintBuilder::new(db.clone());
@@ -1361,7 +1442,7 @@ mod batch_mint_tests {
     async fn wait_for_quote_paid(mint: &Mint, quote_id: &QuoteId) {
         loop {
             let check = mint
-                .check_mint_quotes(std::slice::from_ref(quote_id))
+                .check_mint_quotes(std::slice::from_ref(quote_id), None)
                 .await
                 .unwrap();
             if let cdk_common::MintQuoteResponse::Bolt11(quote) = &check[0] {
@@ -1384,7 +1465,7 @@ mod batch_mint_tests {
             0,
             PaymentIdentifier::QuoteId(quote_id.clone()),
             None,
-            Amount::new(paid_amount, CurrencyUnit::Sat),
+            Amount::new(0, CurrencyUnit::Sat),
             Amount::new(0, CurrencyUnit::Sat),
             PaymentMethod::Known(KnownMethod::Onchain),
             now,
@@ -1531,6 +1612,130 @@ mod batch_mint_tests {
 
         assert!(
             matches!(err, Error::AmountOutofLimitRange(_, _, _)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Store outputs the way a swap or melt does before it signs them, leaving
+    /// them reserved with no signature
+    async fn reserve_outputs_without_signing(mint: &Mint, outputs: &[BlindedMessage]) {
+        let mut tx = mint.localstore().begin_transaction().await.unwrap();
+        tx.add_blinded_messages(
+            None,
+            outputs,
+            &Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn paid_mint_quote(mint: &Mint, amount: u64) -> QuoteId {
+        let quote: MintQuoteBolt11Response<QuoteId> = mint
+            .get_mint_quote(
+                MintQuoteBolt11Request {
+                    amount: Amount::from(amount),
+                    unit: CurrencyUnit::Sat,
+                    description: None,
+                    pubkey: None,
+                }
+                .into(),
+            )
+            .await
+            .unwrap()
+            .try_into()
+            .unwrap();
+        wait_for_quote_paid(mint, &quote.quote).await;
+        quote.quote
+    }
+
+    #[tokio::test]
+    async fn test_mint_rejects_outputs_pending_in_another_request() {
+        let mint = create_test_mint().await;
+        let quote_id = paid_mint_quote(&mint, 64).await;
+
+        let request = mint_request_for_amount(&mint, quote_id, 64);
+        reserve_outputs_without_signing(&mint, &request.outputs).await;
+
+        let err = mint
+            .process_mint_request(crate::mint::MintInput::Single(request))
+            .await
+            .expect_err("outputs reserved by another request must be rejected");
+
+        assert!(
+            matches!(err, Error::OutputsPending),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_mint_rejects_outputs_pending_in_another_request() {
+        let mint = create_test_mint().await;
+        let quotes = vec![
+            paid_mint_quote(&mint, 32).await,
+            paid_mint_quote(&mint, 32).await,
+        ];
+
+        let outputs = mint_request_for_amount(&mint, quotes[0].clone(), 64).outputs;
+        reserve_outputs_without_signing(&mint, &outputs).await;
+
+        let err = mint
+            .process_mint_request(crate::mint::MintInput::Batch(BatchMintRequest {
+                quotes,
+                quote_amounts: None,
+                outputs,
+                signatures: None,
+            }))
+            .await
+            .expect_err("outputs reserved by another request must be rejected");
+
+        assert!(
+            matches!(err, Error::OutputsPending),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mint_rejects_outputs_signed_by_earlier_request() {
+        let mint = create_test_mint().await;
+
+        let mut quote_ids = Vec::new();
+        for _ in 0..2 {
+            let quote: MintQuoteBolt11Response<QuoteId> = mint
+                .get_mint_quote(
+                    MintQuoteBolt11Request {
+                        amount: Amount::from(64),
+                        unit: CurrencyUnit::Sat,
+                        description: None,
+                        pubkey: None,
+                    }
+                    .into(),
+                )
+                .await
+                .unwrap()
+                .try_into()
+                .unwrap();
+            wait_for_quote_paid(&mint, &quote.quote).await;
+            quote_ids.push(quote.quote);
+        }
+
+        let first_request = mint_request_for_amount(&mint, quote_ids[0].clone(), 64);
+        let reused_outputs = first_request.outputs.clone();
+        mint.process_mint_request(crate::mint::MintInput::Single(first_request))
+            .await
+            .expect("first mint request should succeed");
+
+        let err = mint
+            .process_mint_request(crate::mint::MintInput::Single(MintRequest {
+                quote: quote_ids[1].clone(),
+                outputs: reused_outputs,
+                signature: None,
+            }))
+            .await
+            .expect_err("outputs signed by an earlier request must be rejected");
+
+        assert!(
+            matches!(err, Error::BlindedMessageAlreadySigned),
             "unexpected error: {err:?}"
         );
     }
@@ -1927,7 +2132,7 @@ mod batch_mint_tests {
         assert!(matches!(result.unwrap_err(), Error::IssuedQuote));
 
         let statuses = mint
-            .check_mint_quotes(&[quote1.quote.clone(), quote2.quote.clone()])
+            .check_mint_quotes(&[quote1.quote.clone(), quote2.quote.clone()], None)
             .await
             .unwrap();
 
@@ -1952,6 +2157,49 @@ mod batch_mint_tests {
 
         assert_eq!(quote1_status, MintQuoteState::Issued);
         assert_eq!(quote2_status, MintQuoteState::Paid);
+    }
+
+    /// Over-size must win over a duplicate, so consolidating the check does not
+    /// change what a request violating both bounds at once gets back.
+    #[test]
+    fn check_batch_ids_rejects_in_the_order_the_http_routes_always_have() {
+        let one = QuoteId::new();
+        let two = QuoteId::new();
+
+        assert!(matches!(
+            check_batch_ids(&[], Some(2)),
+            Err(Error::UnknownQuote)
+        ));
+        assert!(matches!(
+            check_batch_ids(&[one.clone(), two.clone()], Some(1)),
+            Err(Error::BatchSizeExceeded { actual: 2, max: 1 })
+        ));
+        assert!(matches!(
+            check_batch_ids(&[one.clone(), one.clone()], Some(2)),
+            Err(Error::DuplicateQuoteIds)
+        ));
+        assert!(matches!(
+            check_batch_ids(&[one.clone(), one.clone()], Some(1)),
+            Err(Error::BatchSizeExceeded { actual: 2, max: 1 })
+        ));
+        assert!(check_batch_ids(&[one.clone(), two], Some(2)).is_ok());
+        assert!(check_batch_ids(&[one], None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_batch_quote_ids_reads_the_configured_limit() {
+        let mint = create_test_mint().await;
+        configure_nut29(&mint, Some(1), None).await;
+
+        assert!(matches!(
+            mint.validate_batch_quote_ids(&[QuoteId::new(), QuoteId::new()])
+                .await,
+            Err(Error::BatchSizeExceeded { actual: 2, max: 1 })
+        ));
+        assert!(mint
+            .validate_batch_quote_ids(&[QuoteId::new()])
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

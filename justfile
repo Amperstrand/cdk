@@ -7,6 +7,14 @@ alias t := test
 default:
   @just --list
 
+# Prepare and sign a local JJ merge; message and local checks are optional.
+merge +args:
+  bash misc/merge.sh "$@"
+
+# Test local merge tooling (nix develop .#merge-tools).
+test-merge:
+  python3 -B -m unittest discover -s misc/tests -p 'test_merge*.py'
+
 # Enter a Nix development shell without copying ignored files from JJ workspaces.
 develop shell="stable":
   #!/usr/bin/env bash
@@ -109,8 +117,12 @@ attic-push:
   targets=(
     '.#default'
     '.#deps'
+    '.#deps-ci'
+    '.#itest-deps-ci'
     '.#deps-msrv'
     '.#itest-archive'
+    '.#nutshell-archive'
+    '.#nutshell-mintd'
     '.#start-fake-mint'
     '.#start-regtest-mints'
     '.#start-fake-auth-mint'
@@ -266,6 +278,10 @@ coverage:
   echo "Running NIP-17 inbox e2e tests coverage..."
   cargo llvm-cov --no-report -p cdk-integration-tests --test nip17_inbox_e2e
 
+  echo "Running MintConnector parity suites coverage..."
+  cargo llvm-cov --no-report -p cdk-integration-tests --test mint_connector_direct
+  cargo llvm-cov --no-report -p cdk-integration-tests --test mint_connector_http
+
   # Generate report
   echo "Generating coverage report..."
   cargo llvm-cov report --lcov --output-path lcov.info
@@ -287,6 +303,8 @@ test-pure db="memory":
     run_test nwc_e2e -j 1
     if [ "{{db}}" = memory ]; then
       run_test nip17_inbox_e2e -j 1
+      run_test mint_connector_direct -j 1
+      run_test mint_connector_http -j 1
     fi
   else
     # Run pure integration tests (cargo test will only build what's needed for the test)
@@ -302,6 +320,8 @@ test-pure db="memory":
     CDK_TEST_DB_TYPE={{db}} cargo test -p cdk-integration-tests --test nwc_e2e -- --test-threads 1
     if [ "{{db}}" = memory ]; then
       cargo test -p cdk-integration-tests --test nip17_inbox_e2e -- --test-threads 1
+      cargo test -p cdk-integration-tests --test mint_connector_direct -- --test-threads 1
+      cargo test -p cdk-integration-tests --test mint_connector_http -- --test-threads 1
     fi
   fi
 
@@ -484,6 +504,7 @@ mutants-check CRATE:
 test-nutshell:
   #!/usr/bin/env bash
   set -euo pipefail
+  source ./misc/itest_helpers.sh
 
   # Function to cleanup docker containers
   cleanup() {
@@ -540,14 +561,14 @@ test-nutshell:
   # Nutshell's SQLite backend, which can cause transient lock-acquisition
   # failures under parallel load.
   echo "Running happy_path_mint_wallet test..."
-  if ! cargo test -p cdk-integration-tests --test happy_path_mint_wallet -- --test-threads=1; then
+  if ! run_test happy_path_mint_wallet -- --test-threads=1; then
     echo "ERROR: happy_path_mint_wallet test failed"
     test_exit_code=1
   fi
 
   # Run second test and capture exit code
   echo "Running test_fees test..."
-  if ! cargo test -p cdk-integration-tests --test test_fees -- --test-threads=1; then
+  if ! run_test test_fees -- --test-threads=1; then
     echo "ERROR: test_fees test failed"
     test_exit_code=1
   fi
@@ -632,6 +653,7 @@ update-msrv-lock:
         cargo_update icu_normalizer --precise 2.0.1
         cargo_update icu_provider --precise 2.1.1
         cargo_update icu_locale_core --precise 2.1.1
+        cargo_update psm --precise 0.1.27
         cp "$lock_dir/Cargo.lock" Cargo.lock.msrv
         echo "Updated Cargo.lock.msrv for MSRV 1.85.0"
     '
@@ -766,6 +788,7 @@ check-wasm *ARGS="--target wasm32-unknown-unknown":
     "-p cdk --no-default-features"
     "-p cdk --no-default-features --features wallet"
     "-p cdk --no-default-features --features mint"
+    "-p cdk-common"
   )
 
   for arg in "${buildargs[@]}"; do
@@ -773,6 +796,31 @@ check-wasm *ARGS="--target wasm32-unknown-unknown":
     cargo check $arg {{ARGS}}
     echo
   done
+
+# Run the cdk-common wasm unit tests under Node. The flake provides the matching
+# wasm-bindgen-cli, so run this from `nix develop`.
+test-wasm *ARGS:
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  if [ ! -f Cargo.toml ]; then
+    cd {{invocation_directory()}}
+  fi
+
+  wanted=$(cargo pkgid wasm-bindgen | sed 's/.*[@#]//')
+  have=$(wasm-bindgen --version 2>/dev/null | awk '{print $2}' || true)
+
+  if [ "$have" != "$wanted" ]; then
+    echo "need wasm-bindgen-cli $wanted, found ${have:-none}." >&2
+    echo "The flake pins a matching one; run this inside the Nix environment:" >&2
+    echo "  nix develop .#stable --command just test-wasm" >&2
+    echo "Or run the sandboxed check directly:" >&2
+    echo "  nix build -L .#checks.x86_64-linux.wasm-cdk-common-tests" >&2
+    exit 1
+  fi
+
+  export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+  cargo test -p cdk-common --lib --target wasm32-unknown-unknown {{ARGS}}
 
 # Publish release crates; --skip-ci overrides the green-CI requirement.
 release *ARGS:
@@ -1097,6 +1145,7 @@ ffi-test: ffi-generate-python
   python3 crates/cdk-ffi/tests/test_transactions.py
   python3 crates/cdk-ffi/tests/test_kvstore.py
   python3 crates/cdk-ffi/tests/test_rate_limit.py
+  python3 crates/cdk-ffi/tests/test_payment_request.py
   echo "✅ Tests completed!"
 
 # Build debug version and generate Python bindings quickly (for development)

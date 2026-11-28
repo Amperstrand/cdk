@@ -22,9 +22,11 @@ pub const PAYMENT_PROCESSOR_PROTOCOL_VERSION: &str = "4.0.0";
 #[cfg(feature = "grpc")]
 pub mod grpc;
 
+pub mod bitcoin_uri;
 pub mod common;
 pub mod database;
 pub mod error;
+pub mod event;
 pub mod melt;
 #[cfg(feature = "mint")]
 pub mod mint;

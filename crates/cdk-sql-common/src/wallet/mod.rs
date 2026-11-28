@@ -148,6 +148,13 @@ impl<RM> WalletDatabase<database::Error> for SQLWalletDatabase<RM>
 where
     RM: DatabasePool + 'static,
 {
+    async fn close(&self) -> Result<(), Error> {
+        self.pool
+            .close()
+            .await
+            .map_err(|error| Error::Database(Box::new(error)))
+    }
+
     #[instrument(skip(self))]
     async fn get_melt_quotes(&self) -> Result<Vec<wallet::MeltQuote>, database::Error> {
         let conn = self
@@ -430,7 +437,9 @@ where
             WHERE
                 amount_issued = 0
                 OR
-                payment_method = 'bolt12'
+                amount_paid > amount_issued
+                OR
+                payment_method <> 'bolt11'
             "#,
         )?
         .fetch_all(&*conn)
@@ -676,7 +685,7 @@ where
             .get()
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
-        Ok(query(
+        let rows = query(
             r#"
             SELECT
                 mint_url,
@@ -684,7 +693,6 @@ where
                 unit,
                 amount,
                 fee,
-                ys,
                 timestamp,
                 memo,
                 metadata,
@@ -693,18 +701,21 @@ where
                 payment_proof,
                 payment_method,
                 saga_id,
-                status
+                status,
+                transactions.id,
+                transaction_ys.y
             FROM
                 transactions
+            LEFT JOIN transaction_ys ON transaction_ys.transaction_id = transactions.id
             WHERE
-                id = :id
+                transactions.id = :id
+            ORDER BY transaction_ys.position
             "#,
         )?
         .bind("id", transaction_id.as_slice().to_vec())
-        .fetch_one(&*conn)
-        .await?
-        .map(sql_row_to_transaction)
-        .transpose()?)
+        .fetch_all(&*conn)
+        .await?;
+        Ok(sql_rows_to_transactions(rows, false)?.into_iter().next())
     }
 
     #[instrument(skip(self))]
@@ -720,7 +731,7 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
-        Ok(query(
+        let rows = query(
             r#"
             SELECT
                 mint_url,
@@ -728,7 +739,6 @@ where
                 unit,
                 amount,
                 fee,
-                ys,
                 timestamp,
                 memo,
                 metadata,
@@ -737,24 +747,21 @@ where
                 payment_proof,
                 payment_method,
                 saga_id,
-                status
+                status,
+                transactions.id,
+                transaction_ys.y
             FROM
                 transactions
+            LEFT JOIN transaction_ys ON transaction_ys.transaction_id = transactions.id
+            ORDER BY transactions.id, transaction_ys.position
             "#,
         )?
         .fetch_all(&*conn)
-        .await?
-        .into_iter()
-        .filter_map(|row| {
-            // TODO: Avoid a table scan by passing the heavy lifting of checking to the DB engine
-            let transaction = sql_row_to_transaction(row).ok()?;
-            if transaction.matches_conditions(&mint_url, &direction, &unit) {
-                Some(transaction)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>())
+        .await?;
+        Ok(sql_rows_to_transactions(rows, true)?
+            .into_iter()
+            .filter(|transaction| transaction.matches_conditions(&mint_url, &direction, &unit))
+            .collect())
     }
 
     async fn update_proofs(
@@ -902,20 +909,16 @@ where
         let unit = transaction.unit.to_string();
         let amount = i64::try_from(u64::from(transaction.amount))?;
         let fee = i64::try_from(u64::from(transaction.fee))?;
-        let ys = transaction
-            .ys
-            .iter()
-            .flat_map(|y| y.to_bytes().to_vec())
-            .collect::<Vec<_>>();
+        let tx = ConnectionWithTransaction::new(conn).await?;
 
         let id = transaction.id();
 
         query(
                r#"
    INSERT INTO transactions
-   (id, mint_url, direction, unit, amount, fee, ys, timestamp, memo, metadata, quote_id, payment_request, payment_proof, payment_method, saga_id, status)
+   (id, mint_url, direction, unit, amount, fee, timestamp, memo, metadata, quote_id, payment_request, payment_proof, payment_method, saga_id, status)
    VALUES
-   (:id, :mint_url, :direction, :unit, :amount, :fee, :ys, :timestamp, :memo, :metadata, :quote_id, :payment_request, :payment_proof, :payment_method, :saga_id, :status)
+   (:id, :mint_url, :direction, :unit, :amount, :fee, :timestamp, :memo, :metadata, :quote_id, :payment_request, :payment_proof, :payment_method, :saga_id, :status)
    ON CONFLICT(id) DO UPDATE SET
        mint_url = excluded.mint_url,
        direction = excluded.direction,
@@ -940,7 +943,6 @@ where
            .bind("unit", unit)
            .bind("amount", amount)
            .bind("fee", fee)
-           .bind("ys", ys)
            .bind("timestamp", i64::try_from(transaction.timestamp)?)
            .bind("memo", transaction.memo)
            .bind(
@@ -953,9 +955,34 @@ where
            .bind("payment_method", transaction.payment_method.map(|pm| pm.to_string()))
            .bind("saga_id", transaction.saga_id.map(|id| id.to_string()))
            .bind("status", transaction.status.to_string())
-           .execute(&*conn)
+           .execute(&tx)
            .await?;
 
+        query("DELETE FROM transaction_ys WHERE transaction_id = :id")?
+            .bind("id", id.as_slice().to_vec())
+            .execute(&tx)
+            .await?;
+        // Three parameters per row keep each batch below SQLite's legacy
+        // 999-parameter limit while reducing PostgreSQL round trips.
+        const BATCH_SIZE: usize = 300;
+        for (batch_index, ys) in transaction.ys.chunks(BATCH_SIZE).enumerate() {
+            let values = (0..ys.len())
+                .map(|index| format!("(:id_{index}, :position_{index}, :y_{index})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = query(&format!(
+                "INSERT INTO transaction_ys (transaction_id, position, y) VALUES {values}"
+            ))?;
+            for (index, y) in ys.iter().enumerate() {
+                let position = batch_index * BATCH_SIZE + index;
+                statement = statement
+                    .bind(format!("id_{index}"), id.as_slice().to_vec())
+                    .bind(format!("position_{index}"), i64::try_from(position)?)
+                    .bind(format!("y_{index}"), y.to_bytes().to_vec());
+            }
+            statement.execute(&tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1054,6 +1081,44 @@ where
         .ok_or_else(|| Error::Internal("Derivation counter update returned no value".to_owned()))?;
 
         Ok(new_counter)
+    }
+
+    #[instrument(skip(self))]
+    async fn reserve_derivation_index(
+        &self,
+        namespace: &str,
+        minimum_index: u32,
+    ) -> Result<u32, database::Error> {
+        let next = minimum_index
+            .checked_add(1)
+            .ok_or(database::Error::AmountOverflow)?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Database(Box::new(e)))?;
+        let counter: u32 = query(
+            r#"
+            INSERT INTO derivation_counter (namespace, counter)
+            VALUES (:namespace, :next)
+            ON CONFLICT(namespace) DO UPDATE SET counter = CASE
+                WHEN derivation_counter.counter < :next THEN :next
+                ELSE derivation_counter.counter + 1 END
+            WHERE derivation_counter.counter < :maximum
+            RETURNING counter
+            "#,
+        )?
+        .bind("namespace", namespace.to_owned())
+        .bind("next", next)
+        .bind("maximum", u32::MAX)
+        .pluck(&*conn)
+        .await?
+        .map(|n| Ok::<_, Error>(column_as_number!(n)))
+        .transpose()?
+        .ok_or(database::Error::AmountOverflow)?;
+        counter
+            .checked_sub(1)
+            .ok_or(database::Error::AmountOverflow)
     }
 
     #[instrument(skip(self, mint_info))]
@@ -1442,11 +1507,20 @@ where
             .await
             .map_err(|e| Error::Database(Box::new(e)))?;
 
+        let tx = ConnectionWithTransaction::new(conn).await?;
+        // Lock the parent row before its points, matching `add_transaction`'s
+        // lock order so concurrent updates and deletions cannot deadlock.
         query(r#"DELETE FROM transactions WHERE id=:id"#)?
             .bind("id", transaction_id.as_slice().to_vec())
-            .execute(&*conn)
+            .execute(&tx)
+            .await?;
+        // Cascading deletes are not guaranteed when SQLite foreign keys are disabled.
+        query("DELETE FROM transaction_ys WHERE transaction_id = :id")?
+            .bind("id", transaction_id.as_slice().to_vec())
+            .execute(&tx)
             .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2305,7 +2379,57 @@ fn sql_row_to_wallet_saga(row: Vec<Column>) -> Result<wallet::WalletSaga, Error>
     })
 }
 
-fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
+// Both transaction queries use one join, avoiding a separate query per transaction.
+fn sql_rows_to_transactions(
+    rows: Vec<Vec<Column>>,
+    skip_invalid: bool,
+) -> Result<Vec<Transaction>, Error> {
+    let mut transactions: Vec<Result<Transaction, Error>> = Vec::new();
+    let mut indices = HashMap::new();
+    for mut row in rows {
+        let y = row
+            .pop()
+            .ok_or_else(|| Error::Internal("Missing transaction point column".to_owned()))?;
+        let id = row
+            .pop()
+            .ok_or_else(|| Error::Internal("Missing transaction ID column".to_owned()))?;
+        let id = column_as_binary!(id);
+        let index = match indices.get(&id) {
+            Some(index) => *index,
+            None => {
+                let index = transactions.len();
+                transactions.push(sql_row_to_transaction(row, Vec::new()));
+                indices.insert(id, index);
+                index
+            }
+        };
+        if let Ok(transaction) = &mut transactions[index] {
+            let point = (|| -> Result<Option<PublicKey>, Error> {
+                Ok(column_as_nullable_binary!(y)
+                    .map(|bytes| PublicKey::from_slice(&bytes))
+                    .transpose()?)
+            })();
+            match point {
+                Ok(Some(y)) => transaction.ys.push(y),
+                Ok(None) => {}
+                // Discard the whole transaction, including previously decoded points.
+                Err(error) => transactions[index] = Err(error),
+            }
+        }
+    }
+    transactions
+        .into_iter()
+        .filter_map(|transaction| match transaction {
+            Err(error) if skip_invalid => {
+                tracing::warn!(%error, "Skipping malformed wallet transaction");
+                None
+            }
+            result => Some(result),
+        })
+        .collect()
+}
+
+fn sql_row_to_transaction(row: Vec<Column>, ys: Vec<PublicKey>) -> Result<Transaction, Error> {
     unpack_into!(
         let (
             mint_url,
@@ -2313,7 +2437,6 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
             unit,
             amount,
             fee,
-            ys,
             timestamp,
             memo,
             metadata,
@@ -2339,10 +2462,7 @@ fn sql_row_to_transaction(row: Vec<Column>) -> Result<Transaction, Error> {
         unit: column_as_string!(unit, CurrencyUnit::from_str),
         amount: Amount::from(amount),
         fee: Amount::from(fee),
-        ys: column_as_binary!(ys)
-            .chunks(33)
-            .map(PublicKey::from_slice)
-            .collect::<Result<Vec<_>, _>>()?,
+        ys,
         timestamp: column_as_number!(timestamp),
         memo: column_as_nullable_string!(memo),
         metadata: column_as_nullable_string!(metadata, |v| serde_json::from_str(&v).ok(), |v| {

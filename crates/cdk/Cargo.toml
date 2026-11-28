@@ -79,7 +79,6 @@ ring = { version = "0.17.14", features = ["wasm32_unknown_unknown_js"] }
 rustls = { workspace = true, optional = true }
 
 uuid = { workspace = true, features = ["js"] }
-gloo-timers = { workspace = true }
 
 [[example]]
 name = "mint-token"
@@ -185,7 +184,7 @@ required-features = ["wallet"]
 rusqlite = { version = "0.31", default-features = false }
 rand.workspace = true
 cdk-sqlite.workspace = true
-cdk-postgres.workspace = true
+cdk-sql-common.workspace = true
 cdk-fake-wallet.workspace = true
 bip39.workspace = true
 tracing-subscriber.workspace = true

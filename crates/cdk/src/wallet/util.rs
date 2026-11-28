@@ -14,7 +14,7 @@ use crate::nuts::nut10::Kind;
 use crate::nuts::{Conditions, Proof, Proofs, PublicKey, SecretKey};
 use crate::util::hex;
 use crate::wallet::Wallet;
-use crate::{Error, SECP256K1};
+use crate::Error;
 
 /// Render a value without allowing terminal controls to reach a log sink.
 pub(crate) fn escape_log_value<T>(value: &T) -> String
@@ -105,7 +105,7 @@ pub(crate) fn sign_proofs(
 
     let key_map: HashMap<XOnlyPublicKey, &SecretKey> = p2pk_signing_keys
         .iter()
-        .map(|s| (s.x_only_public_key(&SECP256K1).0, s))
+        .map(|s| (s.x_only_public_key().0, s))
         .collect();
 
     for proof in proofs.iter_mut() {
@@ -148,6 +148,11 @@ pub(crate) fn sign_proofs(
         }
 
         let ephemeral_key = proof.p2pk_e;
+        if ephemeral_key.is_some() {
+            if let Some(last_index) = pubkeys.len().checked_sub(1) {
+                p2bk_slot(secret.kind(), last_index)?;
+            }
+        }
         let mut signed_with_ephemeral_key = false;
         for (i, pubkey) in pubkeys.iter().enumerate() {
             let already_signed = proof
@@ -163,11 +168,8 @@ pub(crate) fn sign_proofs(
                 continue;
             }
 
-            let slot = match secret.kind() {
-                Kind::P2PK => i as u8,
-                Kind::HTLC => (i + 1) as u8,
-            };
             if let Some(ephemeral_key) = ephemeral_key {
+                let slot = p2bk_slot(secret.kind(), i)?;
                 for signing_key in key_map.values() {
                     if let Ok(r) = crate::nuts::nut28::ecdh_kdf(signing_key, &ephemeral_key, slot) {
                         if let Ok(derived_key) =
@@ -190,6 +192,23 @@ pub(crate) fn sign_proofs(
     }
 
     Ok(())
+}
+
+/// Convert a key's position to a valid NUT-28 slot.
+pub(crate) fn p2bk_slot(kind: Kind, index: usize) -> Result<u8, Error> {
+    let slot = match kind {
+        Kind::P2PK => index,
+        Kind::HTLC => index.saturating_add(1),
+    };
+    let invalid_slot = || {
+        Error::NUT11(crate::nuts::nut11::Error::TooManyPubkeys {
+            slots: slot.saturating_add(1),
+        })
+    };
+    if slot >= crate::nuts::nut10::MAX_LOCKING_SLOTS {
+        return Err(invalid_slot());
+    }
+    u8::try_from(slot).map_err(|_| invalid_slot())
 }
 
 /// Verify the spending witness on every P2PK/HTLC-locked proof.
@@ -221,10 +240,7 @@ pub(crate) async fn merge_keyring_keys(
     explicit_keys: &[SecretKey],
 ) -> Result<Vec<SecretKey>, Error> {
     let mut keys = explicit_keys.to_vec();
-    let covered: HashSet<XOnlyPublicKey> = keys
-        .iter()
-        .map(|k| k.x_only_public_key(&SECP256K1).0)
-        .collect();
+    let covered: HashSet<XOnlyPublicKey> = keys.iter().map(|k| k.x_only_public_key().0).collect();
 
     let pubkeys = collect_p2pk_pubkeys(proofs)?;
     for pubkey in pubkeys {
@@ -396,6 +412,55 @@ mod tests {
     }
 
     #[test]
+    fn p2bk_slot_checks_boundaries() {
+        assert_eq!(p2bk_slot(Kind::P2PK, 0).unwrap(), 0);
+        assert_eq!(p2bk_slot(Kind::P2PK, 10).unwrap(), 10);
+        assert_eq!(p2bk_slot(Kind::HTLC, 0).unwrap(), 1);
+        assert_eq!(p2bk_slot(Kind::HTLC, 9).unwrap(), 10);
+        for index in [11, 255, 256, usize::MAX] {
+            assert!(p2bk_slot(Kind::P2PK, index).is_err());
+        }
+        for index in [10, 254, 255, usize::MAX] {
+            assert!(p2bk_slot(Kind::HTLC, index).is_err());
+        }
+    }
+
+    #[test]
+    fn sign_proofs_rejects_excess_p2bk_slots_only() {
+        let signing_key = SecretKey::generate();
+        let pubkey = SecretKey::generate().public_key();
+        for kind in [Kind::P2PK, Kind::HTLC] {
+            for key_count in [11, 256] {
+                let mut tag = vec!["pubkeys".to_string()];
+                tag.extend((0..key_count).map(|_| pubkey.to_string()));
+                let data = match kind {
+                    Kind::P2PK => pubkey.to_string(),
+                    Kind::HTLC => "00".repeat(32),
+                };
+                let secret = serde_json::json!([kind, {
+                    "nonce": "test",
+                    "data": data,
+                    "tags": [tag]
+                }]);
+                let mut proof = make_plain_proof();
+                proof.secret = crate::secret::Secret::new(secret.to_string());
+                let mut proofs = vec![proof];
+                sign_proofs(&mut proofs, std::slice::from_ref(&signing_key)).unwrap();
+
+                proofs[0].p2pk_e = Some(SecretKey::generate().public_key());
+                assert!(matches!(
+                    sign_proofs(&mut proofs, std::slice::from_ref(&signing_key)),
+                    Err(Error::NUT11(
+                        crate::nuts::nut11::Error::TooManyPubkeys { .. }
+                    ))
+                ));
+                assert!(proofs[0].witness.is_none());
+                assert!(proofs[0].p2pk_e.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn sign_proofs_with_wrong_key_leaves_proof_unchanged() {
         let pubkey = SecretKey::generate().public_key();
         let wrong_key = SecretKey::generate();
@@ -435,5 +500,55 @@ mod tests {
         let token_str = "cashuAeyJ0b2tlbiI6W3sicHJvb2ZzIjpbeyJhbW91bnQiOjIsInNlY3JldCI6ImI2Zjk1ODIxYmZlNjUyYjYwZGQ2ZjYwMDU4N2UyZjNhOTk4MzVhMGMyNWI4MTQzODNlYWIwY2QzOWFiNDFjNzUiLCJDIjoiMDI1YWU4ZGEyOTY2Y2E5OGVmYjA5ZDcwOGMxM2FiZmEwZDkxNGUwYTk3OTE4MmFjMzQ4MDllMjYxODY5YTBhNDJlIiwicmVzZXJ2ZWQiOmZhbHNlLCJpZCI6IjAwOWExZjI5MzI1M2U0MWUifSx7ImFtb3VudCI6Miwic2VjcmV0IjoiZjU0Y2JjNmNhZWZmYTY5MTUyOTgyM2M1MjU1MDkwYjRhMDZjNGQ3ZDRjNzNhNDFlZTFkNDBlM2ExY2EzZGZhNyIsIkMiOiIwMjMyMTIzN2JlYjcyMWU3NGI1NzcwNWE5MjJjNjUxMGQwOTYyYzAzNzlhZDM0OTJhMDYwMDliZTAyNjA5ZjA3NTAiLCJyZXNlcnZlZCI6ZmFsc2UsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSJ9LHsiYW1vdW50IjoxLCJzZWNyZXQiOiJhNzdhM2NjODY4YWM4ZGU3YmNiOWMxMzJmZWI3YzEzMDY4Nzg3ODk5Yzk3YTk2NWE2ZThkZTFiMzliMmQ2NmQ3IiwiQyI6IjAzMTY0YTMxNWVhNjM0NGE5NWI2NzM1NzBkYzg0YmZlMTQ2NDhmMTQwM2EwMDJiZmJlMDhlNWFhMWE0NDQ0YWE0MCIsInJlc2VydmVkIjpmYWxzZSwiaWQiOiIwMDlhMWYyOTMyNTNlNDFlIn1dLCJtaW50IjoiaHR0cHM6Ly90ZXN0bnV0LmNhc2h1LnNwYWNlIn1dLCJ1bml0Ijoic2F0In0=";
 
         assert_eq!(token, token_str)
+    }
+
+    #[test]
+    fn sign_proofs_derives_htlc_example_proof_keys_from_slots_1_and_2() {
+        // NUT-28 HTLC example proof (cashubtc/nuts#402): the hash lock
+        // occupies slot 0 unblinded, the `pubkeys` key blinds at slot 1 and
+        // the `refund` key at slot 2. A regression that numbers HTLC keys
+        // from slot 0 fails to derive either key, so the proof is left
+        // unsigned.
+        let receiver_key = crate::nuts::SecretKey::from_hex(
+            "ad37e8abd800be3e8272b14045873f4353327eedeb702b72ddcc5c5adff5129c",
+        )
+        .unwrap();
+        let ephemeral_key = crate::nuts::SecretKey::from_hex(
+            "1cedb9df0c6872188b560ace9e35fd55c2532d53e19ae65b46159073886482ca",
+        )
+        .unwrap();
+
+        let secret = crate::secret::Secret::from_str(
+            "[\"HTLC\",{\"nonce\":\"8b1f18aa85a2787903cfdc776fde0b8555bdb126eea02b05cd84de06a4f4b551\",\"data\":\"ec4916dd28fc4c10d78e287ca5d9cc51ee1ae73cbfde08c6b37324cbfaac8bc5\",\"tags\":[[\"pubkeys\",\"0352fb6d93360b7c2538eedf3c861f32ea5883fceec9f3e573d9d84377420da838\"],[\"locktime\",\"1689418329\"],[\"refund\",\"03667361ca925065dcafea0a705ba49e75bdd7975751fcc933e05953463c79fff1\"]]}]",
+        )
+        .unwrap();
+        let mut proof = Proof::new(
+            Amount::from(64),
+            Id::from_str("009a1f293253e41e").unwrap(),
+            secret,
+            PublicKey::from_hex(
+                "0270aba098c920adafa1ce75acefb06d8cc541ef80270f70cc7b66375b789ed9be",
+            )
+            .unwrap(),
+        );
+        proof.p2pk_e = Some(ephemeral_key.public_key());
+        let mut proofs = vec![proof];
+
+        sign_proofs(&mut proofs, &[receiver_key]).unwrap();
+
+        // The receiver-only ephemeral-key metadata is stripped.
+        assert!(proofs[0].witness.is_some());
+        assert!(proofs[0].p2pk_e.is_none());
+
+        // Without a preimage, the expired locktime requires the slot 2
+        // refund signature produced by sign_proofs.
+        assert!(proofs[0].verify_htlc().is_ok());
+
+        // With the valid preimage, verification requires the slot 1
+        // receiver signature instead.
+        proofs[0].add_preimage(
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        );
+        assert!(proofs[0].verify_htlc().is_ok());
     }
 }

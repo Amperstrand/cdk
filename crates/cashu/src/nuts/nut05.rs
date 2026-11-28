@@ -2,6 +2,7 @@
 //!
 //! <https://github.com/cashubtc/nuts/blob/main/05.md>
 
+use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -15,6 +16,7 @@ use super::ProofsMethods;
 use crate::nut00::KnownMethod;
 #[cfg(feature = "mint")]
 use crate::quote_id::QuoteId;
+use crate::util::serde_helpers::deserialize_empty_map_as_null;
 use crate::Amount;
 
 /// NUT05 Error
@@ -267,13 +269,8 @@ impl Serialize for MeltMethodSettings {
         if self.method_name.is_some() {
             num_fields += 1;
         }
-
-        let mut amountless_in_top_level = false;
-        if let Some(MeltMethodOptions::Bolt11 { amountless }) = &self.options {
-            if *amountless {
-                num_fields += 1;
-                amountless_in_top_level = true;
-            }
+        if self.options.is_some() {
+            num_fields += 1;
         }
 
         let mut state = serializer.serialize_struct("MeltMethodSettings", num_fields)?;
@@ -293,9 +290,8 @@ impl Serialize for MeltMethodSettings {
             state.serialize_field("max_amount", max_amount)?;
         }
 
-        // If there's an amountless flag in Bolt11 options, add it at the top level
-        if amountless_in_top_level {
-            state.serialize_field("amountless", &true)?;
+        if let Some(options) = &self.options {
+            state.serialize_field("options", options)?;
         }
 
         state.end()
@@ -303,6 +299,17 @@ impl Serialize for MeltMethodSettings {
 }
 
 struct MeltMethodSettingsVisitor;
+
+/// Recognized keys checked for duplicates; unknown keys are ignored
+const MELT_METHOD_SETTINGS_FIELDS: &[&str] = &[
+    "method",
+    "unit",
+    "method_name",
+    "min_amount",
+    "max_amount",
+    "amountless",
+    "options",
+];
 
 impl<'de> Visitor<'de> for MeltMethodSettingsVisitor {
     type Value = MeltMethodSettings;
@@ -322,42 +329,37 @@ impl<'de> Visitor<'de> for MeltMethodSettingsVisitor {
         let mut max_amount: Option<Amount> = None;
         let mut amountless: Option<bool> = None;
 
+        // Recognized keys seen so far, so repeated keys are rejected even when a
+        // value is `null`
+        let mut seen_fields: HashSet<&'static str> = HashSet::new();
+
         while let Some(key) = map.next_key::<String>()? {
+            if let Some(field) = MELT_METHOD_SETTINGS_FIELDS
+                .iter()
+                .find(|field| **field == key)
+            {
+                if !seen_fields.insert(field) {
+                    return Err(de::Error::duplicate_field(field));
+                }
+            }
+
             match key.as_str() {
                 "method" => {
-                    if method.is_some() {
-                        return Err(de::Error::duplicate_field("method"));
-                    }
                     method = Some(map.next_value()?);
                 }
                 "unit" => {
-                    if unit.is_some() {
-                        return Err(de::Error::duplicate_field("unit"));
-                    }
                     unit = Some(map.next_value()?);
                 }
                 "method_name" => {
-                    if method_name.is_some() {
-                        return Err(de::Error::duplicate_field("method_name"));
-                    }
                     method_name = map.next_value()?;
                 }
                 "min_amount" => {
-                    if min_amount.is_some() {
-                        return Err(de::Error::duplicate_field("min_amount"));
-                    }
-                    min_amount = Some(map.next_value()?);
+                    min_amount = map.next_value()?;
                 }
                 "max_amount" => {
-                    if max_amount.is_some() {
-                        return Err(de::Error::duplicate_field("max_amount"));
-                    }
-                    max_amount = Some(map.next_value()?);
+                    max_amount = map.next_value()?;
                 }
                 "amountless" => {
-                    if amountless.is_some() {
-                        return Err(de::Error::duplicate_field("amountless"));
-                    }
                     amountless = Some(map.next_value()?);
                 }
                 "options" => {
@@ -503,7 +505,12 @@ pub struct MeltQuoteCustomRequest {
     ///
     /// These fields are flattened into the JSON representation, allowing
     /// custom payment methods to include additional data.
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "serde_json::Value::is_null",
+        deserialize_with = "deserialize_empty_map_as_null"
+    )]
     pub extra: serde_json::Value,
 }
 
@@ -563,7 +570,12 @@ pub struct MeltQuoteCustomResponse<Q> {
     ///
     /// These fields are flattened into the JSON representation, allowing
     /// custom payment methods to include additional data without nesting.
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "serde_json::Value::is_null",
+        deserialize_with = "deserialize_empty_map_as_null"
+    )]
     pub extra: serde_json::Value,
 }
 
@@ -736,6 +748,14 @@ mod tests {
                 max_amount: None,
                 options: Some(MeltMethodOptions::Bolt11 { amountless: true }),
             },
+            MeltMethodSettings {
+                method: PaymentMethod::Known(KnownMethod::Bolt11),
+                unit: CurrencyUnit::Sat,
+                method_name: None,
+                min_amount: None,
+                max_amount: None,
+                options: Some(MeltMethodOptions::Bolt11 { amountless: false }),
+            },
         ];
 
         for settings in settings {
@@ -751,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_melt_method_settings_top_level_amountless() {
-        // Create JSON with top-level amountless
+        // Create JSON with legacy top-level amountless
         let json_str = r#"{
             "method": "bolt11",
             "unit": "sat",
@@ -778,11 +798,63 @@ mod tests {
         }
 
         // Serialize it back
-        let serialized = to_string(&settings).unwrap();
-        let parsed: serde_json::Value = from_str(&serialized).unwrap();
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap(),
+            json!({
+                "method": "bolt11",
+                "unit": "sat",
+                "min_amount": 0,
+                "max_amount": 10000,
+                "options": {"amountless": true}
+            })
+        );
+    }
 
-        // Verify the amountless is at the top level
-        assert_eq!(parsed["amountless"], json!(true));
+    #[test]
+    fn test_melt_method_settings_rejects_duplicate_nullable_fields() {
+        for (field, value) in [
+            ("method_name", r#""Lightning""#),
+            ("min_amount", "100"),
+            ("max_amount", "100"),
+        ] {
+            for (first, second) in [
+                ("null", value),
+                (value, "null"),
+                ("null", "null"),
+                (value, value),
+            ] {
+                let json_str = format!(
+                    r#"{{"method":"bolt11","unit":"sat","{field}":{first},"{field}":{second}}}"#
+                );
+
+                let err = from_str::<MeltMethodSettings>(&json_str).unwrap_err();
+
+                assert!(
+                    err.to_string()
+                        .contains(&format!("duplicate field `{field}`")),
+                    "{field}: {first} then {second} should be rejected, got: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_melt_method_settings_rejects_duplicate_options() {
+        let json_str = r#"{"method":"bolt11","unit":"sat","options":{"amountless":true},"options":{"amountless":true}}"#;
+
+        let err = from_str::<MeltMethodSettings>(json_str).unwrap_err();
+
+        assert!(err.to_string().contains("duplicate field `options`"));
+    }
+
+    #[test]
+    fn test_melt_method_settings_ignores_duplicate_unknown_fields() {
+        let json_str =
+            r#"{"method":"bolt11","unit":"sat","min_amount":100,"extra":1,"extra":null}"#;
+
+        let settings: MeltMethodSettings = from_str(json_str).unwrap();
+
+        assert_eq!(settings.min_amount, Some(Amount::from(100)));
     }
 
     #[test]
@@ -970,6 +1042,27 @@ mod tests {
     }
 
     #[test]
+    fn test_melt_method_settings_null_amount_limits_deserialize_as_none() {
+        let json_str = r#"{
+            "method": "bolt11",
+            "unit": "sat",
+            "min_amount": null,
+            "max_amount": null
+        }"#;
+
+        let settings: MeltMethodSettings = from_str(json_str).unwrap();
+
+        assert_eq!(settings.min_amount, None);
+        assert_eq!(settings.max_amount, None);
+
+        let serialized = to_string(&settings).unwrap();
+        let parsed: serde_json::Value = from_str(&serialized).unwrap();
+
+        assert!(parsed.get("min_amount").is_none());
+        assert!(parsed.get("max_amount").is_none());
+    }
+
+    #[test]
     fn test_melt_method_settings_omitted_method_name_uses_derived_name() {
         let json_str = r#"{
             "method": "apple-pay",
@@ -1029,5 +1122,71 @@ mod tests {
 
         assert_eq!(parsed["fee_reserve"], json!(10));
         assert_eq!(parsed["method"], json!("custom"));
+    }
+
+    #[test]
+    fn custom_melt_quote_extra_round_trips_as_null_when_absent() {
+        let request = MeltQuoteCustomRequest {
+            method: "paypal".to_string(),
+            request: "pay://abc".to_string(),
+            unit: CurrencyUnit::Sat,
+            amount: Some(Amount::from(10)),
+            extra: serde_json::Value::Null,
+        };
+
+        let decoded: MeltQuoteCustomRequest =
+            from_str(&to_string(&request).expect("serializes")).expect("parses");
+        assert_eq!(decoded, request);
+
+        let response = MeltQuoteCustomResponse {
+            quote: "q1".to_string(),
+            method: PaymentMethod::Custom("paypal".to_string()),
+            amount: Amount::from(10),
+            fee_reserve: Some(Amount::from(1)),
+            state: QuoteState::Unpaid,
+            expiry: 9999,
+            payment_preimage: None,
+            change: None,
+            request: Some("pay://abc".to_string()),
+            unit: Some(CurrencyUnit::Sat),
+            extra: serde_json::Value::Null,
+        };
+
+        let decoded: MeltQuoteCustomResponse<String> =
+            from_str(&to_string(&response).expect("serializes")).expect("parses");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn custom_melt_quote_extra_round_trips_when_populated() {
+        let request = MeltQuoteCustomRequest {
+            method: "paypal".to_string(),
+            request: "pay://abc".to_string(),
+            unit: CurrencyUnit::Sat,
+            amount: Some(Amount::from(10)),
+            extra: json!({"account": "a@b.c"}),
+        };
+
+        let decoded: MeltQuoteCustomRequest =
+            from_str(&to_string(&request).expect("serializes")).expect("parses");
+        assert_eq!(decoded, request);
+
+        let response = MeltQuoteCustomResponse {
+            quote: "q1".to_string(),
+            method: PaymentMethod::Custom("paypal".to_string()),
+            amount: Amount::from(10),
+            fee_reserve: Some(Amount::from(1)),
+            state: QuoteState::Unpaid,
+            expiry: 9999,
+            payment_preimage: None,
+            change: None,
+            request: Some("pay://abc".to_string()),
+            unit: Some(CurrencyUnit::Sat),
+            extra: json!({"settlement_id": "s1", "ref": 42}),
+        };
+
+        let decoded: MeltQuoteCustomResponse<String> =
+            from_str(&to_string(&response).expect("serializes")).expect("parses");
+        assert_eq!(decoded, response);
     }
 }

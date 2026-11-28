@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 // external crates
 use anyhow::{anyhow, bail, Context, Result};
@@ -46,6 +47,9 @@ use cdk_sqlite::MintSqliteDatabase;
 use cli::CLIArgs;
 use config::{AuthType, DatabaseEngine, PaymentBackendType};
 use env_vars::ENV_WORK_DIR;
+use primary_database::PrimaryDatabase;
+#[cfg(feature = "sqlite")]
+use primary_database::SqliteKey;
 use setup::PaymentBackendSetup;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
@@ -61,6 +65,7 @@ mod config_migration;
 mod config_service;
 mod config_store;
 pub mod env_vars;
+mod primary_database;
 mod secret;
 pub mod setup;
 
@@ -368,8 +373,7 @@ fn expand_path(path: &str) -> Option<PathBuf> {
 /// and initializing the database connection.
 async fn initial_setup(
     work_dir: &Path,
-    settings: &config::Settings,
-    db_password: Option<String>,
+    database: &PrimaryDatabase,
 ) -> Result<(
     DynMintDatabase,
     Arc<dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync>,
@@ -378,7 +382,7 @@ async fn initial_setup(
 )> {
     tracing::info!("Initializing database...");
     let (localstore, keystore, kv, configuration_store) =
-        setup_database(settings, work_dir, db_password).await?;
+        setup_database(database, work_dir).await?;
     tracing::info!("Database initialized successfully");
     Ok((localstore, keystore, kv, configuration_store))
 }
@@ -651,6 +655,17 @@ fn validate_signing_config(settings: &config::Settings) -> Result<()> {
             bail!(
                 "gRPC signatory TLS is not configured. Set [signatory].tls_dir or \
                  [signatory].allow_insecure = true to connect without TLS"
+            );
+        }
+
+        if settings
+            .info
+            .keyset_refresh_interval_ms
+            .is_some_and(|interval_ms| interval_ms > 0)
+        {
+            tracing::warn!(
+                "[info].keyset_refresh_interval_ms has no effect with a remote signatory; \
+                 set --keyset-refresh-interval-ms on the signatory process instead"
             );
         }
 
@@ -933,20 +948,18 @@ pub fn apply_seed_file(settings: &mut config::Settings, seed_file: &Path) -> Res
 }
 
 async fn setup_database(
-    settings: &config::Settings,
+    database: &PrimaryDatabase,
     _work_dir: &Path,
-    _db_password: Option<String>,
 ) -> Result<(
     DynMintDatabase,
     Arc<dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync>,
     Arc<dyn KVStore<Err = cdk_database::Error> + Send + Sync>,
     Arc<dyn KVStoreCompareAndSwap<Err = cdk_database::Error> + Send + Sync>,
 )> {
-    tracing::info!("Using database engine: {:?}", settings.database.engine);
-    match settings.database.engine {
+    match *database {
         #[cfg(feature = "sqlite")]
-        DatabaseEngine::Sqlite => {
-            let db = setup_sqlite_database(_work_dir, _db_password).await?;
+        PrimaryDatabase::Sqlite(ref key) => {
+            let db = setup_sqlite_database(_work_dir, key).await?;
             let localstore: Arc<dyn MintDatabase<cdk_database::Error> + Send + Sync> = db.clone();
             let kv: Arc<dyn KVStore<Err = cdk_database::Error> + Send + Sync> = db.clone();
             let configuration_store: Arc<
@@ -956,52 +969,24 @@ async fn setup_database(
             Ok((localstore, keystore, kv, configuration_store))
         }
         #[cfg(feature = "postgres")]
-        DatabaseEngine::Postgres => {
-            // Get the PostgreSQL configuration, ensuring it exists
-            let pg_config = settings.database.postgres.as_ref().ok_or_else(|| {
-                anyhow!("PostgreSQL configuration is required when using PostgreSQL engine")
-            })?;
-
-            if pg_config.url.is_empty() {
-                bail!("PostgreSQL URL is required. Set it in config file [database.postgres] section or via CDK_MINTD_POSTGRES_URL/CDK_MINTD_DATABASE_URL environment variable");
-            }
-
-            #[cfg(feature = "postgres")]
+        PrimaryDatabase::Postgres(ref pg_config) => {
             let db_config = PgConfig::new(
                 pg_config.url.as_str(),
                 pg_config.tls_mode.as_deref(),
                 pg_config.max_connections,
                 pg_config.connection_timeout_seconds,
             );
-            #[cfg(feature = "postgres")]
             let pg_db = Arc::new(MintPgDatabase::new(db_config).await?);
             tracing::info!("PostgreSQL database connection established");
-            #[cfg(feature = "postgres")]
             let localstore: Arc<dyn MintDatabase<cdk_database::Error> + Send + Sync> =
                 pg_db.clone();
-            #[cfg(feature = "postgres")]
             let kv: Arc<dyn KVStore<Err = cdk_database::Error> + Send + Sync> = pg_db.clone();
-            #[cfg(feature = "postgres")]
             let configuration_store: Arc<
                 dyn KVStoreCompareAndSwap<Err = cdk_database::Error> + Send + Sync,
             > = pg_db.clone();
-            #[cfg(feature = "postgres")]
-            let keystore: Arc<
-                dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync,
-            > = pg_db;
-            #[cfg(feature = "postgres")]
-            return Ok((localstore, keystore, kv, configuration_store));
-
-            #[cfg(not(feature = "postgres"))]
-            bail!("PostgreSQL support not compiled in. Enable the 'postgres' feature to use PostgreSQL database.")
-        }
-        #[cfg(not(feature = "sqlite"))]
-        DatabaseEngine::Sqlite => {
-            bail!("SQLite support not compiled in. Enable the 'sqlite' feature to use SQLite database.")
-        }
-        #[cfg(not(feature = "postgres"))]
-        DatabaseEngine::Postgres => {
-            bail!("PostgreSQL support not compiled in. Enable the 'postgres' feature to use PostgreSQL database.")
+            let keystore: Arc<dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync> =
+                pg_db;
+            Ok((localstore, keystore, kv, configuration_store))
         }
     }
 }
@@ -1009,21 +994,14 @@ async fn setup_database(
 #[cfg(feature = "sqlite")]
 async fn setup_sqlite_database(
     work_dir: &Path,
-    _password: Option<String>,
+    key: &SqliteKey,
 ) -> Result<Arc<MintSqliteDatabase>> {
     let sql_db_path = work_dir.join("cdk-mintd.sqlite");
     tracing::info!("SQLite database path: {}", sql_db_path.display());
 
-    #[cfg(not(feature = "sqlcipher"))]
-    let db = MintSqliteDatabase::new(&sql_db_path).await?;
     #[cfg(feature = "sqlcipher")]
-    let db = {
-        // Get password from command line arguments for sqlcipher
-        let password = _password
-            .ok_or_else(|| anyhow!("Password required when sqlcipher feature is enabled"))?;
-        tracing::info!("Using SQLCipher encryption for SQLite database");
-        MintSqliteDatabase::new((sql_db_path, password)).await?
-    };
+    tracing::info!("Using SQLCipher encryption for SQLite database");
+    let db = MintSqliteDatabase::new(key.database(sql_db_path)).await?;
 
     tracing::info!("SQLite database initialized successfully");
     Ok(Arc::new(db))
@@ -1206,7 +1184,17 @@ fn configure_basic_info(settings: &config::Settings, mint_builder: MintBuilder) 
         }
     }
 
-    builder = builder.with_keyset_v2(settings.info.use_keyset_v2);
+    builder = builder
+        .with_keyset_v2(settings.info.use_keyset_v2)
+        .with_keyset_version(settings.info.keyset_version.map(Into::into));
+
+    builder = builder.with_keyset_refresh_interval(
+        settings
+            .info
+            .keyset_refresh_interval_ms
+            .filter(|interval_ms| *interval_ms > 0)
+            .map(Duration::from_millis),
+    );
 
     builder
 }
@@ -1394,7 +1382,7 @@ async fn configure_payment_backends(
         let fake_wallet = settings.fake_wallet.as_ref().ok_or_else(|| {
             anyhow!("Fake wallet backend selected but [fake_wallet] config section is missing")
         })?;
-        mint_builder = configure_fake_wallet_keyset_rotations_once(mint_builder, fake_wallet);
+        mint_builder = configure_fake_wallet_keyset_rotations_once(mint_builder, fake_wallet)?;
     }
 
     Ok(mint_builder)
@@ -1404,9 +1392,10 @@ async fn configure_payment_backends(
 fn configure_fake_wallet_keyset_rotations_once(
     mut mint_builder: MintBuilder,
     fake_wallet: &config::FakeWallet,
-) -> MintBuilder {
+) -> Result<MintBuilder> {
     for rotation_cfg in &fake_wallet.keyset_rotations {
         use cdk::mint::KeysetRotation;
+        use cdk_common::nut02::KeySetVersion;
 
         let amounts = cdk::mint::UnitConfig::default().amounts;
         let final_expiry = if rotation_cfg.expired {
@@ -1414,17 +1403,23 @@ fn configure_fake_wallet_keyset_rotations_once(
         } else {
             None
         };
+        // Reject unknown versions instead of silently creating a V1 keyset.
+        let keyset_id_type: KeySetVersion = rotation_cfg
+            .version
+            .parse::<config::KeysetVersion>()
+            .map_err(|err| anyhow!("Unsupported fake wallet keyset rotation version: {err}"))?
+            .into();
 
         mint_builder = mint_builder.with_keyset_rotation(KeysetRotation {
             unit: rotation_cfg.unit.clone(),
             amounts,
             input_fee_ppk: rotation_cfg.input_fee_ppk,
-            use_keyset_v2: rotation_cfg.version == "v2",
+            keyset_id_type,
             final_expiry,
         });
     }
 
-    mint_builder
+    Ok(mint_builder)
 }
 
 /// Configures Onchain backend based on the specified backend type
@@ -1708,7 +1703,7 @@ async fn setup_authentication(
     settings: &config::Settings,
     _work_dir: &Path,
     mut mint_builder: MintBuilder,
-    _password: Option<String>,
+    database: &PrimaryDatabase,
 ) -> Result<(
     MintBuilder,
     Option<cdk_common::database::DynMintAuthDatabase>,
@@ -1717,67 +1712,34 @@ async fn setup_authentication(
         use cdk_common::database::DynMintAuthDatabase;
 
         tracing::info!("Auth settings are defined. {:?}", auth_settings);
-        let auth_localstore: DynMintAuthDatabase = match settings.database.engine {
+        let auth_localstore: DynMintAuthDatabase = match *database {
             #[cfg(feature = "sqlite")]
-            DatabaseEngine::Sqlite => {
-                #[cfg(feature = "sqlite")]
-                {
-                    let sql_db_path = _work_dir.join("cdk-mintd-auth.sqlite");
-                    #[cfg(not(feature = "sqlcipher"))]
-                    let sqlite_db = MintSqliteAuthDatabase::new(&sql_db_path).await?;
-                    #[cfg(feature = "sqlcipher")]
-                    let sqlite_db = {
-                        // Get password from command line arguments for sqlcipher
-                        let password = _password.clone().ok_or_else(|| {
-                            anyhow!("Password required when sqlcipher feature is enabled")
-                        })?;
-                        MintSqliteAuthDatabase::new((sql_db_path, password)).await?
-                    };
-
-                    Arc::new(sqlite_db)
-                }
-                #[cfg(not(feature = "sqlite"))]
-                {
-                    bail!("SQLite support not compiled in. Enable the 'sqlite' feature to use SQLite database.")
-                }
+            PrimaryDatabase::Sqlite(ref key) => {
+                let sql_db_path = _work_dir.join("cdk-mintd-auth.sqlite");
+                Arc::new(MintSqliteAuthDatabase::new(key.database(sql_db_path)).await?)
             }
             #[cfg(feature = "postgres")]
-            DatabaseEngine::Postgres => {
-                #[cfg(feature = "postgres")]
-                {
-                    // Require dedicated auth database configuration - no fallback to main database
-                    let auth_db_config = settings.auth_database.as_ref().ok_or_else(|| {
-                        anyhow!("Auth database configuration is required when using PostgreSQL with authentication. Set [auth_database]")
-                    })?;
+            PrimaryDatabase::Postgres(_) => {
+                // Require dedicated auth database configuration - no fallback to main database
+                let auth_db_config = settings.auth_database.as_ref().ok_or_else(|| {
+                    anyhow!("Auth database configuration is required when using PostgreSQL with authentication. Set [auth_database]")
+                })?;
 
-                    let auth_pg_config = auth_db_config.postgres.as_ref().ok_or_else(|| {
-                        anyhow!("PostgreSQL auth database configuration is required when using PostgreSQL with authentication. Set [auth_database.postgres]")
-                    })?;
+                let auth_pg_config = auth_db_config.postgres.as_ref().ok_or_else(|| {
+                    anyhow!("PostgreSQL auth database configuration is required when using PostgreSQL with authentication. Set [auth_database.postgres]")
+                })?;
 
-                    if auth_pg_config.url.is_empty() {
-                        bail!("Auth database PostgreSQL URL is required and cannot be empty. Set [auth_database.postgres].url to an env: or file: secret reference");
-                    }
-
-                    let auth_db_config = PgConfig::new(
-                        auth_pg_config.url.as_str(),
-                        auth_pg_config.tls_mode.as_deref(),
-                        auth_pg_config.max_connections,
-                        auth_pg_config.connection_timeout_seconds,
-                    );
-                    Arc::new(MintPgAuthDatabase::new(auth_db_config).await?)
+                if auth_pg_config.url.is_empty() {
+                    bail!("Auth database PostgreSQL URL is required and cannot be empty. Set [auth_database.postgres].url to an env: or file: secret reference");
                 }
-                #[cfg(not(feature = "postgres"))]
-                {
-                    bail!("PostgreSQL support not compiled in. Enable the 'postgres' feature to use PostgreSQL database.")
-                }
-            }
-            #[cfg(not(feature = "sqlite"))]
-            DatabaseEngine::Sqlite => {
-                bail!("SQLite support not compiled in. Enable the 'sqlite' feature to use SQLite database.")
-            }
-            #[cfg(not(feature = "postgres"))]
-            DatabaseEngine::Postgres => {
-                bail!("PostgreSQL support not compiled in. Enable the 'postgres' feature to use PostgreSQL database.")
+
+                let auth_db_config = PgConfig::new(
+                    auth_pg_config.url.as_str(),
+                    auth_pg_config.tls_mode.as_deref(),
+                    auth_pg_config.max_connections,
+                    auth_pg_config.connection_timeout_seconds,
+                );
+                Arc::new(MintPgAuthDatabase::new(auth_db_config).await?)
             }
         };
 
@@ -1877,7 +1839,7 @@ async fn build_mint(
     keystore: Arc<dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync>,
     mint_builder: MintBuilder,
     validated_signing_source: Option<&ValidatedSigningSource>,
-) -> Result<Mint> {
+) -> Result<Arc<Mint>> {
     if let Some(signatory) = settings.enabled_signatory() {
         let tls_dir = signatory.tls_dir.clone();
 
@@ -2003,6 +1965,7 @@ async fn reconcile_canonical_configuration(
 /// completed, ready to start its services.
 struct PreparedMintd {
     mint: Arc<cdk::mint::Mint>,
+    auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
     #[cfg(feature = "prometheus")]
     prometheus: Option<config::Prometheus>,
     mint_service: Router,
@@ -2019,6 +1982,7 @@ struct PreparedMintd {
 /// as applied, serving requests until shutdown.
 struct RunningMintd {
     mint: Arc<cdk::mint::Mint>,
+    auth_localstore: Option<cdk_common::database::DynMintAuthDatabase>,
     mint_service: Router,
     listener: tokio::net::TcpListener,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -2338,6 +2302,7 @@ impl PreparedMintd {
 
         Ok(Self {
             mint,
+            auth_localstore,
             #[cfg(feature = "prometheus")]
             prometheus: settings.prometheus.clone(),
             mint_service,
@@ -2417,6 +2382,7 @@ impl PreparedMintd {
 
         Ok(RunningMintd {
             mint: self.mint,
+            auth_localstore: self.auth_localstore,
             mint_service: self.mint_service,
             listener,
             shutdown_tx: self.shutdown_tx,
@@ -2486,6 +2452,12 @@ impl RunningMintd {
             }
         }
 
+        // No service may start new database work after closing the shared pools.
+        self.mint.localstore().close().await?;
+        if let Some(auth_localstore) = self.auth_localstore {
+            auth_localstore.close().await?;
+        }
+
         Ok(())
     }
 }
@@ -2519,9 +2491,28 @@ async fn start_services_with_shutdown(
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C handler");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install CTRL+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
     tracing::info!("Shutdown signal received");
 }
 
@@ -2581,8 +2572,9 @@ pub async fn run_mintd_with_shutdown(
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     routers: Vec<Router>,
 ) -> Result<()> {
+    let database = PrimaryDatabase::select(&settings.database, db_password)?;
     let (localstore, keystore, kv, _configuration_store) =
-        initial_setup(work_dir, settings, db_password.clone()).await?;
+        initial_setup(work_dir, &database).await?;
 
     run_mintd_with_database_and_shutdown(
         work_dir,
@@ -2591,7 +2583,7 @@ pub async fn run_mintd_with_shutdown(
         keystore,
         kv,
         shutdown_signal,
-        db_password,
+        &database,
         runtime,
         routers,
         None,
@@ -2608,7 +2600,7 @@ async fn run_mintd_with_database_and_shutdown(
     keystore: Arc<dyn MintKeysDatabase<Err = cdk_database::Error> + Send + Sync>,
     kv: Arc<dyn KVStore<Err = cdk_database::Error> + Send + Sync>,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
-    db_password: Option<String>,
+    database: &PrimaryDatabase,
     runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     routers: Vec<Router>,
     activation: Option<ConfigurationActivation>,
@@ -2656,7 +2648,7 @@ async fn run_mintd_with_database_and_shutdown(
     )
     .await?;
     let (mint_builder, auth_localstore) =
-        setup_authentication(settings, work_dir, mint_builder, db_password).await?;
+        setup_authentication(settings, work_dir, mint_builder, database).await?;
 
     let config_mint_info = mint_builder.current_mint_info();
 
@@ -2669,8 +2661,6 @@ async fn run_mintd_with_database_and_shutdown(
     .await?;
 
     tracing::debug!("Mint built from builder.");
-
-    let mint = Arc::new(mint);
 
     start_services_with_shutdown(
         mint.clone(),
@@ -2726,8 +2716,9 @@ pub async fn initialize_configuration(
     db_password: Option<String>,
 ) -> Result<()> {
     let bootstrap = load_database_bootstrap_settings()?;
+    let database = PrimaryDatabase::select(&bootstrap.database, db_password)?;
     let (localstore, keystore, _kv, configuration_store) =
-        initial_setup(work_dir, &bootstrap, db_password).await?;
+        initial_setup(work_dir, &database).await?;
     let mut mint_builder = MintBuilder::new(localstore.clone());
     mint_builder.init_from_db_if_present().await?;
     let database_pubkey = mint_builder.current_mint_info().pubkey;
@@ -2765,8 +2756,9 @@ pub async fn apply_configuration(
     db_password: Option<String>,
 ) -> Result<ApplyOutcome> {
     let bootstrap = load_database_bootstrap_settings()?;
+    let database = PrimaryDatabase::select(&bootstrap.database, db_password)?;
     let (_localstore, _keystore, _kv, configuration_store) =
-        initial_setup(work_dir, &bootstrap, db_password).await?;
+        initial_setup(work_dir, &database).await?;
     Ok(configuration_service(configuration_store, &bootstrap)
         .apply(document, validate_only, work_dir, bdk_wallet_policy)
         .await?)
@@ -2778,8 +2770,9 @@ pub async fn rollback_configuration(
     db_password: Option<String>,
 ) -> Result<RollbackOutcome> {
     let bootstrap = load_database_bootstrap_settings()?;
+    let database = PrimaryDatabase::select(&bootstrap.database, db_password)?;
     let (_localstore, _keystore, _kv, configuration_store) =
-        initial_setup(work_dir, &bootstrap, db_password).await?;
+        initial_setup(work_dir, &database).await?;
     Ok(configuration_service(configuration_store, &bootstrap)
         .rollback()
         .await?)
@@ -2791,8 +2784,9 @@ pub async fn stored_configuration_document(
     db_password: Option<String>,
 ) -> Result<String> {
     let bootstrap = load_database_bootstrap_settings()?;
+    let database = PrimaryDatabase::select(&bootstrap.database, db_password)?;
     let (_localstore, _keystore, _kv, configuration_store) =
-        initial_setup(work_dir, &bootstrap, db_password).await?;
+        initial_setup(work_dir, &database).await?;
     Ok(configuration_service(configuration_store, &bootstrap)
         .document()
         .await?)
@@ -2807,8 +2801,9 @@ pub async fn run_mintd_from_database(
     routers: Vec<Router>,
 ) -> Result<()> {
     let bootstrap = load_database_bootstrap_settings()?;
+    let database = PrimaryDatabase::select(&bootstrap.database, db_password)?;
     let (localstore, keystore, kv, configuration_store) =
-        initial_setup(work_dir, &bootstrap, db_password.clone()).await?;
+        initial_setup(work_dir, &database).await?;
     let service = configuration_service(configuration_store, &bootstrap);
     let startup = service.startup().await?;
     config_service::require_existing_bdk_wallet(
@@ -2842,7 +2837,7 @@ pub async fn run_mintd_from_database(
         keystore,
         kv,
         shutdown_signal(),
-        db_password,
+        &database,
         runtime,
         routers,
         activation,
@@ -2871,8 +2866,67 @@ mod tests {
     const TEST_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_signal_handles_sigint_and_sigterm() {
+        const SIGNAL_ENV: &str = "CDK_MINTD_TEST_SHUTDOWN_SIGNAL";
+
+        // Signal handlers are process-wide, so exercise each signal in its own child.
+        if let Ok(signal) = std::env::var(SIGNAL_ENV) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime should start")
+                .block_on(async {
+                    let mut shutdown = std::pin::pin!(shutdown_signal());
+                    // Poll once to install both handlers before sending the signal.
+                    std::future::poll_fn(|cx| {
+                        assert!(std::future::Future::poll(shutdown.as_mut(), cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+
+                    let status = std::process::Command::new("kill")
+                        .arg(format!("-{signal}"))
+                        .arg(std::process::id().to_string())
+                        .status()
+                        .expect("signal should be sent");
+                    assert!(status.success());
+
+                    tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+                        .await
+                        .expect("signal should trigger graceful shutdown");
+                });
+            return;
+        }
+
+        for signal in ["INT", "TERM"] {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable should exist"),
+            )
+            .args([
+                "--exact",
+                "tests::shutdown_signal_handles_sigint_and_sigterm",
+            ])
+            .env(SIGNAL_ENV, signal)
+            .output()
+            .expect("child should start");
+            assert!(
+                output.status.success(),
+                "{signal} shutdown failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
     fn temp_seed_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cdk_mintd_{name}_{}", std::process::id()))
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "fakewallet"))]
+    fn test_database(bootstrap: &config::Settings, password: Option<String>) -> PrimaryDatabase {
+        PrimaryDatabase::select(&bootstrap.database, password).expect("database selection")
     }
 
     #[cfg(all(feature = "sqlite", feature = "fakewallet"))]
@@ -3158,7 +3212,7 @@ engine = "sqlite"
             .replace("[mint_info]", "[mint_info]\npubkey = \"02eec7245d6b7d2ccb30380bfbe2a3648cd7a942653f5aa340edcea1f283686619\"");
         let bootstrap = load_database_bootstrap_settings().expect("bootstrap");
         let (db, keystore, _, config_store) =
-            initial_setup(&work_dir, &bootstrap, password.clone())
+            initial_setup(&work_dir, &test_database(&bootstrap, password.clone()))
                 .await
                 .expect("database");
         let mut builder = MintBuilder::new(db.clone());
@@ -3383,7 +3437,7 @@ engine = "sqlite"
 
         let bootstrap = load_database_bootstrap_settings().expect("bootstrap settings");
         let (localstore, keystore, _kv, _configuration_store) =
-            initial_setup(&work_dir, &bootstrap, password.clone())
+            initial_setup(&work_dir, &test_database(&bootstrap, password.clone()))
                 .await
                 .expect("initialize database");
         let mut builder = MintBuilder::new(localstore);
@@ -3441,7 +3495,7 @@ engine = "sqlite"
 
         let bootstrap = load_database_bootstrap_settings().expect("bootstrap settings");
         let (localstore, keystore, _kv, _configuration_store) =
-            initial_setup(&work_dir, &bootstrap, password.clone())
+            initial_setup(&work_dir, &test_database(&bootstrap, password.clone()))
                 .await
                 .expect("initialize database");
         let mut builder = MintBuilder::new(localstore);
@@ -4342,6 +4396,8 @@ backend = "fakewallet"
             "CDK_MINTD_POSTGRES_CONNECTION_TIMEOUT_SECONDS",
             "CDK_MINTD_SEED",
             "CDK_MINTD_MNEMONIC",
+            "CDK_MINTD_KEYSET_VERSION",
+            "CDK_MINTD_USE_KEYSET_V2",
             "CDK_MINTD_SIGNATORY_ENABLED",
             "CDK_MINTD_SIGNATORY_ADDRESS",
             "CDK_MINTD_SIGNATORY_PORT",
@@ -5169,6 +5225,62 @@ openid_client_id = "mintd"
         let _ = fs::remove_dir_all(&temp_dir);
         clear_mintd_env();
         result
+    }
+
+    #[cfg(feature = "fakewallet")]
+    #[test]
+    fn keyset_version_env_is_validated_before_startup() {
+        let config = format!(
+            r#"
+[info]
+mnemonic = "{TEST_MNEMONIC}"
+keyset_version = "v2"
+use_keyset_v2 = true
+
+[database]
+engine = "sqlite"
+
+[payment_backend]
+backend = "fakewallet"
+"#
+        );
+
+        for invalid in ["1", "v1 ", "v3", ""] {
+            let error = load_settings_with_env("cdk_mintd_invalid_keyset_version", &config, || {
+                std::env::set_var(crate::env_vars::ENV_KEYSET_VERSION, invalid);
+            })
+            .expect_err("invalid version must not fall back to configured selectors");
+            let message = error.to_string();
+            assert!(message.contains("CDK_MINTD_KEYSET_VERSION"), "{message}");
+            assert!(message.contains("expected v1 or v2"), "{message}");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let error =
+                load_settings_with_env("cdk_mintd_nonunicode_keyset_version", &config, || {
+                    std::env::set_var(
+                        crate::env_vars::ENV_KEYSET_VERSION,
+                        std::ffi::OsString::from_vec(vec![0xff]),
+                    );
+                })
+                .expect_err("non-Unicode version must fail configuration loading");
+            assert!(error.to_string().contains("CDK_MINTD_KEYSET_VERSION"));
+        }
+
+        for (value, expected) in [
+            ("v1", config::KeysetVersion::V1),
+            ("V2", config::KeysetVersion::V2),
+        ] {
+            let settings =
+                load_settings_with_env("cdk_mintd_valid_keyset_version", &config, || {
+                    std::env::set_var(crate::env_vars::ENV_KEYSET_VERSION, value);
+                })
+                .expect("valid environment version should override the file");
+            assert_eq!(settings.info.keyset_version, Some(expected));
+        }
     }
 
     #[cfg(feature = "fakewallet")]

@@ -42,7 +42,7 @@ async fn test_melt_saga_initial_state_creation() {
     let db = mint.localstore();
     let pubsub = mint.pubsub_manager();
 
-    let _saga = MeltSaga::new(std::sync::Arc::new(mint.clone()), db, pubsub);
+    let _saga = MeltSaga::new(std::sync::Arc::clone(&mint), db, pubsub);
     // Type system enforces Initial state - if this compiles, test passes
 }
 
@@ -56,7 +56,7 @@ async fn test_onchain_setup_uses_selected_fee_option_for_balance() {
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
 
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -92,7 +92,7 @@ async fn test_onchain_setup_rejects_amount_for_unselected_fee_option() {
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
 
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -151,7 +151,7 @@ async fn test_onchain_setup_accepts_change_outputs() {
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
 
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -166,6 +166,102 @@ async fn test_onchain_setup_accepts_change_outputs() {
 
     assert_eq!(setup.state_data.quote.selected_fee_index, Some(0));
     assert_eq!(setup.state_data.quote.fee_reserve().value(), 500);
+}
+
+/// Test: change outputs that another request reserved but has not signed are
+/// rejected as pending (NUT-00 11004), not as already signed.
+#[tokio::test]
+async fn test_melt_setup_rejects_change_outputs_pending_in_another_request() {
+    use cdk_common::mint::Operation;
+    use cdk_common::nuts::MeltRequest;
+
+    use crate::test_helpers::mint::create_test_blinded_messages;
+
+    let mint = create_test_mint().await.unwrap();
+
+    // Reserve the outputs the way a swap does before it signs them.
+    let (pending_outputs, _premint) = create_test_blinded_messages(&mint, Amount::from(500))
+        .await
+        .unwrap();
+    let mut tx = mint.localstore().begin_transaction().await.unwrap();
+    tx.add_blinded_messages(
+        None,
+        &pending_outputs,
+        &Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let quote = create_test_onchain_melt_quote(&mint).await;
+    let proofs = mint_test_proofs(&mint, Amount::from(9_500)).await.unwrap();
+    let melt_request =
+        MeltRequest::new(quote.id.clone(), proofs, Some(pending_outputs)).fee_index(0);
+    let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
+
+    let saga = MeltSaga::new(
+        std::sync::Arc::clone(&mint),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    );
+    let result = saga
+        .setup_melt(
+            &melt_request,
+            verification,
+            PaymentMethod::Known(KnownMethod::Onchain),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(cdk_common::Error::OutputsPending)),
+        "reserved change outputs should be rejected as pending, got: {:?}",
+        result.err()
+    );
+}
+
+/// Test: change outputs already signed by an earlier request are rejected as
+/// already signed (NUT-00 11003), not as an already-paid invoice.
+#[tokio::test]
+async fn test_melt_setup_rejects_change_outputs_signed_by_earlier_swap() {
+    use cdk_common::nuts::{MeltRequest, SwapRequest};
+
+    use crate::test_helpers::mint::create_test_blinded_messages;
+
+    let mint = create_test_mint().await.unwrap();
+
+    // Have the mint sign a set of outputs in an ordinary swap first.
+    let (signed_outputs, _premint) = create_test_blinded_messages(&mint, Amount::from(500))
+        .await
+        .unwrap();
+    let swap_inputs = mint_test_proofs(&mint, Amount::from(500)).await.unwrap();
+    mint.process_swap_request(SwapRequest::new(swap_inputs, signed_outputs.clone()))
+        .await
+        .expect("swap should sign the outputs");
+
+    let quote = create_test_onchain_melt_quote(&mint).await;
+    let proofs = mint_test_proofs(&mint, Amount::from(9_500)).await.unwrap();
+    let melt_request =
+        MeltRequest::new(quote.id.clone(), proofs, Some(signed_outputs)).fee_index(0);
+    let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
+
+    let saga = MeltSaga::new(
+        std::sync::Arc::clone(&mint),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    );
+    let result = saga
+        .setup_melt(
+            &melt_request,
+            verification,
+            PaymentMethod::Known(KnownMethod::Onchain),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(cdk_common::Error::BlindedMessageAlreadySigned)),
+        "reused change outputs should be rejected as already signed, got: {:?}",
+        result.err()
+    );
 }
 
 /// Test: onchain melt setup accepts inputs greater than amount plus selected fee reserve.
@@ -191,7 +287,7 @@ async fn test_onchain_setup_accepts_overfunded_inputs() {
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
 
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -220,7 +316,7 @@ async fn test_onchain_setup_rejects_missing_fee_index() {
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
 
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -251,7 +347,7 @@ async fn test_onchain_setup_rejects_fee_index_not_in_fee_options() {
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
 
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -289,7 +385,7 @@ async fn test_saga_state_persistence_after_setup() {
     // STEP 2: Setup melt saga
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -402,7 +498,7 @@ async fn test_saga_deletion_on_success() {
     // STEP 3: Complete full melt flow
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -472,7 +568,7 @@ async fn test_completed_operation_recorded_on_finalize() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -527,7 +623,7 @@ async fn test_msat_total_spent_rounds_up_when_recording_sat_melt() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -563,6 +659,78 @@ async fn test_msat_total_spent_rounds_up_when_recording_sat_melt() {
 }
 
 #[tokio::test]
+async fn test_melt_signs_change_after_keyset_rotation() {
+    use cdk_common::nuts::PreMintSecrets;
+
+    let mint = create_test_mint().await.unwrap();
+    let proofs = mint_test_proofs(&mint, Amount::from(10_000)).await.unwrap();
+    let amounts = vec![1, 3, 9, 27, 81, 243, 729];
+    let keyset = mint
+        .rotate_keyset(CurrencyUnit::Sat, amounts.clone(), 0, true, None)
+        .await
+        .unwrap();
+    let quote = create_test_melt_quote(&mint, Amount::from(9_000)).await;
+    let change_outputs = PreMintSecrets::blank(keyset.id, Amount::from(1_000))
+        .unwrap()
+        .blinded_messages();
+    let request = MeltRequest::new(quote.id.clone(), proofs, Some(change_outputs));
+    let verification = mint.verify_inputs(request.inputs()).await.unwrap();
+    let setup = MeltSaga::new(
+        std::sync::Arc::clone(&mint),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    )
+    .setup_melt(
+        &request,
+        verification.clone(),
+        PaymentMethod::Known(KnownMethod::Bolt11),
+    )
+    .await
+    .unwrap();
+
+    mint.rotate_keyset(CurrencyUnit::Sat, vec![1, 2, 4, 8], 0, true, None)
+        .await
+        .unwrap();
+    assert!(!mint.get_keyset_info(&keyset.id).unwrap().active);
+
+    let rejected = MeltSaga::new(
+        std::sync::Arc::clone(&mint),
+        mint.localstore(),
+        mint.pubsub_manager(),
+    )
+    .setup_melt(
+        &request,
+        verification,
+        PaymentMethod::Known(KnownMethod::Bolt11),
+    )
+    .await;
+    assert!(matches!(rejected, Err(cdk_common::Error::InactiveKeyset)));
+
+    let change = finalize_melt_quote(
+        &mint,
+        &mint.localstore(),
+        &mint.pubsub_manager(),
+        &quote,
+        Amount::new(9_000, CurrencyUnit::Sat),
+        None,
+        &PaymentIdentifier::CustomId("rotation-payment".to_string()),
+        Some(setup.operation_id),
+    )
+    .await
+    .expect("accepted melt must return change after rotation")
+    .expect("melt has change");
+
+    assert_eq!(
+        Amount::try_sum(change.iter().map(|sig| sig.amount)).unwrap(),
+        Amount::from(1_000)
+    );
+    assert!(change
+        .iter()
+        .all(|sig| sig.keyset_id == keyset.id && amounts.contains(&sig.amount.to_u64())));
+    mint.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_finalizing_recovery_uses_persisted_payment_fee() {
     let mint = create_test_mint().await.unwrap();
     let proofs = mint_test_proofs(&mint, Amount::from(10_000)).await.unwrap();
@@ -571,7 +739,7 @@ async fn test_finalizing_recovery_uses_persisted_payment_fee() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -625,6 +793,8 @@ async fn test_finalizing_recovery_uses_persisted_payment_fee() {
     tx.commit().await.unwrap();
 
     drop(setup_saga);
+
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
 
     mint.recover_from_incomplete_melt_sagas().await.unwrap();
 
@@ -681,7 +851,7 @@ async fn test_finalizing_recovery_without_metadata_uses_internal_settlement() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -722,6 +892,8 @@ async fn test_finalizing_recovery_without_metadata_uses_internal_settlement() {
     tx.commit().await.unwrap();
 
     drop(confirmed_saga);
+
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
 
     mint.recover_from_incomplete_melt_sagas().await.unwrap();
 
@@ -781,7 +953,7 @@ async fn test_crash_recovery_setup_complete() {
     // STEP 5: Setup melt saga (this persists saga to DB)
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -805,6 +977,7 @@ async fn test_crash_recovery_setup_complete() {
     drop(setup_saga);
 
     // STEP 9: Run recovery (simulating mint restart)
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -856,7 +1029,7 @@ async fn test_crash_recovery_multiple_sagas() {
 
         let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
         let saga = MeltSaga::new(
-            std::sync::Arc::new(mint.clone()),
+            std::sync::Arc::clone(&mint),
             mint.localstore(),
             mint.pubsub_manager(),
         );
@@ -905,6 +1078,7 @@ async fn test_crash_recovery_multiple_sagas() {
     }
 
     // STEP 4: Run recovery (should handle all sagas)
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -966,7 +1140,7 @@ async fn test_crash_recovery_orphaned_saga() {
     // STEP 2: Create incomplete saga
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -991,6 +1165,7 @@ async fn test_crash_recovery_orphaned_saga() {
 
     // STEP 3: Run recovery
     // Recovery should handle the saga gracefully, cleaning up all state
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -1093,7 +1268,7 @@ async fn test_crash_recovery_internal_settlement() {
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
 
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1160,6 +1335,7 @@ async fn test_crash_recovery_internal_settlement() {
     );
 
     // STEP 8: Run recovery
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -1211,7 +1387,8 @@ async fn test_crash_recovery_internal_settlement() {
 ///
 /// Returns (mint_quote_id, melt_quote, melt_request, setup saga, input_ys).
 async fn setup_internal_melt(
-    mint: &crate::mint::Mint,
+    mint: &std::sync::Arc<crate::mint::Mint>,
+    outputs: Option<Vec<cdk_common::BlindedMessage>>,
 ) -> (
     cdk_common::QuoteId,
     MeltQuote,
@@ -1256,10 +1433,10 @@ async fn setup_internal_melt(
         .unwrap()
         .expect("Melt quote should exist");
 
-    let melt_request = create_test_melt_request(&proofs, &melt_quote);
+    let melt_request = MeltRequest::new(melt_quote.id.clone(), proofs, outputs);
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1287,7 +1464,7 @@ async fn setup_internal_melt(
 async fn test_internal_settlement_aborts_after_rollback() {
     let mint = create_test_mint().await.unwrap();
     let (mint_quote_id, melt_quote, melt_request, setup_saga, input_ys) =
-        setup_internal_melt(&mint).await;
+        setup_internal_melt(&mint, None).await;
     let operation_id = setup_saga.operation_id;
 
     // Roll the melt back (proofs released, quote reset to Unpaid, saga deleted)
@@ -1342,13 +1519,89 @@ async fn test_internal_settlement_aborts_after_rollback() {
     assert_saga_not_exists(&mint, &operation_id).await;
 }
 
+#[tokio::test]
+async fn test_status_poll_waits_for_internal_melt_finalization() {
+    use crate::test_helpers::mint::create_test_blinded_messages;
+
+    let mint = create_test_mint().await.unwrap();
+    let (outputs, _premint) = create_test_blinded_messages(&mint, Amount::from(8_191))
+        .await
+        .unwrap();
+    let (_, melt_quote, melt_request, setup_saga, input_ys) =
+        setup_internal_melt(&mint, Some(outputs)).await;
+    let operation_id = setup_saga.operation_id;
+    let (payment_saga, decision) = setup_saga
+        .attempt_internal_settlement(&melt_request)
+        .await
+        .unwrap();
+    assert!(matches!(
+        decision,
+        crate::mint::melt::melt_saga::state::SettlementDecision::Internal { .. }
+    ));
+
+    let stored = mint
+        .localstore
+        .get_melt_quote(&melt_quote.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, MeltQuoteState::Paid);
+    assert_eq!(stored.melt_lock, operation_id.to_string());
+    assert_proofs_state(&mint, &input_ys, Some(State::Pending)).await;
+
+    let response = mint.check_melt_quote(&melt_quote.id, None).await.unwrap();
+    assert_eq!(response.state(), MeltQuoteState::Pending);
+    assert!(response.payment_proof().is_none());
+    assert!(response.change().is_none());
+    assert_proofs_state(&mint, &input_ys, Some(State::Pending)).await;
+    let stored = mint
+        .localstore
+        .get_melt_quote(&melt_quote.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, MeltQuoteState::Paid);
+    assert_eq!(stored.melt_lock, operation_id.to_string());
+
+    let PaymentOutcome::Confirmed(confirmed_saga) =
+        payment_saga.make_payment(decision).await.unwrap()
+    else {
+        panic!("internal settlement should confirm payment");
+    };
+    confirmed_saga.finalize().await.unwrap();
+
+    let finalized = mint
+        .localstore
+        .get_melt_quote(&melt_quote.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!finalized.is_locked());
+    assert_eq!(finalized.melt_lock_expires_at, 0);
+
+    for _ in 0..2 {
+        let response = mint.check_melt_quote(&melt_quote.id, None).await.unwrap();
+        assert_eq!(response.state(), MeltQuoteState::Paid);
+        let change = response
+            .change()
+            .expect("finalized melt should return change");
+        assert_eq!(
+            Amount::try_sum(change.iter().map(|signature| signature.amount)).unwrap(),
+            Amount::from(6_000)
+        );
+        assert_proofs_state(&mint, &input_ys, Some(State::Spent)).await;
+        assert_saga_not_exists(&mint, &operation_id).await;
+    }
+    mint.stop().await.unwrap();
+}
+
 /// Test: rollback of an internally settled (Paid) melt quote is refused, and
 /// the in-band finalize still completes normally and spends the proofs.
 #[tokio::test]
 async fn test_rollback_refused_after_internal_settlement() {
     let mint = create_test_mint().await.unwrap();
     let (_mint_quote_id, melt_quote, melt_request, setup_saga, input_ys) =
-        setup_internal_melt(&mint).await;
+        setup_internal_melt(&mint, None).await;
     let operation_id = setup_saga.operation_id;
 
     let (payment_saga, decision) = setup_saga
@@ -1432,7 +1685,7 @@ async fn test_startup_recovery_integration() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1459,6 +1712,7 @@ async fn test_startup_recovery_integration() {
     // Note: create_test_mint() already calls mint.start(), so recovery should
     // have run on startup. However, since we created the saga AFTER startup,
     // we need to manually trigger recovery to simulate a restart scenario.
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -1475,7 +1729,7 @@ async fn test_startup_recovery_integration() {
 
     let new_verification = mint.verify_inputs(new_request.inputs()).await.unwrap();
     let new_saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1521,7 +1775,7 @@ async fn test_compensation_removes_proofs() {
     // STEP 2: Setup melt saga (this marks proofs as PENDING)
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1543,6 +1797,7 @@ async fn test_compensation_removes_proofs() {
     drop(setup_saga);
 
     // Run recovery which triggers compensation
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -1559,7 +1814,7 @@ async fn test_compensation_removes_proofs() {
 
     let new_verification = mint.verify_inputs(new_request.inputs()).await.unwrap();
     let new_saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1612,7 +1867,7 @@ async fn test_compensation_removes_change_outputs() {
     // STEP 4: Setup melt saga (this stores blinded messages)
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1647,6 +1902,8 @@ async fn test_compensation_removes_change_outputs() {
 
     // STEP 6: Simulate crash and trigger compensation
     drop(setup_saga);
+
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
 
     mint.recover_from_incomplete_melt_sagas()
         .await
@@ -1697,7 +1954,7 @@ async fn test_compensation_resets_quote_state() {
     // STEP 2: Setup melt saga (this changes quote state to PENDING)
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1729,6 +1986,8 @@ async fn test_compensation_resets_quote_state() {
     // STEP 4: Simulate crash and trigger compensation
     drop(setup_saga);
 
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
+
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -1756,7 +2015,7 @@ async fn test_compensation_resets_quote_state() {
 
     let new_verification = mint.verify_inputs(new_request.inputs()).await.unwrap();
     let new_saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1789,7 +2048,7 @@ async fn test_compensation_idempotent() {
     // STEP 2: Setup melt saga
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1812,6 +2071,7 @@ async fn test_compensation_idempotent() {
     drop(setup_saga);
 
     // STEP 4: Run compensation first time
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("First recovery should succeed");
@@ -1829,6 +2089,7 @@ async fn test_compensation_idempotent() {
     assert_eq!(quote_after_first.state, MeltQuoteState::Unpaid);
 
     // STEP 5: Run compensation second time (should be idempotent)
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Second recovery should succeed without errors");
@@ -1852,6 +2113,7 @@ async fn test_compensation_idempotent() {
     );
 
     // STEP 8: Run third time to be extra sure
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Third recovery should also succeed");
@@ -1911,7 +2173,7 @@ async fn test_saga_deleted_after_payment_failure() {
     // STEP 3: Setup melt saga
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -1986,7 +2248,7 @@ async fn test_authoritative_failure_is_durable_before_compensation() {
     let melt_request = create_test_melt_request(&proofs, &quote);
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2046,7 +2308,7 @@ async fn test_failed_recheck_after_unknown_dispatch_is_durable_before_compensati
     let melt_request = create_test_melt_request(&proofs, &quote);
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2106,7 +2368,7 @@ async fn test_failed_recheck_after_error_is_durable_before_compensation() {
     let melt_request = create_test_melt_request(&proofs, &quote);
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2167,7 +2429,7 @@ async fn test_payment_error_with_pending_check_does_not_compensate() {
     let melt_request = create_test_melt_request(&proofs, &quote);
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2195,6 +2457,8 @@ async fn test_payment_error_with_pending_check_does_not_compensate() {
         "a pending backend response should remain recoverable"
     );
     assert_proofs_state(&mint, &input_ys, Some(State::Pending)).await;
+
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
 
     mint.recover_from_incomplete_melt_sagas()
         .await
@@ -2234,7 +2498,7 @@ async fn assert_payment_error_with_terminal_follow_up_compensates(follow_up_stat
     let melt_request = create_test_melt_request(&proofs, &quote);
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2303,7 +2567,7 @@ async fn test_unknown_dispatch_with_unpaid_check_compensates() {
     let melt_request = create_test_melt_request(&proofs, &quote);
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2366,7 +2630,7 @@ async fn test_saga_content_validation() {
     // STEP 2: Setup melt saga
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2493,7 +2757,7 @@ async fn test_saga_state_updates_timestamp() {
     // STEP 2: Setup melt saga and note timestamps
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2563,7 +2827,7 @@ async fn test_get_incomplete_sagas_filters_by_kind() {
 
     let melt_verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let melt_saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2580,9 +2844,11 @@ async fn test_get_incomplete_sagas_filters_by_kind() {
 
     // STEP 3: Create a swap saga
     let swap_proofs = mint_test_proofs(&mint, Amount::from(5_000)).await.unwrap();
-    let swap_verification = crate::mint::Verification {
-        amount: Amount::from(5_000).with_unit(cdk_common::nuts::CurrencyUnit::Sat),
-    };
+    let swap_verification = crate::mint::Verification::new(
+        Amount::from(5_000).with_unit(cdk_common::nuts::CurrencyUnit::Sat),
+        &swap_proofs,
+    )
+    .unwrap();
 
     let (swap_outputs, _) = create_test_blinded_messages(&mint, Amount::from(5_000))
         .await
@@ -2692,7 +2958,7 @@ async fn test_concurrent_melt_operations() {
                 .await
                 .unwrap();
             let saga = MeltSaga::new(
-                std::sync::Arc::new(mint_clone.clone()),
+                std::sync::Arc::clone(&mint_clone),
                 mint_clone.localstore(),
                 mint_clone.pubsub_manager(),
             );
@@ -2758,7 +3024,7 @@ async fn test_concurrent_recovery_and_operations() {
 
     let verification1 = mint.verify_inputs(melt_request1.inputs()).await.unwrap();
     let saga1 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2779,6 +3045,7 @@ async fn test_concurrent_recovery_and_operations() {
     assert_saga_exists(&mint, &incomplete_operation_id).await;
 
     // STEP 3: Create tasks for concurrent recovery and new operation
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     let mint_for_recovery = mint.clone();
     let recovery_task = tokio::spawn(async move {
         mint_for_recovery
@@ -2800,7 +3067,7 @@ async fn test_concurrent_recovery_and_operations() {
             .await
             .unwrap();
         let saga2 = MeltSaga::new(
-            std::sync::Arc::new(mint_for_new_op.clone()),
+            std::sync::Arc::clone(&mint_for_new_op),
             mint_for_new_op.localstore(),
             mint_for_new_op.pubsub_manager(),
         );
@@ -2847,7 +3114,7 @@ async fn test_double_spend_detection() {
 
     let verification1 = mint.verify_inputs(melt_request1.inputs()).await.unwrap();
     let saga1 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2872,7 +3139,7 @@ async fn test_double_spend_detection() {
     // but setup_melt should fail (checks proof states)
     let verification2 = mint.verify_inputs(melt_request2.inputs()).await.unwrap();
     let saga2 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2928,7 +3195,7 @@ async fn test_insufficient_funds() {
     let melt_request = create_test_melt_request(&proofs, &quote);
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -2977,7 +3244,7 @@ async fn test_invalid_quote_id() {
     // Verification might succeed (just checks signatures) or fail (if database issues)
     if let Ok(verification) = verification_result {
         let saga = MeltSaga::new(
-            std::sync::Arc::new(mint.clone()),
+            std::sync::Arc::clone(&mint),
             mint.localstore(),
             mint.pubsub_manager(),
         );
@@ -3031,7 +3298,7 @@ async fn test_quote_already_paid() {
     // Complete the full melt flow
     let verification1 = mint.verify_inputs(melt_request1.inputs()).await.unwrap();
     let saga1 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3075,7 +3342,7 @@ async fn test_quote_already_paid() {
 
     let verification2 = mint.verify_inputs(melt_request2.inputs()).await.unwrap();
     let saga2 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3129,7 +3396,7 @@ async fn test_paid_melt_responses_wait_for_change_commit() {
             .unwrap();
         let request = MeltRequest::new(quote.id.clone(), proofs.clone(), Some(outputs));
         let verification = mint.verify_inputs(request.inputs()).await.unwrap();
-        let setup = MeltSaga::new(Arc::new(mint.clone()), db.clone(), mint.pubsub_manager())
+        let setup = MeltSaga::new(Arc::clone(&mint), db.clone(), mint.pubsub_manager())
             .setup_melt(
                 &request,
                 verification,
@@ -3159,12 +3426,17 @@ async fn test_paid_melt_responses_wait_for_change_commit() {
         .await
         .unwrap();
 
-        assert!(Mint::load_settled_melt_response(&db, &quote.id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            Mint::load_settled_melt_response(&db, &mint.signatory, &quote.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            mint.check_melt_quote(&quote.id).await.unwrap().state(),
+            mint.check_melt_quote(&quote.id, None)
+                .await
+                .unwrap()
+                .state(),
             MeltQuoteState::Pending
         );
         assert_eq!(
@@ -3203,11 +3475,11 @@ async fn test_paid_melt_responses_wait_for_change_commit() {
         .await
         .unwrap();
 
-        let settled = Mint::load_settled_melt_response(&db, &quote.id)
+        let settled = Mint::load_settled_melt_response(&db, &mint.signatory, &quote.id)
             .await
             .unwrap()
             .unwrap();
-        let checked = mint.check_melt_quote(&quote.id).await.unwrap();
+        let checked = mint.check_melt_quote(&quote.id, None).await.unwrap();
         for response in [settled, checked] {
             assert_eq!(response.state(), MeltQuoteState::Paid);
             let amount = response
@@ -3242,7 +3514,7 @@ async fn test_finalize_melt_quote_duplicate_success_is_idempotent() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3302,7 +3574,7 @@ async fn test_concurrent_duplicate_melt_finalization_is_idempotent() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3383,7 +3655,7 @@ async fn test_stale_melt_cleanup_observes_completed_finalization() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3460,7 +3732,7 @@ async fn test_finalize_melt_quote_conflicting_success_is_rejected() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3528,7 +3800,7 @@ async fn test_rollback_melt_quote_duplicate_failure_is_idempotent() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3602,7 +3874,7 @@ async fn test_stale_remove_melt_setup_does_not_clobber_retry() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let first_saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3643,7 +3915,7 @@ async fn test_stale_remove_melt_setup_does_not_clobber_retry() {
     // The client retries the same quote with the same proofs -> saga B.
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let retry_saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3717,7 +3989,7 @@ async fn test_unknown_follow_up_after_payment_error_keeps_proofs_pending() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3774,7 +4046,7 @@ async fn test_quote_already_pending() {
 
     let verification1 = mint.verify_inputs(melt_request1.inputs()).await.unwrap();
     let saga1 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3806,7 +4078,7 @@ async fn test_quote_already_pending() {
 
     let verification2 = mint.verify_inputs(melt_request2.inputs()).await.unwrap();
     let saga2 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3918,7 +4190,7 @@ async fn test_recovery_no_melt_request() {
     // STEP 2: Create incomplete saga
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -3943,6 +4215,7 @@ async fn test_recovery_no_melt_request() {
 
     // STEP 3: Run recovery
     // Should handle gracefully even with no change outputs to clean up
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed without change outputs");
@@ -3974,7 +4247,7 @@ async fn test_recovery_order_on_startup() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4011,6 +4284,7 @@ async fn test_recovery_order_on_startup() {
 
     // STEP 3: Manually trigger recovery (simulating startup)
     // Note: In production, mint.start() calls this automatically
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -4041,7 +4315,7 @@ async fn test_recovery_order_on_startup() {
 
     let new_verification = mint.verify_inputs(new_request.inputs()).await.unwrap();
     let new_saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4073,7 +4347,7 @@ async fn test_no_duplicate_recovery() {
 
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4097,6 +4371,7 @@ async fn test_no_duplicate_recovery() {
     assert_proofs_state(&mint, &input_ys, Some(State::Pending)).await;
 
     // STEP 3: Run recovery first time
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("First recovery should succeed");
@@ -4115,6 +4390,7 @@ async fn test_no_duplicate_recovery() {
 
     // STEP 4: Run recovery again (simulating duplicate execution)
     // Should be idempotent - no errors even though saga is already cleaned up
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Second recovery should succeed (idempotent)");
@@ -4155,7 +4431,7 @@ async fn test_operation_id_uniqueness_and_tracking() {
 
         let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
         let saga = MeltSaga::new(
-            std::sync::Arc::new(mint.clone()),
+            std::sync::Arc::clone(&mint),
             mint.localstore(),
             mint.pubsub_manager(),
         );
@@ -4214,7 +4490,7 @@ async fn test_saga_drop_without_finalize() {
     // STEP 2: Setup saga
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4256,7 +4532,7 @@ async fn test_saga_drop_after_payment() {
     // STEP 2: Setup saga and make payment
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4303,6 +4579,7 @@ async fn test_saga_drop_after_payment() {
     drop(confirmed_saga);
 
     // STEP 5: Run recovery to complete the operation
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -4348,7 +4625,7 @@ async fn test_finalizing_state_resumes_paid_melt() {
     // STEP 2: Setup saga and make payment
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4403,6 +4680,7 @@ async fn test_finalizing_state_resumes_paid_melt() {
     drop(confirmed_saga);
 
     // STEP 5: Run recovery from the durable finalization handoff
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -4446,7 +4724,7 @@ async fn test_setup_complete_state_compensates() {
     // STEP 2: Setup saga but don't make payment
     let verification = mint.verify_inputs(melt_request.inputs()).await.unwrap();
     let saga = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4480,6 +4758,7 @@ async fn test_setup_complete_state_compensates() {
     drop(setup_saga);
 
     // STEP 4: Run recovery - should compensate without payment backend check
+    crate::test_helpers::mint::expire_melt_leases(&mint).await;
     mint.recover_from_incomplete_melt_sagas()
         .await
         .expect("Recovery should succeed");
@@ -4758,7 +5037,7 @@ async fn test_duplicate_lookup_id_prevents_second_pending() {
 
     let verification1 = mint.verify_inputs(melt_request1.inputs()).await.unwrap();
     let saga1 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4804,7 +5083,7 @@ async fn test_duplicate_lookup_id_prevents_second_pending() {
 
     let verification2 = mint.verify_inputs(melt_request2.inputs()).await.unwrap();
     let saga2 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4920,7 +5199,7 @@ async fn test_paid_lookup_id_prevents_pending() {
 
     let verification1 = mint.verify_inputs(melt_request1.inputs()).await.unwrap();
     let saga1 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -4964,7 +5243,7 @@ async fn test_paid_lookup_id_prevents_pending() {
 
     let verification2 = mint.verify_inputs(melt_request2.inputs()).await.unwrap();
     let saga2 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -5021,7 +5300,7 @@ async fn test_different_lookup_ids_allow_concurrent_pending() {
 
     let verification1 = mint.verify_inputs(melt_request1.inputs()).await.unwrap();
     let saga1 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );
@@ -5040,7 +5319,7 @@ async fn test_different_lookup_ids_allow_concurrent_pending() {
 
     let verification2 = mint.verify_inputs(melt_request2.inputs()).await.unwrap();
     let saga2 = MeltSaga::new(
-        std::sync::Arc::new(mint.clone()),
+        std::sync::Arc::clone(&mint),
         mint.localstore(),
         mint.pubsub_manager(),
     );

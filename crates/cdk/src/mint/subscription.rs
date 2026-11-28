@@ -17,6 +17,7 @@ use cdk_common::{
     MintQuoteBolt12Response, MintQuoteCustomResponse, MintQuoteOnchainResponse, MintQuoteState,
     NotificationPayload, ProofState, PublicKey, QuoteId,
 };
+use cdk_signatory::signatory::Signatory;
 
 use super::Mint;
 use crate::event::MintEvent;
@@ -27,6 +28,7 @@ use crate::event::MintEvent;
 pub struct MintPubSubSpec {
     db: DynMintDatabase,
     payment_processors: Arc<HashMap<PaymentProcessorKey, DynMintPayment>>,
+    signatory: Arc<dyn Signatory + Send + Sync>,
     // The manager owns this spec; a strong reference back would retain both forever.
     pubsub_manager: Weak<PubSubManager>,
 }
@@ -81,12 +83,9 @@ impl MintPubSubSpec {
         ) {
             None
         } else {
-            let signatures = self
-                .db
-                .get_blind_signatures_for_quote(quote_id)
+            Mint::load_quote_change_with_dleq(&self.db, &self.signatory, quote_id)
                 .await
-                .map_err(|e| e.to_string())?;
-            (!signatures.is_empty()).then_some(signatures)
+                .map_err(|e| e.to_string())?
         };
         Ok(Some(quote.into_response(change)))
     }
@@ -156,24 +155,34 @@ impl MintPubSubSpec {
                 | NotificationId::MintQuoteCustom(_, uuid) => {
                     if let Some(mint_quote) = mint_quotes.get(uuid).cloned() {
                         let mint_quote = match idx {
-                            NotificationId::MintQuoteBolt11(_) => {
+                            NotificationId::MintQuoteBolt11(_)
+                                if mint_quote.payment_method.is_bolt11() =>
+                            {
                                 let response: MintQuoteBolt11Response<QuoteId> = mint_quote.into();
                                 response.into()
                             }
-                            NotificationId::MintQuoteBolt12(_) => match mint_quote.try_into() {
-                                Ok(response) => {
-                                    let response: MintQuoteBolt12Response<QuoteId> = response;
-                                    response.into()
+                            NotificationId::MintQuoteBolt12(_)
+                                if mint_quote.payment_method.is_bolt12() =>
+                            {
+                                match mint_quote.try_into() {
+                                    Ok(response) => {
+                                        let response: MintQuoteBolt12Response<QuoteId> = response;
+                                        response.into()
+                                    }
+                                    Err(_) => continue,
                                 }
-                                Err(_) => continue,
-                            },
-                            NotificationId::MintQuoteOnchain(_) => match mint_quote.try_into() {
-                                Ok(response) => {
-                                    let response: MintQuoteOnchainResponse<QuoteId> = response;
-                                    response.into()
+                            }
+                            NotificationId::MintQuoteOnchain(_)
+                                if mint_quote.payment_method.is_onchain() =>
+                            {
+                                match mint_quote.try_into() {
+                                    Ok(response) => {
+                                        let response: MintQuoteOnchainResponse<QuoteId> = response;
+                                        response.into()
+                                    }
+                                    Err(_) => continue,
                                 }
-                                Err(_) => continue,
-                            },
+                            }
                             NotificationId::MintQuoteCustom(method, _)
                                 if mint_quote.payment_method
                                     == cdk_common::PaymentMethod::Custom(method.clone()) =>
@@ -224,12 +233,14 @@ impl Spec for MintPubSubSpec {
     type Context = (
         DynMintDatabase,
         Arc<HashMap<PaymentProcessorKey, DynMintPayment>>,
+        Arc<dyn Signatory + Send + Sync>,
     );
 
     fn new_instance(context: Self::Context) -> Arc<Self> {
         Arc::new(Self {
             db: context.0,
             payment_processors: context.1,
+            signatory: context.2,
             pubsub_manager: Weak::new(),
         })
     }
@@ -256,12 +267,14 @@ impl PubSubManager {
         context: (
             DynMintDatabase,
             Arc<HashMap<PaymentProcessorKey, DynMintPayment>>,
+            Arc<dyn Signatory + Send + Sync>,
         ),
     ) -> Arc<Self> {
         Arc::new_cyclic(|manager| {
             Self(Pubsub::new(Arc::new(MintPubSubSpec {
                 db: context.0,
                 payment_processors: context.1,
+                signatory: context.2,
                 pubsub_manager: manager.clone(),
             })))
         })
@@ -434,6 +447,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::mint::tests::{rotated_snapshots, MockSignatory};
 
     fn bolt11_quote(id: QuoteId, amount: u64) -> MintQuote {
         MintQuote::new(
@@ -481,7 +495,11 @@ mod tests {
         add_mint_quote(&db, bolt11_quote(first_quote_id.clone(), 21)).await;
         add_mint_quote(&db, bolt11_quote(second_quote_id.clone(), 34)).await;
 
-        let spec = MintPubSubSpec::new_instance((db, Arc::new(HashMap::new())));
+        let snaps = rotated_snapshots(1).await;
+        let signatory = MockSignatory::new(snaps[0].clone());
+
+        let spec =
+            MintPubSubSpec::new_instance((db, Arc::new(HashMap::new()), Arc::new(signatory)));
         let events = spec
             .get_events_from_db(&[
                 NotificationId::MintQuoteBolt11(first_quote_id.clone()),
@@ -585,9 +603,15 @@ mod tests {
         use cdk_common::nut00::KnownMethod;
         use cdk_common::PaymentMethod;
 
+        let snaps = rotated_snapshots(1).await;
+        let signatory = MockSignatory::new(snaps[0].clone());
         let db: DynMintDatabase =
             Arc::new(cdk_sqlite::mint::memory::empty().await.expect("database"));
-        let spec = MintPubSubSpec::new_instance((db.clone(), Arc::new(HashMap::new())));
+        let spec = MintPubSubSpec::new_instance((
+            db.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(signatory),
+        ));
         for method in [
             PaymentMethod::Known(KnownMethod::Bolt11),
             PaymentMethod::Known(KnownMethod::Bolt12),
@@ -634,7 +658,13 @@ mod tests {
 
         let db: DynMintDatabase =
             Arc::new(cdk_sqlite::mint::memory::empty().await.expect("database"));
-        let spec = MintPubSubSpec::new_instance((db.clone(), Arc::new(HashMap::new())));
+        let snaps = rotated_snapshots(1).await;
+        let signatory = MockSignatory::new(snaps[0].clone());
+        let spec = MintPubSubSpec::new_instance((
+            db.clone(),
+            Arc::new(HashMap::new()),
+            Arc::new(signatory),
+        ));
         for method in [
             KnownMethod::Bolt11,
             KnownMethod::Bolt12,
@@ -694,7 +724,10 @@ mod tests {
             .try_update_mint_quote_last_checked(&quote.id, cdk_common::util::unix_time(), 0)
             .await
             .expect("record payment check"));
-        let spec = MintPubSubSpec::new_instance((db, Arc::new(HashMap::new())));
+        let snaps = rotated_snapshots(1).await;
+        let signatory = MockSignatory::new(snaps[0].clone());
+        let spec =
+            MintPubSubSpec::new_instance((db, Arc::new(HashMap::new()), Arc::new(signatory)));
         let events = spec
             .get_events_from_db(&[
                 NotificationId::MintQuoteCustom(method.clone(), quote.id.clone()),
@@ -718,6 +751,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_events_from_db_skips_mint_quotes_of_another_method() {
+        let db: DynMintDatabase =
+            Arc::new(cdk_sqlite::mint::memory::empty().await.expect("database"));
+        let pubkey = cdk_common::SecretKey::generate().public_key();
+
+        // Both quotes carry a NUT-20 pubkey, so every known response type can be built from
+        // them and only the payment method tells them apart.
+        let mut bolt11 = bolt11_quote(QuoteId::new(), 21);
+        bolt11.pubkey = Some(pubkey);
+        let mut bolt12 = bolt11_quote(QuoteId::new(), 34);
+        bolt12.pubkey = Some(pubkey);
+        bolt12.payment_method =
+            cdk_common::PaymentMethod::Known(cdk_common::nut00::KnownMethod::Bolt12);
+
+        for quote in [&bolt11, &bolt12] {
+            add_mint_quote(&db, quote.clone()).await;
+            assert!(db
+                .try_update_mint_quote_last_checked(&quote.id, cdk_common::util::unix_time(), 0)
+                .await
+                .expect("record payment check"));
+        }
+
+        let snaps = rotated_snapshots(1).await;
+        let signatory = MockSignatory::new(snaps[0].clone());
+
+        let spec =
+            MintPubSubSpec::new_instance((db, Arc::new(HashMap::new()), Arc::new(signatory)));
+
+        let events = spec
+            .get_events_from_db(&[
+                NotificationId::MintQuoteBolt12(bolt11.id.clone()),
+                NotificationId::MintQuoteOnchain(bolt11.id.clone()),
+                NotificationId::MintQuoteBolt11(bolt12.id.clone()),
+                NotificationId::MintQuoteOnchain(bolt12.id.clone()),
+            ])
+            .await
+            .expect("backfill");
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+
+        let events = spec
+            .get_events_from_db(&[
+                NotificationId::MintQuoteBolt11(bolt11.id.clone()),
+                NotificationId::MintQuoteBolt12(bolt12.id.clone()),
+            ])
+            .await
+            .expect("backfill");
+        assert_eq!(events.len(), 2);
+        match events[0].inner() {
+            NotificationPayload::MintQuoteBolt11Response(response) => {
+                assert_eq!(response.quote, bolt11.id);
+            }
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+        match events[1].inner() {
+            NotificationPayload::MintQuoteBolt12Response(response) => {
+                assert_eq!(response.quote, bolt12.id);
+            }
+            payload => panic!("unexpected payload: {payload:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn get_events_from_db_backfills_custom_melt_quotes() {
         let db: DynMintDatabase =
             Arc::new(cdk_sqlite::mint::memory::empty().await.expect("database"));
@@ -728,7 +823,10 @@ mod tests {
         );
         quote.extra_json = Some(serde_json::json!({"receipt": "melt-receipt"}));
         let change = add_melt_quote(&db, quote.clone(), true).await;
-        let spec = MintPubSubSpec::new_instance((db, Arc::new(HashMap::new())));
+        let snaps = rotated_snapshots(1).await;
+        let signatory = MockSignatory::new(snaps[0].clone());
+        let spec =
+            MintPubSubSpec::new_instance((db, Arc::new(HashMap::new()), Arc::new(signatory)));
         let events = spec
             .get_events_from_db(&[
                 NotificationId::MeltQuoteCustom(method.clone(), quote.id.clone()),
@@ -856,7 +954,10 @@ mod tests {
                     PaymentProcessorKey::new(CurrencyUnit::Sat, method),
                     backend.clone() as DynMintPayment,
                 )]);
-                let manager = PubSubManager::new((db.clone(), Arc::new(processors)));
+                let snaps = rotated_snapshots(1).await;
+                let signatory = MockSignatory::new(snaps[0].clone());
+                let manager =
+                    PubSubManager::new((db.clone(), Arc::new(processors), Arc::new(signatory)));
                 let params = Params {
                     kind,
                     filters: vec![quote.id.to_string()],
@@ -920,7 +1021,9 @@ mod tests {
         let db: DynMintDatabase =
             Arc::new(cdk_sqlite::mint::memory::empty().await.expect("database"));
         let db_weak = Arc::downgrade(&db);
-        let manager = PubSubManager::new((db, Arc::new(HashMap::new())));
+        let snaps = rotated_snapshots(1).await;
+        let signatory = MockSignatory::new(snaps[0].clone());
+        let manager = PubSubManager::new((db, Arc::new(HashMap::new()), Arc::new(signatory)));
         let manager_weak = Arc::downgrade(&manager);
         drop(manager);
         assert!(manager_weak.upgrade().is_none());

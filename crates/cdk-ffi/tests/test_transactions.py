@@ -112,7 +112,8 @@ async def test_wallet_keyset_management():
             id=keyset_id.hex,
             unit=cdk_ffi.CurrencyUnit.SAT(),
             active=True,
-            input_fee_ppk=0
+            input_fee_ppk=0,
+            final_expiry=1900000000
         )
         await db.add_mint_keysets(mint_url, [keyset_info])
         print("✓ Added mint and keyset")
@@ -121,6 +122,7 @@ async def test_wallet_keyset_management():
         keyset = await db.get_keyset_by_id(keyset_id)
         assert keyset is not None, "Keyset should exist"
         assert keyset.id == keyset_id.hex, "Keyset ID should match"
+        assert keyset.final_expiry == 1900000000, "Keyset expiry should survive the round trip"
         print(f"✓ Retrieved keyset: {keyset.id}")
 
         # Query keysets for mint
@@ -155,7 +157,8 @@ async def test_wallet_keyset_counter():
             id=keyset_id.hex,
             unit=cdk_ffi.CurrencyUnit.SAT(),
             active=True,
-            input_fee_ppk=0
+            input_fee_ppk=0,
+            final_expiry=None
         )
         await db.add_mint_keysets(mint_url, [keyset_info])
         print("✓ Setup complete")
@@ -258,6 +261,12 @@ async def test_wallet_derivation_counter():
         assert counter2 == 6, f"Expected counter 6, got {counter2}"
         assert counter3 == 6, f"Expected current counter 6, got {counter3}"
         assert p2pk_counter == 2, f"Expected independent counter 2, got {p2pk_counter}"
+
+        indexes = await asyncio.gather(
+            *(db.reserve_derivation_index("p2pk", 6) for _ in range(8))
+        )
+        assert sorted(indexes) == list(range(6, 14)), indexes
+        assert await db.reserve_derivation_index("p2pk", 6) == 14
 
         print("✓ Test passed: namespaced derivation counters work")
 

@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -17,10 +17,13 @@ use cdk_common::payment::{
 use cdk_common::quote_id::QuoteId;
 use cdk_common::subscription::Params;
 use cdk_common::{
-    MeltOptions, MeltQuoteBolt12Request, MeltQuoteCreateResponse, MeltQuoteCustomRequest,
-    MeltQuoteCustomResponse, MeltQuoteOnchainRequest, MeltQuoteOnchainResponse, MeltQuoteResponse,
+    BlindSignature, MeltOptions, MeltQuoteBolt12Request, MeltQuoteCreateResponse,
+    MeltQuoteCustomRequest, MeltQuoteCustomResponse, MeltQuoteOnchainRequest,
+    MeltQuoteOnchainResponse, MeltQuoteResponse,
 };
+use cdk_signatory::signatory::{ReconstructDleqArguments, Signatory};
 use lightning::offers::offer::Offer;
+use tokio::task::JoinHandle;
 use tracing::instrument;
 
 use super::{
@@ -33,6 +36,7 @@ use crate::types::PaymentProcessorKey;
 use crate::util::unix_time;
 use crate::{ensure_cdk, Amount, Error};
 
+pub(crate) mod lease;
 pub(crate) mod melt_saga;
 pub(crate) mod shared;
 
@@ -63,7 +67,7 @@ fn pending_melt_notification_wait_interval() -> Duration {
 #[derive(Debug)]
 pub struct PendingMelt {
     response: MeltQuoteResponse<QuoteId>,
-    completion: tokio::task::JoinHandle<Result<MeltQuoteResponse<QuoteId>, Error>>,
+    completion: JoinHandle<Result<MeltQuoteResponse<QuoteId>, Error>>,
 }
 
 impl PendingMelt {
@@ -77,6 +81,13 @@ impl PendingMelt {
         self.response
     }
 
+    /// Whether the caller has to answer with the pending response instead of
+    /// awaiting settlement: an onchain payment confirms on chain time, so the
+    /// NUT-05 async flow is the only workable one.
+    pub fn requires_async_response(&self) -> bool {
+        self.response.method() == PaymentMethod::Known(KnownMethod::Onchain)
+    }
+
     async fn wait(self) -> Result<MeltQuoteResponse<QuoteId>, Error> {
         match self.completion.await {
             Ok(result) => result,
@@ -88,7 +99,7 @@ impl PendingMelt {
     }
 }
 
-impl std::future::IntoFuture for PendingMelt {
+impl IntoFuture for PendingMelt {
     type Output = Result<MeltQuoteResponse<QuoteId>, Error>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
 
@@ -144,11 +155,60 @@ impl Mint {
                     .is_some()
                 {
                     quote.state = MeltQuoteState::Pending;
+                    quote.payment_proof = None;
                 }
             }
         }
         tx.rollback().await?;
         Ok(quote)
+    }
+
+    /// Loads stored change blind signatures for a quote and reconstructs their DLEQ proofs
+    /// in a single batched signatory call.
+    pub(crate) async fn load_quote_change_with_dleq(
+        localstore: &DynMintDatabase,
+        signatory: &Arc<dyn Signatory + Send + Sync>,
+        quote_id: &QuoteId,
+    ) -> Result<Option<Vec<BlindSignature>>, Error> {
+        let signatures_and_secrets = localstore
+            .get_blind_signatures_and_secret_for_quote(quote_id)
+            .await?;
+
+        if signatures_and_secrets.is_empty() {
+            return Ok(None);
+        }
+
+        let args: Vec<ReconstructDleqArguments> = signatures_and_secrets
+            .iter()
+            .map(|(blind_signature, blind_secret)| ReconstructDleqArguments {
+                blind_signature: blind_signature.clone(),
+                blind_secret: *blind_secret,
+            })
+            .collect();
+
+        let blind_signatures = match signatory.reconstruct_dleq(args).await {
+            Ok(with_dleq) => with_dleq,
+            Err(Error::SignatureMissingOrInvalid) => {
+                tracing::error!(
+                    %quote_id,
+                    "Stored change signature failed DLEQ reconstruction; possible corrupted state"
+                );
+                return Err(Error::SignatureMissingOrInvalid);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %quote_id,
+                    error = %err,
+                    "Could not reconstruct DLEQ for change signatures; serving them without DLEQ"
+                );
+                signatures_and_secrets
+                    .into_iter()
+                    .map(|(blind_signature, _)| blind_signature)
+                    .collect()
+            }
+        };
+
+        Ok(Some(blind_signatures))
     }
 
     /// Loads a settled (non-pending, non-unknown) melt response from the database.
@@ -167,6 +227,7 @@ impl Mint {
     /// state.
     async fn load_settled_melt_response(
         localstore: &DynMintDatabase,
+        signatory: &Arc<dyn Signatory + Send + Sync>,
         quote_id: &QuoteId,
     ) -> Result<Option<MeltQuoteResponse<QuoteId>>, Error> {
         let quote = Self::load_melt_quote_for_response(localstore, quote_id)
@@ -180,14 +241,9 @@ impl Mint {
             return Ok(None);
         }
 
-        let change = localstore.get_blind_signatures_for_quote(quote_id).await?;
-        let change_opt = if change.is_empty() {
-            None
-        } else {
-            Some(change)
-        };
+        let change = Self::load_quote_change_with_dleq(localstore, signatory, quote_id).await?;
 
-        Ok(Some(quote.into_response(change_opt)))
+        Ok(Some(quote.into_response(change)))
     }
 
     #[instrument(skip_all)]
@@ -807,10 +863,16 @@ impl Mint {
     }
 
     /// Check melt quote status
+    ///
+    /// Takes `expected_method` rather than leaving the caller to check the
+    /// scoping separately, which cost a second read of the quote. A quote
+    /// created for another method is rejected before the pending-melt handling
+    /// below can act on it.
     #[instrument(skip(self))]
     pub async fn check_melt_quote(
         &self,
         quote_id: &QuoteId,
+        expected_method: Option<&PaymentMethod>,
     ) -> Result<MeltQuoteResponse<QuoteId>, Error> {
         #[cfg(feature = "prometheus")]
         let metrics = super::MintMetricGuard::new("check_melt_quote");
@@ -822,17 +884,18 @@ impl Mint {
                 .await?
                 .ok_or(Error::UnknownQuote)?;
 
+            if expected_method.is_some_and(|expected| &quote.payment_method != expected) {
+                return Err(Error::InvalidPaymentMethod);
+            }
+
             self.handle_pending_melt_quote(&mut quote).await?;
             let quote = Self::load_melt_quote_for_response(&self.localstore, quote_id)
                 .await?
                 .ok_or(Error::UnknownQuote)?;
 
-            let blind_signatures = self
-                .localstore
-                .get_blind_signatures_for_quote(quote_id)
-                .await?;
-
-            let change = (!blind_signatures.is_empty()).then_some(blind_signatures);
+            let change =
+                Self::load_quote_change_with_dleq(&self.localstore, &self.signatory, quote_id)
+                    .await?;
 
             let response = match quote.payment_method {
                 PaymentMethod::Known(KnownMethod::Bolt11) => {
@@ -869,7 +932,9 @@ impl Mint {
                     MeltQuoteResponse::Onchain(response)
                 }
                 _ => {
-                    let custom_response: MeltQuoteCustomResponse<QuoteId> = quote.clone().into();
+                    let mut custom_response: MeltQuoteCustomResponse<QuoteId> =
+                        quote.clone().into();
+                    custom_response.change = change;
                     MeltQuoteResponse::Custom((quote.payment_method.clone(), custom_response))
                 }
             };
@@ -898,6 +963,26 @@ impl Mint {
         Ok(quote.payment_method)
     }
 
+    /// Melt counterpart of [`Mint::ensure_mint_quote_methods`].
+    ///
+    /// Melting has no folded form: the check has to clear before the payment
+    /// executes, and a mismatch caught afterwards would report an error for a
+    /// payment that already settled and burned the inputs.
+    pub async fn ensure_melt_quote_method<M>(
+        &self,
+        method: M,
+        quote_id: &QuoteId,
+    ) -> Result<(), Error>
+    where
+        M: Into<PaymentMethod>,
+    {
+        if self.get_melt_quote_method(quote_id).await? != method.into() {
+            return Err(Error::InvalidPaymentMethod);
+        }
+
+        Ok(())
+    }
+
     /// Get melt quotes
     #[instrument(skip_all)]
     pub async fn melt_quotes(&self) -> Result<Vec<MeltQuote>, Error> {
@@ -909,7 +994,10 @@ impl Mint {
     ///
     /// Uses MeltSaga typestate pattern for atomic transaction handling with automatic rollback on failure.
     #[instrument(skip_all)]
-    pub async fn melt(&self, melt_request: &MeltRequest<QuoteId>) -> Result<PendingMelt, Error> {
+    pub async fn melt(
+        self: &Arc<Self>,
+        melt_request: &MeltRequest<QuoteId>,
+    ) -> Result<PendingMelt, Error> {
         // Check max outputs limit (if change outputs are provided)
         if let Some(outputs) = melt_request.outputs() {
             let outputs_count = outputs.len();
@@ -944,7 +1032,7 @@ impl Mint {
         let active_melt_guard = quote_lock.lock_owned().await;
 
         let init_saga = MeltSaga::new(
-            std::sync::Arc::new(self.clone()),
+            Arc::clone(self),
             self.localstore.clone(),
             std::sync::Arc::clone(&self.pubsub_manager),
         );
@@ -954,10 +1042,12 @@ impl Mint {
             .setup_melt(melt_request, verification, quote.payment_method.clone())
             .await?;
 
+        let mut lease = lease::MeltLease::owned(self.localstore.clone(), setup_saga.lease_quote());
         let melt_request_owned = melt_request.clone();
         let quote_id_for_log = quote_id.clone();
         let localstore = self.localstore();
         let pubsub = self.pubsub_manager();
+        let signatory = self.signatory.clone();
 
         let quote_for_spawn = quote.clone();
         let completion = tokio::spawn(async move {
@@ -966,70 +1056,109 @@ impl Mint {
                 quote_id_for_log
             );
 
-            // Step 2: Attempt internal settlement (returns saga + SettlementDecision)
-            // Note: Compensation is handled internally if this fails
-            let result = match setup_saga
-                .attempt_internal_settlement(&melt_request_owned)
-                .await
-            {
-                Ok((setup_saga, settlement)) => {
-                    // Step 3: Make payment (internal or external)
-                    let payment_outcome = setup_saga.make_payment(settlement).await;
+            let payment_outcome = lease
+                .run(async {
+                    let (setup_saga, settlement) = setup_saga
+                        .attempt_internal_settlement(&melt_request_owned)
+                        .await?;
+                    setup_saga.make_payment(settlement).await
+                })
+                .await;
 
-                    // Once the backend has returned a pending/unknown outcome,
-                    // dispatch is complete and explicit quote checks may safely
-                    // reconcile it. Confirmed payments keep the guard through
-                    // finalization.
-                    if matches!(&payment_outcome, Ok(PaymentOutcome::Pending { .. })) {
-                        drop(active_melt_guard);
-                    }
+            let result = match payment_outcome {
+                Ok(PaymentOutcome::Confirmed(payment_saga)) => {
+                    lease.run(payment_saga.finalize()).await
+                }
+                Ok(PaymentOutcome::Pending {
+                    #[cfg(feature = "prometheus")]
+                    metrics,
+                }) => {
+                    lease.release().await;
+                    drop(active_melt_guard);
+                    let result = async {
+                        // Wait for the background task to complete the payment
+                        let kind = match quote_for_spawn.payment_method {
+                            PaymentMethod::Known(KnownMethod::Bolt11) => Kind::Bolt11MeltQuote,
+                            PaymentMethod::Known(KnownMethod::Bolt12) => Kind::Bolt12MeltQuote,
+                            PaymentMethod::Known(KnownMethod::Onchain) => Kind::OnchainMeltQuote,
+                            PaymentMethod::Custom(ref method) => {
+                                Kind::Custom(format!("{}_melt_quote", method))
+                            }
+                        };
 
-                    match payment_outcome {
-                        Ok(PaymentOutcome::Confirmed(payment_saga)) => {
-                            // Step 4: Finalize (TX2 - marks spent, issues change)
-                            payment_saga.finalize().await
-                        }
-                        Ok(PaymentOutcome::Pending {
-                            #[cfg(feature = "prometheus")]
-                            metrics,
-                        }) => {
-                            let result = async {
-                                // Wait for the background task to complete the payment
-                                let kind = match quote_for_spawn.payment_method {
-                                    PaymentMethod::Known(KnownMethod::Bolt11) => {
-                                        Kind::Bolt11MeltQuote
+                        let sub_id = crate::subscription::SubId::from(format!(
+                            "melt_sync_wait_{}",
+                            quote_id_for_log
+                        ));
+                        let params = Params {
+                            id: Arc::new(sub_id),
+                            kind,
+                            filters: vec![quote_id_for_log.to_string()],
+                        };
+
+                        let mut sub = match pubsub.subscribe(params) {
+                            Ok(sub) => sub,
+                            Err(_err) => return Err(Error::Internal),
+                        };
+
+                        let start = tokio::time::Instant::now();
+
+                        loop {
+                            if let Some(response) = Self::load_settled_melt_response(
+                                &localstore,
+                                &signatory,
+                                &quote_id_for_log,
+                            )
+                            .await?
+                            {
+                                return Ok(response);
+                            }
+
+                            if start.elapsed() >= pending_melt_wait_timeout() {
+                                return Err(Error::PendingMeltTimeout {
+                                    last_backend_error: None,
+                                });
+                            }
+
+                            let Ok(maybe_event) = tokio::time::timeout(
+                                pending_melt_notification_wait_interval(),
+                                sub.recv(),
+                            )
+                            .await
+                            else {
+                                continue;
+                            };
+
+                            if let Some(event) = maybe_event {
+                                let (event_quote_id, state) = match event.into_inner() {
+                                    NotificationPayload::MeltQuoteBolt11Response(r) => {
+                                        (r.quote, r.state)
                                     }
-                                    PaymentMethod::Known(KnownMethod::Bolt12) => {
-                                        Kind::Bolt12MeltQuote
+                                    NotificationPayload::MeltQuoteBolt12Response(r) => {
+                                        (r.quote, r.state)
                                     }
-                                    PaymentMethod::Known(KnownMethod::Onchain) => {
-                                        Kind::OnchainMeltQuote
+                                    NotificationPayload::CustomMeltQuoteResponse(_, r) => {
+                                        (r.quote, r.state)
                                     }
-                                    PaymentMethod::Custom(ref method) => {
-                                        Kind::Custom(format!("{}_melt_quote", method))
+                                    // Onchain is the one method where the subscription
+                                    // fast-path is most valuable, because confirmation is
+                                    // inherently asynchronous. We subscribe to
+                                    // `OnchainMeltQuote` events above (see `Kind` mapping)
+                                    // and must handle them here; otherwise onchain waiters
+                                    // would rely solely on the
+                                    // explicit quote-check path.
+                                    NotificationPayload::MeltQuoteOnchainResponse(r) => {
+                                        (r.quote, r.state)
                                     }
+                                    _ => continue,
                                 };
 
-                                let sub_id = crate::subscription::SubId::from(format!(
-                                    "melt_sync_wait_{}",
-                                    quote_id_for_log
-                                ));
-                                let params = Params {
-                                    id: Arc::new(sub_id),
-                                    kind,
-                                    filters: vec![quote_id_for_log.to_string()],
-                                };
-
-                                let mut sub = match pubsub.subscribe(params) {
-                                    Ok(sub) => sub,
-                                    Err(_err) => return Err(Error::Internal),
-                                };
-
-                                let start = tokio::time::Instant::now();
-
-                                loop {
+                                if event_quote_id == quote_id_for_log
+                                    && state != MeltQuoteState::Pending
+                                {
                                     if let Some(response) = Self::load_settled_melt_response(
                                         &localstore,
+                                        &signatory,
                                         &quote_id_for_log,
                                     )
                                     .await?
@@ -1082,6 +1211,7 @@ impl Mint {
                                             if let Some(response) =
                                                 Self::load_settled_melt_response(
                                                     &localstore,
+                                                    &signatory,
                                                     &quote_id_for_log,
                                                 )
                                                 .await?
@@ -1092,20 +1222,20 @@ impl Mint {
                                     }
                                 }
                             }
-                            .await;
-
-                            #[cfg(feature = "prometheus")]
-                            if let Some(metrics) = metrics {
-                                metrics.record(result.is_ok());
-                            }
-
-                            result
                         }
-                        Err(err) => Err(err),
                     }
+                    .await;
+
+                    #[cfg(feature = "prometheus")]
+                    if let Some(metrics) = metrics {
+                        metrics.record(result.is_ok());
+                    }
+
+                    result
                 }
                 Err(err) => Err(err),
             };
+            lease.release().await;
 
             match &result {
                 Ok(_) => {

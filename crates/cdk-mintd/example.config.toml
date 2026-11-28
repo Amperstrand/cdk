@@ -17,6 +17,16 @@ mnemonic = "env:CDK_MINTD_MNEMONIC"
 # If unset (default), existing keysets are preserved, but new ones use V2.
 # use_keyset_v2 = true
 
+# Explicit keyset version: "v1" or "v2". Takes precedence over use_keyset_v2.
+# keyset_version = "v2"
+
+# How often, in milliseconds, the embedded signatory reloads keysets from the
+# database. Off by default: a single mint owns its database and needs no
+# polling. Set it only when several mints or signatories share one database, so
+# each picks up another's rotation without a restart. It has no effect with a
+# remote [signatory]; that process takes --keyset-refresh-interval-ms instead.
+# keyset_refresh_interval_ms = 5000
+
 [info.quote_ttl]
 # Prefer explicit fields over inline tables for readability and reviewable edits
 mint_ttl = 600
@@ -257,8 +267,8 @@ onchain_backend = "fakewallet"
 # allow_self_payment = true # Optional, defaults to true. Allow circular payments back to this LND node.
 
 # [ldk_node]
-# fee_percent = 0.02         # Optional, defaults to 2%
-# reserve_fee_min = 2        # Optional, defaults to 2 sats
+# fee_percent = 0.04         # Optional, defaults to 4%
+# reserve_fee_min = 4        # Optional, defaults to 4 sats
 # bitcoin_network = "signet"  # REQUIRED: mainnet, testnet, signet, regtest (no default)
 # chain_source_type = "esplora"  # esplora, electrum, bitcoinrpc
 # 
@@ -273,8 +283,6 @@ onchain_backend = "fakewallet"
 # 
 # # Mutinynet configuration (recommended for testing)
 # esplora_url = "https://mutinynet.com/api"
-# gossip_source_type = "rgs"  # Use RGS for better performance
-# rgs_url = "https://rgs.mutinynet.com/snapshot/0"
 # storage_dir_path = "~/.cdk-ldk-node/mutinynet"
 # log_dir_path = ".cdk-ldk-node/ldk-node/ldk_node.log"
 
@@ -282,13 +290,11 @@ onchain_backend = "fakewallet"
 # # Testnet configuration
 # # bitcoin_network = "testnet"
 # # esplora_url = "https://blockstream.info/testnet/api"
-# # rgs_url = "https://rapidsync.lightningdevkit.org/snapshot"
 # # storage_dir_path = "~/.cdk-ldk-node/testnet"
 # 
 # # Mainnet configuration (CAUTION: Real Bitcoin!)
 # # bitcoin_network = "mainnet"
 # # esplora_url = "https://blockstream.info/api"  
-# # rgs_url = "https://rapidsync.lightningdevkit.org/snapshot"
 # # storage_dir_path = "~/.cdk-ldk-node/mainnet"
 # 
 # # Bitcoin RPC configuration (when chain_source_type = "bitcoinrpc")
@@ -304,9 +310,6 @@ onchain_backend = "fakewallet"
 # ldk_node_host = "127.0.0.1"
 # ldk_node_port = 8090
 
-# 
-# # Gossip source configuration  
-# gossip_source_type = "p2p"  # p2p (direct peer-to-peer) or rgs (rapid gossip sync)
 # 
 # # Webserver configuration for LDK node management interface
 # webserver_host = "127.0.0.1"  # Default: 127.0.0.1
@@ -332,7 +335,7 @@ max_delay_time = 3
 # Optional keyset rotations to create inactive/expired test keysets
 # Each rotation creates a keyset that gets rotated out during mint build
 # unit: currency unit (e.g. "sat", "usd")
-# version: "v1" (Version00) or "v2" (Version01)
+# version: "v1" (Version00, default) or "v2" (Version01); other values are rejected
 # input_fee_ppk: input fee in parts per thousand (default: 0)
 # expired: if true, keyset is created with a past expiry timestamp (default: false)
 #

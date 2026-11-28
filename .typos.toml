@@ -2,7 +2,8 @@
 extend-exclude = [
     "target/",
     "bindings/dart/flutter_example",
-    "Cargo.lock.msrv"
+    "Cargo.lock.msrv",
+    "tests/rusqlite-compat/Cargo.lock.min"
 ]
 
 [default]
@@ -21,3 +22,6 @@ extend-ignore-re = [
     "lnbc[A-Za-z0-9-_]+",
     "Writeable"
 ]
+
+[default.extend-words]
+rith = "rith"

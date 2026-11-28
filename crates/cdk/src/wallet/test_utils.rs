@@ -27,7 +27,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::nuts::{
     nut17, nut19, BatchCheckMintQuoteRequest, BatchMintRequest, BlindSignature, BlindedMessage,
     MeltQuoteBolt11Response, MeltQuoteState, NUT04Settings, NUT05Settings, PaymentMethod,
-    SecretKey, State,
+    ProofState, SecretKey, State,
 };
 use crate::secret::Secret;
 use crate::wallet::{MintConnector, Wallet};
@@ -503,6 +503,11 @@ pub struct MockMintConnector {
     pub mint_info: Mutex<MintInfo>,
     /// Response for post_check_state calls
     pub check_state_response: Mutex<Option<Result<CheckStateResponse, Error>>>,
+    /// Per-proof states answered by post_check_state when no response is configured.
+    ///
+    /// Unlike `check_state_response`, this answers for the ys the wallet
+    /// actually asked about (unknown ys are Unspent).
+    pub proof_states: Mutex<HashMap<crate::nuts::PublicKey, State>>,
     /// Response for post_restore calls
     pub restore_response: Mutex<Option<Result<RestoreResponse, Error>>>,
     /// Response for get_melt_quote_status calls
@@ -572,6 +577,8 @@ pub struct MockMintConnector {
     /// `MintConnector` default, so a test paying an HTTP-only payment request
     /// has to opt in.
     pub payment_request_deliverability: Mutex<PaymentRequestDeliverability>,
+    /// Fail keyset and key requests as if the mint were unreachable
+    pub keysets_unavailable: Mutex<bool>,
 }
 
 /// What a [`MockMintConnector`] reports for a NUT-18 receiver URL.
@@ -601,6 +608,7 @@ impl MockMintConnector {
             keysets: Mutex::new(vec![keyset]),
             mint_info: Mutex::new(mint_info),
             check_state_response: Mutex::new(None),
+            proof_states: Mutex::new(HashMap::new()),
             restore_response: Mutex::new(None),
             melt_quote_status_response: Mutex::new(None),
             melt_quote_status_responses: Mutex::new(std::collections::VecDeque::new()),
@@ -628,11 +636,17 @@ impl MockMintConnector {
             #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
             dns_txt_response: Mutex::new(None),
             payment_request_deliverability: Mutex::new(PaymentRequestDeliverability::Unsupported),
+            keysets_unavailable: Mutex::new(false),
         }
     }
 
     pub fn set_check_state_response(&self, response: Result<CheckStateResponse, Error>) {
         *self.check_state_response.lock().unwrap() = Some(response);
+    }
+
+    /// Set the state the mock mint reports for a proof `y`.
+    pub fn set_proof_state(&self, y: crate::nuts::PublicKey, state: State) {
+        self.proof_states.lock().unwrap().insert(y, state);
     }
 
     pub fn set_mint_keys_response(&self, response: Result<Vec<KeySet>, Error>) {
@@ -680,6 +694,18 @@ impl MockMintConnector {
             Ok(mint_info) => *self.mint_info.lock().unwrap() = mint_info,
             Err(_) => unimplemented!("error responses for mint info state are not supported"),
         }
+    }
+
+    /// Make keyset and key requests fail with a network error.
+    pub fn set_keysets_unavailable(&self, unavailable: bool) {
+        *self.keysets_unavailable.lock().unwrap() = unavailable;
+    }
+
+    fn check_keysets_available(&self) -> Result<(), Error> {
+        if *self.keysets_unavailable.lock().unwrap() {
+            return Err(Error::HttpError(Some(503), "unavailable".to_string()));
+        }
+        Ok(())
     }
 
     pub fn set_active_keyset(&self, keyset: KeySet) {
@@ -946,10 +972,12 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn get_mint_keys(&self) -> Result<Vec<crate::nuts::KeySet>, Error> {
+        self.check_keysets_available()?;
         Ok(self.keysets.lock().unwrap().clone())
     }
 
     async fn get_mint_keyset(&self, keyset_id: Id) -> Result<crate::nuts::KeySet, Error> {
+        self.check_keysets_available()?;
         self.keysets
             .lock()
             .unwrap()
@@ -960,6 +988,7 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn get_mint_keysets(&self) -> Result<KeysetResponse, Error> {
+        self.check_keysets_available()?;
         let keysets = self.keysets.lock().unwrap();
 
         Ok(KeysetResponse {
@@ -1062,17 +1091,22 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn post_swap(&self, request: SwapRequest) -> Result<SwapResponse, Error> {
-        self.captured_swap_requests.lock().unwrap().push(request);
         let queued = self.post_swap_responses.lock().unwrap().pop_front();
-        match queued {
-            Some(response) => response,
-            None => self
-                .post_swap_response
-                .lock()
-                .unwrap()
-                .take()
-                .expect("MockMintConnector: post_swap called without configured response"),
+        if let Some(response) = queued {
+            self.captured_swap_requests.lock().unwrap().push(request);
+            return response;
         }
+        if let Some(response) = self.post_swap_response.lock().unwrap().take() {
+            self.captured_swap_requests.lock().unwrap().push(request);
+            return response;
+        }
+        self.captured_swap_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        self.sign_outputs(request.outputs())
+            .expect("MockMintConnector: post_swap called without configured response")
+            .map(|signatures| SwapResponse { signatures })
     }
 
     async fn get_mint_info(&self) -> Result<crate::nuts::MintInfo, Error> {
@@ -1081,13 +1115,29 @@ impl MintConnector for MockMintConnector {
 
     async fn post_check_state(
         &self,
-        _request: CheckStateRequest,
+        request: CheckStateRequest,
     ) -> Result<CheckStateResponse, Error> {
-        self.check_state_response
-            .lock()
-            .unwrap()
-            .take()
-            .expect("MockMintConnector: post_check_state called without configured response")
+        if let Some(response) = self.check_state_response.lock().unwrap().take() {
+            return response;
+        }
+
+        let proof_states = self.proof_states.lock().unwrap();
+        assert!(
+            !proof_states.is_empty(),
+            "MockMintConnector: post_check_state called without configured response"
+        );
+
+        Ok(CheckStateResponse {
+            states: request
+                .ys
+                .into_iter()
+                .map(|y| ProofState {
+                    y,
+                    state: proof_states.get(&y).copied().unwrap_or(State::Unspent),
+                    witness: None,
+                })
+                .collect(),
+        })
     }
 
     async fn post_restore(&self, _request: RestoreRequest) -> Result<RestoreResponse, Error> {

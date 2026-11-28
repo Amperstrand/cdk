@@ -10,14 +10,13 @@ use async_trait::async_trait;
 use cdk_common::bitcoin::bip32::DerivationPath;
 use cdk_common::database::{validate_kvstore_params, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
-use cdk_common::nut00::KnownMethod;
 use cdk_common::util::unix_time;
 use cdk_common::wallet::{
     self, MintQuote, ProofInfo, Transaction, TransactionDirection, TransactionId,
 };
 use cdk_common::{
-    database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PaymentMethod,
-    PublicKey, SpendingConditions, State,
+    database, Amount, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintInfo, PublicKey,
+    SpendingConditions, State,
 };
 use redb::{Database, MultimapTableDefinition, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::instrument;
@@ -343,7 +342,8 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
             .flat_map(|(_id, quote)| serde_json::from_str::<MintQuote>(quote.value()).ok())
             .filter(|quote| {
                 quote.amount_issued == Amount::ZERO
-                    || quote.payment_method == PaymentMethod::Known(KnownMethod::Bolt12)
+                    || quote.amount_paid > quote.amount_issued
+                    || !quote.payment_method.is_bolt11()
             })
             .collect())
     }
@@ -761,6 +761,33 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
     }
 
     #[instrument(skip(self))]
+    async fn reserve_derivation_index(
+        &self,
+        namespace: &str,
+        minimum_index: u32,
+    ) -> Result<u32, database::Error> {
+        let write_txn = self.db.begin_write().map_err(Error::from)?;
+        let index = {
+            let mut table = write_txn
+                .open_table(DERIVATION_COUNTER)
+                .map_err(Error::from)?;
+            let current = table
+                .get(namespace)
+                .map_err(Error::from)?
+                .map(|value| value.value())
+                .unwrap_or_default();
+            let index = current.max(minimum_index);
+            let next = index
+                .checked_add(1)
+                .ok_or(database::Error::AmountOverflow)?;
+            table.insert(namespace, next).map_err(Error::from)?;
+            index
+        };
+        write_txn.commit().map_err(Error::from)?;
+        Ok(index)
+    }
+
+    #[instrument(skip(self))]
     async fn add_mint(
         &self,
         mint_url: MintUrl,
@@ -953,6 +980,11 @@ impl WalletDatabase<database::Error> for WalletRedbDatabase {
 
                 if existing_quote.version != quote.version {
                     return Err(database::Error::ConcurrentUpdate);
+                }
+
+                // An update without a payment proof keeps the stored one
+                if quote_to_save.payment_proof.is_none() {
+                    quote_to_save.payment_proof = existing_quote.payment_proof;
                 }
 
                 // Increment version for update

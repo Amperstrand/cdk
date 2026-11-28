@@ -17,7 +17,6 @@ use bitcoin::key::Secp256k1;
 #[cfg(feature = "mint")]
 use bitcoin::secp256k1;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_with::{serde_as, VecSkipError};
 use thiserror::Error;
 
 use super::nut01::Keys;
@@ -25,6 +24,7 @@ use super::nut01::Keys;
 use super::nut01::{MintKeyPair, MintKeys};
 use crate::nuts::nut00::CurrencyUnit;
 use crate::util::hex;
+use crate::util::serde_helpers::deserialize_vec_skip_invalid;
 use crate::{ensure_cdk, Amount};
 
 /// NUT02 Error
@@ -45,6 +45,9 @@ pub enum Error {
     /// Short keyset id does not match any of the provided IDv2s
     #[error("Short keyset id does not match any of the provided IDv2s")]
     UnknownShortKeysetId,
+    /// Short keyset id matches multiple distinct full IDs
+    #[error("Short keyset id is ambiguous")]
+    AmbiguousShortKeysetId,
     /// Short keyset id is ill-formed
     #[error("Short keyset id is ill-formed")]
     MalformedShortKeysetId,
@@ -289,15 +292,18 @@ impl Id {
                 })
             }
             KeySetVersion::Version01 => {
-                // We return the first match or error
-                for keyset_info in keysets_info.iter() {
-                    if keyset_info.id.version == KeySetVersion::Version01
+                let mut resolved = None;
+                for keyset_info in keysets_info {
+                    if keyset_info.id.version == short_id.version
                         && keyset_info.id.id.to_vec().starts_with(&short_id.prefix)
                     {
-                        return Ok(keyset_info.id);
+                        if resolved.is_some_and(|id| id != keyset_info.id) {
+                            return Err(Error::AmbiguousShortKeysetId);
+                        }
+                        resolved = Some(keyset_info.id);
                     }
                 }
-                Err(Error::UnknownShortKeysetId)
+                resolved.ok_or(Error::UnknownShortKeysetId)
             }
         }
     }
@@ -485,11 +491,10 @@ impl From<ShortKeysetId> for String {
 
 /// Mint Keysets [NUT-02]
 /// Ids of mints keyset ids
-#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeysetResponse {
     /// set of public key ids that the mint generates
-    #[serde_as(as = "VecSkipError<_>")]
+    #[serde(deserialize_with = "deserialize_vec_skip_invalid")]
     pub keysets: Vec<KeySetInfo>,
 }
 
@@ -506,7 +511,10 @@ pub struct KeySet {
     /// Keyset [`Keys`]
     pub keys: Keys,
     /// Input Fee PPK
-    #[serde(default)]
+    #[serde(
+        deserialize_with = "deserialize_input_fee_ppk",
+        default = "default_input_fee_ppk"
+    )]
     pub input_fee_ppk: u64,
     /// Expiry
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -780,11 +788,12 @@ impl From<&MintKeys> for Id {
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeMap;
     use std::str::FromStr;
 
     use bitcoin::secp256k1::rand::{self, RngCore};
 
-    use super::{KeySetInfo, KeySetVersion, Keys, KeysetResponse, ShortKeysetId};
+    use super::{KeySet, KeySetInfo, KeySetVersion, Keys, KeysetResponse, ShortKeysetId};
     use crate::nuts::nut02::{Error, Id};
     use crate::nuts::KeysResponse;
     use crate::util::hex;
@@ -929,7 +938,52 @@ mod test {
     fn test_deserialization_of_keyset_response() {
         let h = r#"{"keysets":[{"id":"009a1f293253e41e","unit":"sat","active":true, "input_fee_ppk": 100},{"id":"eGnEWtdJ0PIM","unit":"sat","active":true},{"id":"003dfdf4e5e35487","unit":"sat","active":true},{"id":"0066ad1a4b6fc57c","unit":"sat","active":true},{"id":"00f7ca24d44c3e5e","unit":"sat","active":true},{"id":"001fcea2931f2d85","unit":"sat","active":true},{"id":"00d095959d940edb","unit":"sat","active":true},{"id":"000d7f730d657125","unit":"sat","active":true},{"id":"0007208d861d7295","unit":"sat","active":true},{"id":"00bfdf8889b719dd","unit":"sat","active":true},{"id":"00ca9b17da045f21","unit":"sat","active":true}]}"#;
 
-        let _keyset_response: KeysetResponse = serde_json::from_str(h).unwrap();
+        let keyset_response: KeysetResponse = serde_json::from_str(h).unwrap();
+        assert_eq!(keyset_response.keysets.len(), 10);
+        assert_eq!(
+            keyset_response.keysets[1].id,
+            Id::from_str("003dfdf4e5e35487").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_keyset_response_skips_invalid_cbor_entry() {
+        let valid: KeySetInfo =
+            serde_json::from_str(r#"{"id":"009a1f293253e41e","unit":"sat","active":true}"#)
+                .unwrap();
+        let positional = (
+            valid.id,
+            &valid.unit,
+            valid.active,
+            valid.input_fee_ppk,
+            valid.final_expiry,
+        );
+        let mut cbor = Vec::new();
+        ciborium::into_writer(
+            &BTreeMap::from([("keysets", (u128::MAX, &valid, positional))]),
+            &mut cbor,
+        )
+        .unwrap();
+
+        let response: KeysetResponse = ciborium::from_reader(cbor.as_slice()).unwrap();
+        assert_eq!(response.keysets, vec![valid.clone(), valid]);
+    }
+
+    #[test]
+    fn test_keys_response_skips_duplicate_denominations() {
+        let key = "02194603ffa36356f4a56b7df9371fc3192472351453ec7398b8da8117e7c3e104";
+        let json = format!(
+            r#"{{"keysets":[
+                {{"id":"009a1f293253e41e","unit":"sat","keys":{{"1":"{key}","1":"{key}"}}}},
+                {{"id":"003dfdf4e5e35487","unit":"sat","keys":{{"1":"{key}"}}}}
+            ]}}"#
+        );
+        let response: KeysResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response.keysets.len(), 1);
+        assert_eq!(
+            response.keysets[0].id,
+            Id::from_str("003dfdf4e5e35487").unwrap()
+        );
     }
 
     #[test]
@@ -1111,6 +1165,37 @@ mod test {
         let id_with_same_inputs = Id::v2_from_data(&keys, &unit, 0, Some(2059210353));
 
         assert_eq!(id_without_fee, id_with_same_inputs);
+    }
+
+    #[test]
+    fn test_short_keyset_resolution_requires_a_unique_full_id() {
+        let mut bytes = [0x11; 33];
+        bytes[0] = 1;
+        let first = Id::from_bytes(&bytes).unwrap();
+        bytes[32] = 0x22;
+        let second = Id::from_bytes(&bytes).unwrap();
+        let keyset = |id| KeySetInfo {
+            id,
+            unit: CurrencyUnit::Sat,
+            active: true,
+            input_fee_ppk: 0,
+            final_expiry: None,
+        };
+        let short = ShortKeysetId::from(first);
+        for ids in [[first, second], [second, first]] {
+            let keysets = ids.map(keyset);
+            assert!(matches!(
+                Id::from_short_keyset_id(&short, &keysets),
+                Err(Error::AmbiguousShortKeysetId),
+            ));
+            let full = ShortKeysetId::from_bytes(&first.to_bytes()).unwrap();
+            assert_eq!(Id::from_short_keyset_id(&full, &keysets).unwrap(), first);
+        }
+        // Repeated metadata for one full ID does not create ambiguity.
+        assert_eq!(
+            Id::from_short_keyset_id(&short, &[keyset(first), keyset(first)],).unwrap(),
+            first
+        );
     }
 
     #[test]
@@ -1530,6 +1615,27 @@ mod test {
         // A unit that does not match any entry must return an empty iterator.
         let none_ids: Vec<Id> = infos.unit(CurrencyUnit::Eur).map(|k| k.id).collect();
         assert!(none_ids.is_empty());
+    }
+
+    #[test]
+    fn test_keyset_with_null_input_fee_ppk() {
+        // NUT-01 allows `"input_fee_ppk": null`, meaning no fee.
+        let keys: Keys = serde_json::from_str(SHORT_KEYSET).unwrap();
+        let id = Id::v2_from_data(&keys, &CurrencyUnit::Sat, 0, None);
+        let keys_json = serde_json::to_string(&keys).unwrap();
+        let keyset_json = format!(
+            r#"{{"id":"{id}","unit":"sat","active":true,"keys":{keys_json},"input_fee_ppk":null}}"#
+        );
+
+        let keyset: KeySet = serde_json::from_str(&keyset_json).unwrap();
+        assert_eq!(keyset.input_fee_ppk, 0);
+        assert!(keyset.verify_id().is_ok());
+
+        // The keys response skips keysets it cannot parse, so the keyset must
+        // not be dropped from it either.
+        let response: KeysResponse =
+            serde_json::from_str(&format!(r#"{{"keysets":[{keyset_json}]}}"#)).unwrap();
+        assert_eq!(response.keysets, vec![keyset]);
     }
 
     #[test]

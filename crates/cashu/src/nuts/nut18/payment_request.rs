@@ -63,17 +63,21 @@ impl SupportedMethod {
 pub struct PaymentRequest {
     /// Payment id to include in the payment payload.
     #[serde(rename = "i")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payment_id: Option<String>,
     /// Requested amount net of input fees.
     ///
     /// If this is set, [`Self::unit`] must also be set.
     #[serde(rename = "a")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<Amount>,
     /// Unit of the requested amount.
     #[serde(rename = "u")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<CurrencyUnit>,
     /// Whether this request is intended for a single payment.
     #[serde(rename = "s")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub single_use: Option<bool>,
     /// Mint URLs the receiver accepts or prefers.
     ///
@@ -105,6 +109,7 @@ pub struct PaymentRequest {
     pub supported_methods: Vec<SupportedMethod>,
     /// Human-readable description for the payer to display.
     #[serde(rename = "d")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Transports for delivering the payment payload, sorted by preference.
     ///
@@ -371,7 +376,9 @@ mod tests {
 
         let request_str = request.to_string();
 
-        assert_eq!(request_str, PAYMENT_REQUEST);
+        // Same request as PAYMENT_REQUEST, without its null `s` and `d`.
+        assert_eq!(request_str, "creqApWFpaGI3YTkwMTc2YWEKYXVjc2F0YW2BeCJodHRwczovL25vZmVlcy50ZXN0bnV0LmNhc2h1LnNwYWNlYXSBo2F0ZW5vc3RyYWF4qW5wcm9maWxlMXFxc2dtNnFmYTNjOGR0ejJmdnpodmZxZWFjbXdtMGU1MHBlM2s1dGZtdnBqam1uMHZqN20ydGdwejNtaHh1ZTY5dWhoeWV0dnY5dWp1ZXJwZDQ2aHh0bmZkdXEzd2Ftbnd2YXo3dG1qdjRreHo3Znc4cWVueHZld3dkY3h6Y205OXVxczZhbW53dmF6N3Rtd2RhZWp1bXIwZHM0bGpoN25hZ4GCYW5iMTc=");
+        assert_eq!(PaymentRequest::from_str(PAYMENT_REQUEST).unwrap(), request);
 
         let req = PaymentRequest::from_str(&request_str).expect("valid payment request");
 
@@ -695,12 +702,33 @@ mod tests {
         );
     }
 
+    fn check_payment_request_encoding(
+        expected_encoded: &str,
+        legacy_encoded: &str,
+    ) -> PaymentRequest {
+        let request = PaymentRequest::from_str(expected_encoded).unwrap();
+        assert_eq!(PaymentRequest::from_str(legacy_encoded).unwrap(), request);
+
+        // Both input alphabets must serialize back to URL-safe Base64.
+        for input in [expected_encoded, legacy_encoded] {
+            let encoded = PaymentRequest::from_str(input).unwrap().to_string();
+            let payload = encoded.strip_prefix(PAYMENT_REQUEST_PREFIX).unwrap();
+            let bytes = general_purpose::URL_SAFE.decode(payload).unwrap();
+            assert_eq!(general_purpose::URL_SAFE.encode(bytes), payload);
+            assert_eq!(PaymentRequest::from_str(&encoded).unwrap(), request);
+        }
+
+        request
+    }
+
     #[test]
     fn test_complete_payment_request() {
         // Complete payment request with all optional fields included
-        let expected_encoded = "creqAqGF0gaNhdGRwb3N0YWF4G2h0dHBzOi8vYXBpLmV4YW1wbGUuY29tL3BheWFn92FpaDQ4NDBmNTFlYWEZA+hhdWNzYXRhbYF4GGh0dHBzOi8vbWludC5leGFtcGxlLmNvbWFkcFByb2R1Y3QgcHVyY2hhc2Vhc/VlbnV0MTCjYWtkUDJQS2FkeEIwM2JhZjBjM2FjMjIwMzY2YzJjMzk3YmY5MzA1NzljNDE2MzQzNTU4NGY1NzNiMTA5MTA5ODdjNTQ0YzU5ZTYxZjFhdIGCZ3B1cnBvc2Vnb2ZmbGluZQ==";
+        // tests/18-tests.md as regenerated in nuts#475: the transport omits `g`.
+        let expected_encoded = "creqAqGF0gaJhdGRwb3N0YWF4G2h0dHBzOi8vYXBpLmV4YW1wbGUuY29tL3BheWFpaDQ4NDBmNTFlYWEZA-hhdWNzYXRhbYF4GGh0dHBzOi8vbWludC5leGFtcGxlLmNvbWFkcFByb2R1Y3QgcHVyY2hhc2Vhc_VlbnV0MTCjYWtkUDJQS2FkeEIwM2JhZjBjM2FjMjIwMzY2YzJjMzk3YmY5MzA1NzljNDE2MzQzNTU4NGY1NzNiMTA5MTA5ODdjNTQ0YzU5ZTYxZjFhdIGCZ3B1cnBvc2Vnb2ZmbGluZQ==";
+        let legacy_encoded = "creqAqGF0gaNhdGRwb3N0YWF4G2h0dHBzOi8vYXBpLmV4YW1wbGUuY29tL3BheWFn92FpaDQ4NDBmNTFlYWEZA+hhdWNzYXRhbYF4GGh0dHBzOi8vbWludC5leGFtcGxlLmNvbWFkcFByb2R1Y3QgcHVyY2hhc2Vhc/VlbnV0MTCjYWtkUDJQS2FkeEIwM2JhZjBjM2FjMjIwMzY2YzJjMzk3YmY5MzA1NzljNDE2MzQzNTU4NGY1NzNiMTA5MTA5ODdjNTQ0YzU5ZTYxZjFhdIGCZ3B1cnBvc2Vnb2ZmbGluZQ==";
 
-        let decoded_from_spec = PaymentRequest::from_str(expected_encoded).unwrap();
+        let decoded_from_spec = check_payment_request_encoding(expected_encoded, legacy_encoded);
 
         assert_eq!(decoded_from_spec.payment_id, Some("4840f51e".to_string()));
         assert_eq!(decoded_from_spec.amount, Some(Amount::from(1000)));
@@ -739,9 +767,11 @@ mod tests {
     #[test]
     fn test_http_transport_payment_request() {
         // HTTP POST transport payment request
-        let expected_encoded = "creqApWF0gaNhdGRwb3N0YWF4H2h0dHBzOi8vYXBpLmV4YW1wbGUuY29tL3JlY2VpdmVhZ/dhaWhhMmMxMmY0NWFhGDJhdWNzYXRhbYF4GWh0dHBzOi8vY2FzaHUuZXhhbXBsZS5jb20=";
+        // tests/18-tests.md as regenerated in nuts#475: the transport omits `g`.
+        let expected_encoded = "creqApWF0gaJhdGRwb3N0YWF4H2h0dHBzOi8vYXBpLmV4YW1wbGUuY29tL3JlY2VpdmVhaWhhMmMxMmY0NWFhGDJhdWNzYXRhbYF4GWh0dHBzOi8vY2FzaHUuZXhhbXBsZS5jb20=";
+        let legacy_encoded = "creqApWF0gaNhdGRwb3N0YWF4H2h0dHBzOi8vYXBpLmV4YW1wbGUuY29tL3JlY2VpdmVhZ/dhaWhhMmMxMmY0NWFhGDJhdWNzYXRhbYF4GWh0dHBzOi8vY2FzaHUuZXhhbXBsZS5jb20=";
 
-        let decoded_from_spec = PaymentRequest::from_str(expected_encoded).unwrap();
+        let decoded_from_spec = check_payment_request_encoding(expected_encoded, legacy_encoded);
 
         assert_eq!(decoded_from_spec.payment_id, Some("a2c12f45".to_string()));
         assert_eq!(decoded_from_spec.amount, Some(Amount::from(50)));
@@ -860,6 +890,7 @@ mod tests {
         // Test decoding the expected encoded string
         let decoded_from_spec = PaymentRequest::from_str(expected_encoded).unwrap();
         assert_eq!(decoded_from_spec.payment_id.as_ref().unwrap(), "7f4a2b39");
+        assert_eq!(encoded, expected_encoded);
     }
 
     #[test]

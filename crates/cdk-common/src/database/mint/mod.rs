@@ -281,6 +281,14 @@ pub trait QuotesTransaction {
     /// Implementations should call [`mint::MintQuote::take_changes`] to retrieve pending
     /// changes, then persist each payment and issuance record, and finally update the
     /// quote's aggregate counters (`amount_paid`, `amount_issued`) in the database.
+    ///
+    /// The counters must only be updated if the stored row still holds the values the quote
+    /// had before these changes. Otherwise return [`Error::ConcurrentUpdate`], after which the
+    /// caller must not commit the transaction: the payment and issuance records may already be
+    /// written.
+    ///
+    /// The pending changes are consumed even if this fails, so a caller that retries must reload
+    /// the quote first. Calling this again with the same quote writes nothing and returns `Ok`.
     async fn update_mint_quote(
         &mut self,
         quote: &mut Acquired<mint::MintQuote>,
@@ -348,6 +356,8 @@ pub trait QuotesTransaction {
     /// Updates the request lookup id for a melt quote.
     ///
     /// Requires an [`Acquired`] melt quote to ensure the row is locked before modification.
+    /// Returns [`Error::ConcurrentUpdate`] if the stored state no longer matches the quote,
+    /// after which the caller must not commit the transaction.
     async fn update_melt_quote_request_lookup_id(
         &mut self,
         quote: &mut Acquired<mint::MeltQuote>,
@@ -357,13 +367,59 @@ pub trait QuotesTransaction {
     /// Update [`mint::MeltQuote`] state.
     ///
     /// Requires an [`Acquired`] melt quote to ensure the row is locked before modification.
-    /// Returns the previous state.
+    /// Returns the previous state, or [`Error::ConcurrentUpdate`] if the stored state no longer
+    /// matches the quote, after which the caller must not commit the transaction.
     async fn update_melt_quote_state(
         &mut self,
         quote: &mut Acquired<mint::MeltQuote>,
         new_state: MeltQuoteState,
         payment_proof: Option<String>,
     ) -> Result<MeltQuoteState, Self::Err>;
+
+    /// Releases the melt execution lock on a melt quote, but only when
+    /// `lock_token` matches the token currently held by the quote.
+    ///
+    /// Called on every executor exit without changing quote or proof state.
+    /// Returns `true` when ownership was released.
+    async fn unlock_melt_quote(
+        &mut self,
+        quote_id: &QuoteId,
+        lock_token: &str,
+    ) -> Result<bool, Self::Err>;
+
+    /// Releases the melt execution lock on a melt quote regardless of the
+    /// held token.
+    ///
+    /// This is an operator override for recovering quotes whose executor is
+    /// gone. Returns `true` when a lock was released.
+    async fn force_unlock_melt_quote(&mut self, quote_id: &QuoteId) -> Result<bool, Self::Err>;
+
+    /// Returns the database clock as a Unix timestamp for melt lease checks.
+    async fn melt_lease_time(&mut self) -> Result<u64, Self::Err>;
+
+    /// Claims expired or released ownership without authorizing another send.
+    /// Returns the updated quote, or None while a valid owner exists.
+    ///
+    /// Returns [`Error::ConcurrentUpdate`] if the stored state, lock or lock expiry changed
+    /// between the read and the write, after which the caller must not commit the transaction.
+    async fn claim_melt_quote_lease(
+        &mut self,
+        quote_id: &QuoteId,
+        lock_token: &str,
+        lease_seconds: u64,
+    ) -> Result<Option<mint::MeltQuote>, Self::Err>;
+
+    /// Renews an unexpired lease belonging to `lock_token`.
+    /// Returns false when ownership was released, replaced, or expired.
+    ///
+    /// Returns [`Error::ConcurrentUpdate`] if the stored state, lock or lock expiry changed
+    /// between the read and the write, after which the caller must not commit the transaction.
+    async fn renew_melt_quote_lease(
+        &mut self,
+        quote_id: &QuoteId,
+        lock_token: &str,
+        lease_seconds: u64,
+    ) -> Result<bool, Self::Err>;
 
     /// Get all [`MintMintQuote`]s and lock it for update in this transaction
     async fn get_mint_quote_by_request(
@@ -448,6 +504,10 @@ pub trait ProofsTransaction {
     ///
     /// Also updates the `state` field on the [`ProofsWithState`] wrapper to reflect
     /// the new state after the database update succeeds.
+    ///
+    /// Returns [`Error::ConcurrentUpdate`] if any stored proof is no longer in the wrapper's
+    /// state, after which the caller must not commit the transaction: the proofs that were still
+    /// in that state may already be updated.
     async fn update_proofs_state(
         &mut self,
         proofs: &mut Acquired<ProofsWithState>,
@@ -519,6 +579,10 @@ pub trait SignaturesTransaction {
     type Err: Into<Error> + From<Error>;
 
     /// Add [`BlindSignature`]
+    ///
+    /// Returns [`Error::ConcurrentUpdate`] if a blinded message read as unsigned was signed
+    /// between the read and the write, after which the caller must not commit the transaction:
+    /// earlier messages in the batch and their keyset totals may already be written.
     async fn add_blind_signatures(
         &mut self,
         blinded_messages: &[PublicKey],
@@ -557,6 +621,13 @@ pub trait SignaturesDatabase {
         quote_id: &QuoteId,
     ) -> Result<Vec<BlindSignature>, Self::Err>;
 
+    /// Get stored [`BlindSignature`]s and their corresponding blinded secrets (B′)
+    /// for a quote, ordered by output index.
+    async fn get_blind_signatures_and_secret_for_quote(
+        &self,
+        quote_id: &QuoteId,
+    ) -> Result<Vec<(BlindSignature, PublicKey)>, Self::Err>;
+
     /// Get total amount issued by keyset id
     async fn get_total_issued(&self) -> Result<HashMap<Id, Amount>, Self::Err>;
 
@@ -593,6 +664,9 @@ pub trait SagaTransaction {
     async fn add_saga(&mut self, saga: &mint::Saga) -> Result<(), Self::Err>;
 
     /// Update the state of an acquired saga.
+    ///
+    /// Returns [`Error::ConcurrentUpdate`] if the stored saga no longer exists or its state no
+    /// longer matches, after which the caller must not commit the transaction.
     async fn update_acquired_saga(
         &mut self,
         saga: &mut Acquired<mint::Saga>,
@@ -600,6 +674,9 @@ pub trait SagaTransaction {
     ) -> Result<(), Self::Err>;
 
     /// Update an acquired saga state and optional finalization metadata.
+    ///
+    /// Returns [`Error::ConcurrentUpdate`] if the stored saga no longer exists or its state no
+    /// longer matches, after which the caller must not commit the transaction.
     async fn update_acquired_saga_with_finalization_data(
         &mut self,
         saga: &mut Acquired<mint::Saga>,
@@ -701,6 +778,14 @@ pub trait Database<Error>:
     + SagaDatabase<Err = Error>
     + CompletedOperationsDatabase<Err = Error>
 {
+    /// Release database resources after stopping all services that use them.
+    ///
+    /// The default does nothing. SQL backends permanently close the shared pool,
+    /// including clones, and wait for outstanding transactions and cleanup.
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Begins a transaction
     async fn begin_transaction(&self) -> Result<Box<dyn Transaction<Error> + Send + Sync>, Error>;
 }

@@ -286,7 +286,9 @@ where
             request_lookup_id_kind,
             extra_json,
             fee_options,
-            selected_fee_index
+            selected_fee_index,
+            melt_lock,
+            melt_lock_expires_at
         FROM
             melt_quote
         WHERE
@@ -400,7 +402,9 @@ where
             request_lookup_id_kind,
             extra_json,
             fee_options,
-            selected_fee_index
+            selected_fee_index,
+            melt_lock,
+            melt_lock_expires_at
         FROM
             melt_quote
         WHERE
@@ -458,7 +462,9 @@ where
             request_lookup_id_kind,
             extra_json,
             fee_options,
-            selected_fee_index
+            selected_fee_index,
+            melt_lock,
+            melt_lock_expires_at
         FROM
             melt_quote
         WHERE
@@ -575,7 +581,9 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
                 request_lookup_id_kind,
                 extra_json,
                 fee_options,
-                selected_fee_index
+                selected_fee_index,
+                melt_lock,
+            melt_lock_expires_at
         ) = row
     );
 
@@ -596,6 +604,8 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
         .and_then(|value| serde_json::from_str::<Vec<MeltQuoteOnchainFeeOption>>(&value).ok())
         .unwrap_or_default();
     let selected_fee_index: Option<u32> = column_as_nullable_number!(selected_fee_index);
+    let melt_lock = column_as_string!(&melt_lock);
+    let melt_lock_expires_at: u64 = column_as_number!(melt_lock_expires_at);
 
     let state =
         MeltQuoteState::from_str(&column_as_string!(&state)).map_err(ConversionError::from)?;
@@ -655,6 +665,8 @@ fn sql_row_to_melt_quote(row: Vec<Column>) -> Result<mint::MeltQuote, Error> {
         estimated_blocks,
         fee_options,
         selected_fee_index,
+        melt_lock,
+        melt_lock_expires_at,
     )
     .map_err(|e| Error::Internal(format!("Invalid onchain melt quote row: {e}")))
 }
@@ -696,6 +708,10 @@ where
         blinded_messages: &[BlindedMessage],
         operation: &Operation,
     ) -> Result<(), Self::Err> {
+        if blinded_messages.is_empty() {
+            return Ok(());
+        }
+
         let current_time = unix_time();
 
         let mut ordered_messages = blinded_messages.iter().enumerate().collect::<Vec<_>>();
@@ -705,8 +721,14 @@ where
                 .cmp(&right.blinded_secret.to_bytes())
         });
 
-        // Insert blinded_messages directly into blind_signature with c = NULL
-        // Let the database constraint handle duplicate detection
+        let blinded_secrets: Vec<Vec<u8>> = ordered_messages
+            .iter()
+            .map(|(_, message)| message.blinded_secret.to_bytes().to_vec())
+            .collect();
+
+        // Insert blinded_messages directly into blind_signature with c = NULL.
+        // ON CONFLICT DO NOTHING waits for a concurrent transaction that is
+        // inserting the same output, so a reservation it commits is seen below.
         for (i, message) in ordered_messages {
             match query(
                 r#"
@@ -714,6 +736,7 @@ where
                 (blinded_message, amount, keyset_id, c, quote_id, created_time, operation_kind, operation_id, order_index)
                 VALUES
                 (:blinded_message, :amount, :keyset_id, NULL, :quote_id, :created_time, :operation_kind, :operation_id, :order_index)
+                ON CONFLICT (blinded_message) DO NOTHING
                 "#,
             )?
             .bind(
@@ -730,12 +753,35 @@ where
             .execute(&self.inner)
             .await
             {
+                Ok(0) => {
+                    // The output is already stored. Outputs that were signed
+                    // (c IS NOT NULL) and outputs another operation reserved but
+                    // has not signed yet (c IS NULL) map to different NUT-00
+                    // errors. A signed output visible to this query takes
+                    // precedence; under READ COMMITTED another transaction may
+                    // still sign one after this snapshot.
+                    let signed = query(
+                        r#"
+                        SELECT blinded_message
+                        FROM blind_signature
+                        WHERE blinded_message IN (:blinded_secrets) AND c IS NOT NULL
+                        LIMIT 1
+                        "#,
+                    )?
+                    .bind_vec("blinded_secrets", blinded_secrets)?
+                    .pluck(&self.inner)
+                    .await?
+                    .is_some();
+
+                    return Err(if signed {
+                        database::Error::Duplicate
+                    } else {
+                        database::Error::BlindedMessagePending
+                    });
+                }
                 Ok(_) => continue,
                 Err(database::Error::Duplicate) => {
                     // Primary key constraint violation - blinded message already exists
-                    // This could be either:
-                    // 1. Already signed (c IS NOT NULL) - definitely an error
-                    // 2. Already pending (c IS NULL) - also an error
                     return Err(database::Error::Duplicate);
                 }
                 Err(err) => return Err(err),
@@ -909,7 +955,28 @@ where
             return Ok(());
         }
 
-        for payment in changes.payments.take().unwrap_or_default() {
+        let payments = changes.payments.take().unwrap_or_default();
+        let issuances = changes.issuances.take().unwrap_or_default();
+
+        // The counters the stored row must still hold for these changes to apply to it.
+        let expected_paid = payments
+            .iter()
+            .try_fold(quote.amount_paid().value(), |total, payment| {
+                total.checked_sub(payment.amount.value())
+            });
+        let expected_issued = issuances
+            .iter()
+            .try_fold(quote.amount_issued().value(), |total, amount| {
+                total.checked_sub(amount.to_u64())
+            });
+        let (Some(expected_paid), Some(expected_issued)) = (expected_paid, expected_issued) else {
+            return Err(Error::Internal(format!(
+                "mint quote {} has changes larger than its totals",
+                quote.id
+            )));
+        };
+
+        for payment in payments {
             query(
                 r#"
                 INSERT INTO mint_quote_payments
@@ -931,7 +998,7 @@ where
 
         let current_time = unix_time();
 
-        for amount_issued in changes.issuances.take().unwrap_or_default() {
+        for amount_issued in issuances {
             query(
                 r#"
                 INSERT INTO mint_quote_issued
@@ -946,7 +1013,7 @@ where
             .await?;
         }
 
-        query(
+        let affected = query(
             r#"
             UPDATE
                 mint_quote
@@ -959,6 +1026,8 @@ where
                 END
             WHERE
                 id = :quote_id
+                AND amount_paid = :expected_paid
+                AND amount_issued = :expected_issued
             "#,
         )?
         .bind("quote_id", quote.id.to_string())
@@ -967,12 +1036,18 @@ where
             i64::try_from(quote.amount_issued().to_u64())?,
         )
         .bind("amount_paid", i64::try_from(quote.amount_paid().to_u64())?)
+        .bind("expected_paid", i64::try_from(expected_paid)?)
+        .bind("expected_issued", i64::try_from(expected_issued)?)
         .bind("current_time", i64::try_from(current_time)?)
         .execute(&self.inner)
         .await
         .inspect_err(|err| {
             tracing::error!("SQL could not update mint quote accounting: {}", err);
         })?;
+
+        if affected != 1 {
+            return Err(Error::ConcurrentUpdate);
+        }
 
         let updated_at = query(
             r#"
@@ -1059,14 +1134,14 @@ where
                 id, unit, amount, request, fee_reserve, state,
                 expiry, payment_proof, estimated_blocks, fee_options, selected_fee_index,
                 request_lookup_id, created_time, paid_time, options, request_lookup_id_kind,
-                payment_method, extra_json
+                payment_method, extra_json, melt_lock, melt_lock_expires_at
             )
             VALUES
             (
                 :id, :unit, :amount, :request, :fee_reserve, :state,
                 :expiry, :payment_proof, :estimated_blocks, :fee_options, :selected_fee_index,
                 :request_lookup_id, :created_time, :paid_time, :options, :request_lookup_id_kind,
-                :payment_method, :extra_json
+                :payment_method, :extra_json, :melt_lock, :melt_lock_expires_at
             )
         "#,
         )?
@@ -1103,6 +1178,11 @@ where
             "extra_json",
             quote.extra_json.as_ref().map(|value| value.to_string()),
         )
+        .bind(
+            "melt_lock_expires_at",
+            i64::try_from(quote.melt_lock_expires_at)?,
+        )
+        .bind("melt_lock", quote.melt_lock)
         .execute(&self.inner)
         .await?;
 
@@ -1114,12 +1194,18 @@ where
         quote: &mut Acquired<mint::MeltQuote>,
         new_request_lookup_id: &PaymentIdentifier,
     ) -> Result<(), Self::Err> {
-        query(r#"UPDATE melt_quote SET request_lookup_id = :new_req_id, request_lookup_id_kind = :new_kind WHERE id = :id"#)?
+        let affected = query(r#"UPDATE melt_quote SET request_lookup_id = :new_req_id, request_lookup_id_kind = :new_kind WHERE id = :id AND state = :state"#)?
             .bind("new_req_id", new_request_lookup_id.to_string())
             .bind("new_kind", new_request_lookup_id.kind())
             .bind("id", quote.id.to_string())
+            .bind("state", quote.state.to_string())
             .execute(&self.inner)
             .await?;
+
+        if affected != 1 {
+            return Err(Error::ConcurrentUpdate);
+        }
+
         quote.request_lookup_id = Some(new_request_lookup_id.clone());
         Ok(())
     }
@@ -1131,6 +1217,9 @@ where
         payment_proof: Option<String>,
     ) -> Result<MeltQuoteState, Self::Err> {
         let old_state = quote.state;
+        if !quote.is_locked() {
+            quote.melt_lock_expires_at = 0;
+        }
 
         check_melt_quote_state_transition(old_state, state)?;
 
@@ -1138,35 +1227,42 @@ where
         // queries below. Per the NUT spec the returned `fee_options` are
         // fixed for the lifetime of the quote, so we never rewrite them
         // after insert. Only state/paid_time/payment_proof/fee_reserve/
-        // estimated_blocks/selected_fee_index may change over the
+        // estimated_blocks/selected_fee_index/melt_lock may change over the
         // quote's lifetime.
         let rec = if state == MeltQuoteState::Paid {
             let current_time = unix_time();
             quote.paid_time = Some(current_time);
             quote.payment_proof = payment_proof.clone();
-            query(r#"UPDATE melt_quote SET state = :state, paid_time = :paid_time, payment_proof = :payment_proof, fee_reserve = :fee_reserve, estimated_blocks = :estimated_blocks, selected_fee_index = :selected_fee_index WHERE id = :id"#)?
+            query(r#"UPDATE melt_quote SET state = :state, paid_time = :paid_time, payment_proof = :payment_proof, fee_reserve = :fee_reserve, estimated_blocks = :estimated_blocks, selected_fee_index = :selected_fee_index, melt_lock = :melt_lock, melt_lock_expires_at = :melt_lock_expires_at WHERE id = :id AND state = :old_state"#)?
                 .bind("state", state.to_string())
+                .bind("old_state", old_state.to_string())
                 .bind("paid_time", i64::try_from(current_time)?)
                 .bind("payment_proof", payment_proof)
                 .bind("fee_reserve", i64::try_from(quote.fee_reserve().value())?)
                 .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
                 .bind("selected_fee_index", quote.selected_fee_index.map(i64::from))
+                .bind("melt_lock", quote.melt_lock.clone())
+                .bind("melt_lock_expires_at", i64::try_from(quote.melt_lock_expires_at)?)
                 .bind("id", quote.id.to_string())
                 .execute(&self.inner)
                 .await
         } else {
-            query(r#"UPDATE melt_quote SET state = :state, fee_reserve = :fee_reserve, estimated_blocks = :estimated_blocks, selected_fee_index = :selected_fee_index WHERE id = :id"#)?
+            query(r#"UPDATE melt_quote SET state = :state, fee_reserve = :fee_reserve, estimated_blocks = :estimated_blocks, selected_fee_index = :selected_fee_index, melt_lock = :melt_lock, melt_lock_expires_at = :melt_lock_expires_at WHERE id = :id AND state = :old_state"#)?
                 .bind("state", state.to_string())
+                .bind("old_state", old_state.to_string())
                 .bind("fee_reserve", i64::try_from(quote.fee_reserve().value())?)
                 .bind("estimated_blocks", quote.estimated_blocks.map(i64::from))
                 .bind("selected_fee_index", quote.selected_fee_index.map(i64::from))
+                .bind("melt_lock", quote.melt_lock.clone())
+                .bind("melt_lock_expires_at", i64::try_from(quote.melt_lock_expires_at)?)
                 .bind("id", quote.id.to_string())
                 .execute(&self.inner)
                 .await
         };
 
         match rec {
-            Ok(_) => {}
+            Ok(1) => {}
+            Ok(_) => return Err(Error::ConcurrentUpdate),
             Err(err) => {
                 tracing::error!("SQLite Could not update melt quote");
                 return Err(err);
@@ -1180,6 +1276,146 @@ where
         }
 
         Ok(old_state)
+    }
+
+    async fn unlock_melt_quote(
+        &mut self,
+        quote_id: &QuoteId,
+        lock_token: &str,
+    ) -> Result<bool, Self::Err> {
+        let rows_affected = query(
+            r#"
+            UPDATE melt_quote
+            SET melt_lock = '', melt_lock_expires_at = 0
+            WHERE id = :id AND melt_lock = :lock_token AND melt_lock != ''
+            "#,
+        )?
+        .bind("id", quote_id.to_string())
+        .bind("lock_token", lock_token.to_string())
+        .execute(&self.inner)
+        .await?;
+
+        Ok(rows_affected > 0)
+    }
+
+    async fn force_unlock_melt_quote(&mut self, quote_id: &QuoteId) -> Result<bool, Self::Err> {
+        let rows_affected = query(
+            r#"
+            UPDATE melt_quote
+            SET melt_lock = '', melt_lock_expires_at = 0
+            WHERE id = :id AND melt_lock != ''
+            "#,
+        )?
+        .bind("id", quote_id.to_string())
+        .execute(&self.inner)
+        .await?;
+
+        Ok(rows_affected > 0)
+    }
+
+    async fn melt_lease_time(&mut self) -> Result<u64, Self::Err> {
+        let sql = match RM::Connection::name() {
+            "postgres" => "SELECT CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp())) AS BIGINT)",
+            "sqlite" => "SELECT CAST(strftime('%s', 'now') AS BIGINT)",
+            driver => {
+                return Err(Error::Internal(format!(
+                    "Unsupported lease clock: {driver}"
+                )))
+            }
+        };
+        let value = query(sql)?
+            .pluck(&self.inner)
+            .await?
+            .ok_or_else(|| Error::Internal("Missing database clock".to_string()))?;
+        Ok(column_as_number!(value))
+    }
+
+    async fn claim_melt_quote_lease(
+        &mut self,
+        quote_id: &QuoteId,
+        lock_token: &str,
+        lease_seconds: u64,
+    ) -> Result<Option<mint::MeltQuote>, Self::Err> {
+        let Some(mut quote) = self.get_melt_quote(quote_id).await? else {
+            return Ok(None);
+        };
+        let now = self.melt_lease_time().await?;
+        if lock_token.is_empty()
+            || (quote.is_locked() && quote.melt_lock_expires_at > now)
+            || !matches!(quote.state, MeltQuoteState::Pending | MeltQuoteState::Paid)
+        {
+            return Ok(None);
+        }
+        let expiry = now
+            .checked_add(lease_seconds)
+            .ok_or_else(|| Error::Internal("Melt lease deadline overflow".to_string()))?;
+        let affected = query(
+            r#"
+            UPDATE melt_quote
+            SET melt_lock = :owner, melt_lock_expires_at = :expiry
+            WHERE id = :id
+                AND state = :old_state
+                AND melt_lock = :old_owner
+                AND melt_lock_expires_at = :old_expiry
+            "#,
+        )?
+        .bind("owner", lock_token.to_string())
+        .bind("expiry", i64::try_from(expiry)?)
+        .bind("id", quote_id.to_string())
+        .bind("old_state", quote.state.to_string())
+        .bind("old_owner", quote.melt_lock.clone())
+        .bind("old_expiry", i64::try_from(quote.melt_lock_expires_at)?)
+        .execute(&self.inner)
+        .await?;
+        if affected != 1 {
+            return Err(Error::ConcurrentUpdate);
+        }
+        quote.melt_lock = lock_token.to_string();
+        quote.melt_lock_expires_at = expiry;
+        Ok(Some(quote.inner()))
+    }
+
+    async fn renew_melt_quote_lease(
+        &mut self,
+        quote_id: &QuoteId,
+        lock_token: &str,
+        lease_seconds: u64,
+    ) -> Result<bool, Self::Err> {
+        let Some(quote) = self.get_melt_quote(quote_id).await? else {
+            return Ok(false);
+        };
+        let now = self.melt_lease_time().await?;
+        if lock_token.is_empty()
+            || quote.melt_lock != lock_token
+            || quote.melt_lock_expires_at <= now
+            || !matches!(quote.state, MeltQuoteState::Pending | MeltQuoteState::Paid)
+        {
+            return Ok(false);
+        }
+        let expiry = now
+            .checked_add(lease_seconds)
+            .ok_or_else(|| Error::Internal("Melt lease deadline overflow".to_string()))?;
+        let affected = query(
+            r#"
+            UPDATE melt_quote
+            SET melt_lock_expires_at = :expiry
+            WHERE id = :id
+                AND state = :old_state
+                AND melt_lock = :old_owner
+                AND melt_lock_expires_at = :old_expiry
+            "#,
+        )?
+        .bind("expiry", i64::try_from(expiry)?)
+        .bind("id", quote_id.to_string())
+        .bind("old_state", quote.state.to_string())
+        .bind("old_owner", quote.melt_lock.clone())
+        .bind("old_expiry", i64::try_from(quote.melt_lock_expires_at)?)
+        .execute(&self.inner)
+        .await?;
+        if affected != 1 {
+            return Err(Error::ConcurrentUpdate);
+        }
+        Ok(true)
     }
 
     async fn get_mint_quote(
@@ -1438,7 +1674,9 @@ where
                 request_lookup_id_kind,
                 extra_json,
                 fee_options,
-                selected_fee_index
+                selected_fee_index,
+                melt_lock,
+            melt_lock_expires_at
             FROM
                 melt_quote
             "#,

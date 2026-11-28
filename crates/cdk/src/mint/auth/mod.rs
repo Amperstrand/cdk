@@ -224,17 +224,27 @@ mod tests {
 
     use bip39::Mnemonic;
     use cdk_common::amount::SplitTarget;
+    use cdk_common::auth::oidc::{OidcClient, OidcHttpResponse, OidcHttpTransport};
     use cdk_common::nut00::KnownMethod;
+    use cdk_common::nut22::MintAuthRequest;
     use cdk_common::nuts::{Id, PreMintSecrets};
     use cdk_common::secret::Secret;
-    use cdk_common::{Amount, CurrencyUnit, PaymentMethod, SecretKey, State};
+    use cdk_common::{Amount, CurrencyUnit, HttpError, PaymentMethod, SecretKey, State};
     use cdk_fake_wallet::FakeWallet;
 
     use super::*;
     use crate::mint::{MintBuilder, MintMeltLimits};
     use crate::types::FeeReserve;
 
-    async fn create_auth_enabled_mint() -> Mint {
+    async fn create_auth_enabled_mint() -> Arc<Mint> {
+        let mint = build_auth_enabled_mint().await;
+        mint.start().await.expect("start mint");
+        mint
+    }
+
+    /// Builds an auth-enabled mint without starting it, so a test can still
+    /// adjust it through `Arc::get_mut` before the background tasks share it.
+    async fn build_auth_enabled_mint() -> Arc<Mint> {
         let db = Arc::new(cdk_sqlite::mint::memory::empty().await.expect("mint db"));
         let auth_db = Arc::new(
             cdk_sqlite::mint::MintSqliteAuthDatabase::new(":memory:")
@@ -267,7 +277,7 @@ mod tests {
             .expect("payment processor");
 
         let mnemonic = Mnemonic::generate(12).expect("mnemonic");
-        let mint = mint_builder
+        mint_builder
             .with_auth(
                 auth_db,
                 "https://example.com/.well-known/openid-configuration".to_string(),
@@ -277,10 +287,7 @@ mod tests {
             .with_blind_auth(50, vec![])
             .build_with_seed(db, &mnemonic.to_seed_normalized(""))
             .await
-            .expect("mint");
-
-        mint.start().await.expect("start mint");
-        mint
+            .expect("mint")
     }
 
     fn output_for_keyset(keyset_id: Id) -> BlindedMessage {
@@ -323,6 +330,88 @@ mod tests {
             .expect_err("sat keyset must not sign through auth path");
 
         assert!(matches!(err, Error::BlindAuthFailed));
+    }
+
+    #[derive(Debug)]
+    struct TestOidcTransport;
+
+    #[async_trait::async_trait]
+    impl OidcHttpTransport for TestOidcTransport {
+        async fn get(&self, url: &str) -> Result<OidcHttpResponse, HttpError> {
+            let body = if url.ends_with("/jwks") {
+                serde_json::json!({
+                    "keys": [{
+                        "kty": "RSA",
+                        "kid": "test",
+                        "alg": "RS256",
+                        "n": "pp9-ak3nTZZg4fI8xWgO45QWT4A9q0d3K0zMfPieOnIQhJT2Jtncb-kvYymmVAkfmv66bjvc2wK3SM1GvHQphEIpV5iFBvXNQ2NTPnwB6sxt4l8zuyqssc8NtvcFB7ty2o9URBp5m-ssgLtWd5vsi1j0daVkBte_pCJB6M-UI9T2bQbA86BHgiJPU_8Ki18qvlsxptoYQlr9GgbOyj0OD7_g2bD4hO0bV-SD-nl8psqjTNIfk5fqvsaudGQgFkqQuT0KhPHK1yRXWkWhoOsQPrEP6VB_uv4e_zRH9acwv9H-zn0OxaulkRJ2w74OObRruNCgqTQgxNQjdiISUKjY0w",
+                        "e": "AQAB"
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "issuer": "https://example.com",
+                    "jwks_uri": "https://example.com/jwks",
+                    "token_endpoint": "https://example.com/token",
+                    "device_authorization_endpoint": "https://example.com/device"
+                })
+            };
+            Ok(OidcHttpResponse::new(200, serde_json::to_vec(&body)?))
+        }
+
+        async fn post_form(
+            &self,
+            _url: &str,
+            _params: Vec<(String, String)>,
+        ) -> Result<OidcHttpResponse, HttpError> {
+            panic!("CAT verification does not POST")
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_blind_auth_rejects_inactive_keysets() {
+        // Signed by a disposable test key, with an expiry in 2100.
+        let cat = "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ.eyJpc3MiOiJodHRwczovL2V4YW1wbGUuY29tIiwiY2xpZW50X2lkIjoidGVzdC1jbGllbnQiLCJleHAiOjQxMDI0NDQ4MDB9.cKzTzB8Y-tnvoYhRY5SrUGQtzTgw_Cvhc_MOB6c23cv6FWafEK5hUuDPHF89lvc8HOfPZ9L519-S2bR_ibF6PW4_ntG5olPhfQj_YiOmek-mtHg8aiXtRRH1G077WEH_FvW9wxwkoL-MpupZSoqN3RHftLdO9O3kxJm6sa9ylHuvepC2CNkHnqrIwHoI90xMzzV8lyf1d3ybnXtG-Vcso58vlh-DbNIfUyRNHJ-hz18q1OuSNuvRh8wb5thX3So971hs-eVNt2dfuuYd3Kk3eIGhmLwZbjmgATt3NltRp3h-iCyuP2zRsxhrlxP23MCiHSjTewHDnTCA1gBdbo5m0Q";
+        let mut mint = build_auth_enabled_mint().await;
+        Arc::get_mut(&mut mint)
+            .expect("mint is not shared before start")
+            .oidc_client = Some(OidcClient::with_transport(
+            "https://example.com/.well-known/openid-configuration".to_string(),
+            Some("test-client".to_string()),
+            Arc::new(TestOidcTransport),
+        ));
+        mint.start().await.expect("start mint");
+        let keyset_id = mint.get_active_keysets()[&CurrencyUnit::Auth];
+        let output = output_for_keyset(keyset_id);
+
+        mint.mint_blind_auth(
+            AuthToken::ClearAuth(cat.to_string()),
+            MintAuthRequest {
+                outputs: vec![output.clone()],
+            },
+        )
+        .await
+        .expect("active auth outputs must be accepted");
+
+        mint.rotate_keyset(CurrencyUnit::Auth, vec![1], 0, true, None)
+            .await
+            .expect("rotate auth keyset");
+        assert!(!mint.get_keyset_info(&keyset_id).unwrap().active);
+        mint.auth_blind_sign(&output)
+            .await
+            .expect("signing an already accepted auth output must survive rotation");
+
+        let err = mint
+            .mint_blind_auth(
+                AuthToken::ClearAuth(cat.to_string()),
+                MintAuthRequest {
+                    outputs: vec![output],
+                },
+            )
+            .await
+            .expect_err("new auth requests must reject inactive outputs");
+        assert!(matches!(err, Error::InactiveKeyset));
+        mint.stop().await.unwrap();
     }
 
     #[tokio::test]

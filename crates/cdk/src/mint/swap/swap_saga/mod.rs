@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::mint::{Operation, Saga, SwapSagaState};
 use cdk_common::nuts::BlindedMessage;
-use cdk_common::{database, Error, Proofs, ProofsMethods, PublicKey, QuoteId, State};
+use cdk_common::{database, Error, Proofs, PublicKey, QuoteId, State};
 use tracing::instrument;
 
 use self::compensation::{CompensatingAction, RemoveSwapSetup};
@@ -138,7 +138,9 @@ impl<'a> SwapSaga<'a, Initial> {
     ///
     /// - `TokenPending`: Proofs are already pending or blinded messages are duplicates
     /// - `TokenAlreadySpent`: Proofs have already been spent
-    /// - `DuplicateOutputs`: Output blinded messages already exist
+    /// - `DuplicateOutputs`: The request contains the same output more than once
+    /// - `BlindedMessageAlreadySigned`: Output blinded messages were signed for an earlier request
+    /// - `OutputsPending`: Output blinded messages are reserved by a request that has not signed them yet
     #[instrument(skip_all)]
     pub async fn setup_swap(
         mut self,
@@ -154,15 +156,15 @@ impl<'a> SwapSaga<'a, Initial> {
 
         // Verify balance within the transaction
         self.mint
-            .verify_transaction_balanced(
-                input_verification.clone(),
-                output_verification.clone(),
+            .verify_amounts_balanced(
+                &input_verification.amount,
+                &output_verification.amount,
                 input_proofs,
             )
             .await?;
 
         // Calculate amounts to create Operation
-        let total_redeemed = input_verification.amount;
+        let (total_redeemed, ys) = input_verification.into_parts();
         let total_issued = output_verification.amount;
 
         let fee_breakdown = self.mint.get_proofs_fee(input_proofs).await?;
@@ -197,11 +199,6 @@ impl<'a> SwapSaga<'a, Initial> {
             }
         };
 
-        let ys = match input_proofs.ys() {
-            Ok(ys) => ys,
-            Err(err) => return Err(Error::NUT00(err)),
-        };
-
         if let Err(err) = Mint::update_proofs_state(&mut tx, &mut new_proofs, State::Pending).await
         {
             tx.rollback().await?;
@@ -215,7 +212,8 @@ impl<'a> SwapSaga<'a, Initial> {
         {
             tx.rollback().await?;
             return Err(match err {
-                database::Error::Duplicate => Error::DuplicateOutputs,
+                database::Error::Duplicate => Error::BlindedMessageAlreadySigned,
+                database::Error::BlindedMessagePending => Error::OutputsPending,
                 _ => Error::Database(err),
             });
         }

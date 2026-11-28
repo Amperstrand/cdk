@@ -46,7 +46,7 @@
     , crane
     , ...
     }@inputs:
-    flake-utils.lib.eachDefaultSystem (
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (
       system:
       let
         # Architecture-specific configuration for static musl builds
@@ -120,7 +120,7 @@
 
         # Toolchains
         # latest stable
-        stable_toolchain = pkgs.rust-bin.stable."1.99.0".default.override {
+        stable_toolchain = pkgs.rust-bin.stable."1.100.0".default.override {
           targets = [
             "wasm32-unknown-unknown"
             "aarch64-apple-ios"
@@ -166,7 +166,7 @@
         # Stable toolchain with musl target for static builds (Linux only)
         static_toolchain =
           if muslTarget != null then
-            pkgs.rust-bin.stable."1.99.0".default.override
+            pkgs.rust-bin.stable."1.100.0".default.override
               {
                 targets = [ muslTarget ];
               }
@@ -199,11 +199,19 @@
         # ========================================
         # Crane setup for cached builds
         # ========================================
-        craneLib = (crane.mkLib pkgs).overrideToolchain stable_toolchain;
+        # Keep usage lints enabled for real sources, but disable checks whose
+        # inputs Crane intentionally removes from dependency-cache sources.
+        craneLibBase = (crane.mkLib pkgs).overrideScope (_final: prev: {
+          mkDummySrc = prev.mkDummySrc.override {
+            cleanCargoToml = import ./nix/crane-dummy-manifest.nix prev.cleanCargoToml;
+          };
+        });
+        craneLib = craneLibBase.overrideToolchain stable_toolchain;
+        # Cargo 1.85 predates these lints and warns about [lints.cargo] itself.
         craneLibMsrv = (crane.mkLib pkgs).overrideToolchain msrv_toolchain;
         craneLibStatic =
-          if static_toolchain != null then (crane.mkLib pkgs).overrideToolchain static_toolchain else null;
-        craneLibNightly = (crane.mkLib pkgs).overrideToolchain nightly_toolchain;
+          if static_toolchain != null then craneLibBase.overrideToolchain static_toolchain else null;
+        craneLibNightly = craneLibBase.overrideToolchain nightly_toolchain;
 
         # Include only checked-in fuzzing inputs. Using ./fuzz directly would also
         # copy generated directories such as fuzz/target, corpus, and artifacts.
@@ -318,6 +326,52 @@
           cargoVendorDir = cargoVendorDirMsrv;
         };
 
+        # Independent downstream resolution avoids LDK Node 0.7's rusqlite pin.
+        # Keep these endpoints in sync with crates/cdk-sqlite/Cargo.toml.
+        rusqliteCompatChecks = lib.mapAttrs
+          (endpoint: config:
+            let
+              lock = builtins.fromTOML (builtins.readFile config.cargoLock);
+              sqlitePackages = builtins.filter (p: p.name == "rusqlite") lock.package;
+              args = commonCraneArgs // {
+                pname = "cdk-rusqlite-compat-${endpoint}";
+                version = "0.0.0";
+                src = lib.fileset.toSource {
+                  root = ./.;
+                  fileset = lib.fileset.unions [
+                    srcFileset
+                    ./tests/rusqlite-compat/Cargo.toml
+                    ./tests/rusqlite-compat/src
+                    ./tests/rusqlite-compat/tests
+                  ];
+                };
+                cargoVendorDir = craneLibMsrv.vendorMultipleCargoDeps {
+                  cargoLockList = [ config.cargoLock ];
+                };
+                cargoExtraArgs = "--locked --manifest-path tests/rusqlite-compat/Cargo.toml";
+                # The nested workspace must use the target directory Crane caches.
+                CARGO_TARGET_DIR = "target";
+                postPatch = ''
+                  cp ${config.cargoLock} tests/rusqlite-compat/Cargo.lock
+                '';
+              };
+            in
+            assert map (p: p.version) sqlitePackages == [ config.version ];
+            craneLibMsrv.cargoTest (args // {
+              cargoArtifacts = craneLibMsrv.buildDepsOnly args;
+              doInstallCargoArtifacts = false;
+            }))
+          {
+            min = {
+              version = "0.31.0";
+              cargoLock = ./tests/rusqlite-compat/Cargo.lock.min;
+            };
+            max = {
+              version = "0.39.0";
+              cargoLock = ./tests/rusqlite-compat/Cargo.lock;
+            };
+          };
+
         # Musl-targeting C compiler for crates that compile bundled C code
         # (libsqlite3-sys, secp256k1-sys, aws-lc-sys, etc.)
         muslCC = if muslTarget != null then pkgs.pkgsStatic.stdenv.cc else null;
@@ -375,13 +429,39 @@
           else
             null;
 
-        # Build ALL dependencies once - this is what gets cached by Cachix
+        # Build ALL dependencies once - published to the Attic cache by CI
         workspaceDeps = craneLib.buildDepsOnly (
           commonCraneArgs
           // {
             pname = "cdk-deps";
             # Build deps for workspace
             cargoExtraArgs = "--workspace";
+          }
+        );
+
+        # Dependencies in the `ci` Cargo profile. `workspaceDeps` uses Crane's
+        # default release profile, so dev-style CI derivations (clippy, unit
+        # tests, docs, the nextest archive) could not reuse it and rebuilt the
+        # whole dependency tree. Derivations that use this must pass
+        # `--profile ci` (`--cargo-profile ci` for nextest) to every cargo call.
+        workspaceDepsCi = craneLib.buildDepsOnly (
+          commonCraneArgs
+          // {
+            pname = "cdk-deps-ci";
+            CARGO_PROFILE = "ci";
+            cargoExtraArgs = "--workspace";
+          }
+        );
+
+        # The nextest archive selects only cdk-integration-tests, which
+        # resolves dependency features differently from `--workspace`, so it
+        # gets its own ci-profile dependency cache.
+        itestDepsCi = craneLib.buildDepsOnly (
+          commonCraneArgs
+          // {
+            pname = "cdk-itest-deps-ci";
+            CARGO_PROFILE = "ci";
+            cargoExtraArgs = "-p cdk-integration-tests";
           }
         );
 
@@ -420,6 +500,85 @@
           }
         );
 
+        # Dependency layer on top of `workspaceDepsCi` for a check that selects
+        # packages or features (`-p`, `--features`, `--exclude`). Cargo resolves
+        # dependency features per selection, so such a check misses much of the
+        # `--workspace` cache and would recompile those dependencies on every
+        # run. `warmCommands` are the check's own cargo invocations, run against
+        # Crane's dummy sources; only the artifacts that differ from
+        # `workspaceDepsCi` are stored. Like the base cache, a layer changes
+        # only with the lockfile, the manifests or its commands.
+        mkDepsCiLayer =
+          name: warmCommands:
+          craneLib.mkCargoDerivation (
+            commonCraneArgs
+            // {
+              pname = "cdk-deps-ci-${name}";
+              src = craneLib.mkDummySrc commonCraneArgs;
+              cargoArtifacts = workspaceDepsCi;
+              buildPhaseCargoCommand = warmCommands;
+              doCheck = false;
+              doInstallCargoArtifacts = true;
+            }
+          );
+
+        # Warm the dependencies of `cargo test` commands without running them.
+        warmTestCommands = lib.concatMapStringsSep "\n" (command: "${command} --no-run");
+
+        # The cargo invocations of one clippy + test selection, shared by the
+        # check and its dependency layer so both resolve the same features.
+        clippyAndTestCommands = cargoArgs: {
+          clippy = "cargo clippy --profile ci ${cargoArgs}";
+          test = "cargo test --profile ci ${if builtins.match ".*cdk-cli.*" cargoArgs != null then "--bins" else "--lib"} ${cargoArgs}";
+        };
+
+        prUnitTestCommands = [
+          "cargo test --profile ci --lib --workspace --exclude cdk-postgres --exclude cdk-integration-tests"
+          "cargo test --profile ci --bins -p cdk-cli"
+          "cargo test --profile ci --lib -p cdk-nostr --all-features"
+        ];
+
+        prFeatureTestCommands = [
+          "cargo test --profile ci --lib -p cdk-sqlite --features sqlcipher"
+          "cargo test --profile ci --bins -p cdk-cli --features redb"
+          "cargo test --profile ci --lib -p cdk-common --no-default-features --features wallet"
+          "cargo test --profile ci --lib -p cdk-common --no-default-features --features mint"
+          "cargo test --profile ci --lib -p cdk-sql-common --no-default-features --features wallet"
+          "cargo test --profile ci --lib -p cdk-sql-common --no-default-features --features mint"
+        ];
+        prFeatureCheckCommand = "cargo check --profile ci -p cdk-mintd --features redis";
+
+        # One dependency layer per check, exposed as `deps-ci-<check>` packages
+        # so CI can push them to the binary cache.
+        ciDepsLayers =
+          (builtins.mapAttrs
+            (name: cargoArgsList:
+              mkDepsCiLayer name (
+                lib.concatMapStringsSep "\n"
+                  (cargoArgs:
+                    let
+                      commands = clippyAndTestCommands cargoArgs;
+                    in
+                    ''
+                      ${commands.clippy}
+                      ${commands.test} --no-run
+                    '')
+                  cargoArgsList
+              ))
+            clippyAndTestChecks)
+          // {
+            pr-unit-tests = mkDepsCiLayer "pr-unit-tests" (warmTestCommands prUnitTestCommands);
+            pr-feature-tests = mkDepsCiLayer "pr-feature-tests" ''
+              ${warmTestCommands prFeatureTestCommands}
+              ${prFeatureCheckCommand}
+            '';
+            postgres-tests = mkDepsCiLayer "postgres-tests" ''
+              cargo clippy --profile ci -p cdk-postgres
+              cargo test --profile ci -p cdk-postgres --no-run
+              cargo test --profile ci -p cdk-integration-tests --test signatory_rotation --no-run
+            '';
+          };
+
         # Helper function to create combined clippy + test checks
         # Runs both in a single derivation to share build artifacts.
         # Now accepts a list of cargoArgs to run multiple checks sequentially.
@@ -429,14 +588,18 @@
             commonCraneArgs
             // {
               pname = "cdk-check-${name}";
-              cargoArtifacts = workspaceDeps;
+              cargoArtifacts = ciDepsLayers.${name};
               buildPhaseCargoCommand = builtins.concatStringsSep "\n" (
                 builtins.map
-                  (cargoArgs: ''
-                    echo "Running check with args: ${cargoArgs}"
-                    cargo clippy ${cargoArgs} -- -D warnings
-                    cargo test ${if builtins.match ".*cdk-cli.*" cargoArgs != null then "--bins" else "--lib"} ${cargoArgs}
-                  '')
+                  (cargoArgs:
+                    let
+                      commands = clippyAndTestCommands cargoArgs;
+                    in
+                    ''
+                      echo "Running check with args: ${cargoArgs}"
+                      ${commands.clippy} -- -D warnings
+                      ${commands.test}
+                    '')
                   cargoArgsList
               );
               doCheck = false;
@@ -447,37 +610,36 @@
             }
           );
 
-        # Helper function to create example checks (compile only, no network access in sandbox)
-        mkExample =
-          name:
-          craneLib.mkCargoDerivation (
-            commonCraneArgs
-            // {
-              pname = "cdk-example-${name}";
-              cargoArtifacts = workspaceDeps;
-              buildPhaseCargoCommand = "cargo build --example ${name}";
-              # Examples are compiled but not run (no network in Nix sandbox)
-              doCheck = false;
-              installPhaseCommand = "mkdir -p $out";
-            }
-          );
+        # All examples built by one cargo invocation, so the workspace crates
+        # compile once instead of once per example. The binaries run outside
+        # the sandbox in CI because they need network access.
+        examplesPackage = craneLib.mkCargoDerivation (
+          commonCraneArgs
+          // {
+            pname = "cdk-examples";
+            cargoArtifacts = workspaceDeps;
+            buildPhaseCargoCommand = "cargo build --release ${
+              lib.concatMapStringsSep " " (name: "--example ${name}") exampleChecks
+            }";
+            doCheck = false;
+            installPhaseCommand = ''
+              mkdir -p $out/bin
+              ${lib.concatMapStringsSep "\n" (
+                name: "cp target/release/examples/${name} $out/bin/"
+              ) exampleChecks}
+            '';
+            doInstallCargoArtifacts = false;
+          }
+        );
 
-        # Helper function to create example packages (outputs binary for running outside sandbox)
+        # One package per example for CI and `nix flake check`. Building the
+        # binary is the compile check, so checks and packages share it.
         mkExamplePackage =
           name:
-          craneLib.mkCargoDerivation (
-            commonCraneArgs
-            // {
-              pname = "cdk-example-${name}";
-              cargoArtifacts = workspaceDeps;
-              buildPhaseCargoCommand = "cargo build --release --example ${name}";
-              doCheck = false;
-              installPhaseCommand = ''
-                mkdir -p $out/bin
-                cp target/release/examples/${name} $out/bin/
-              '';
-            }
-          );
+          pkgs.runCommandLocal "cdk-example-${name}" { } ''
+            mkdir -p $out/bin
+            ln -s ${examplesPackage}/bin/${name} $out/bin/${name}
+          '';
 
         # Helper function to create MSRV build checks
         mkMsrvBuild =
@@ -487,7 +649,8 @@
             // {
               pname = "cdk-msrv-${name}";
               cargoArtifacts = workspaceDepsMsrv;
-              cargoExtraArgs = cargoArgs;
+              cargoExtraArgs = "--locked ${cargoArgs}";
+              doInstallCargoArtifacts = false;
             }
           );
 
@@ -505,6 +668,7 @@
             buildInputs = [ ];
             # Disable tests for WASM (can't run in sandbox)
             doCheck = false;
+            doInstallCargoArtifacts = false;
           });
 
         # Doc tests check
@@ -514,6 +678,7 @@
             pname = "cdk-doc-tests";
             cargoArtifacts = workspaceDeps;
             cargoTestExtraArgs = "--doc";
+            doInstallCargoArtifacts = false;
           }
         );
 
@@ -523,10 +688,11 @@
           commonCraneArgs
           // {
             pname = "cdk-workspace-clippy-all-targets";
-            cargoArtifacts = workspaceDeps;
-            buildPhaseCargoCommand = "cargo clippy --workspace --all-targets -- -D warnings";
+            cargoArtifacts = workspaceDepsCi;
+            buildPhaseCargoCommand = "cargo clippy --profile ci --workspace --all-targets -- -D warnings";
             doCheck = false;
             installPhaseCommand = "mkdir -p $out";
+            doInstallCargoArtifacts = false;
           }
         );
 
@@ -536,10 +702,10 @@
           commonCraneArgs
           // {
             pname = "cdk-strict-docs";
-            cargoArtifacts = workspaceDeps;
+            cargoArtifacts = workspaceDepsCi;
             buildPhaseCargoCommand = ''
               export RUSTDOCFLAGS="-D warnings"
-              cargo doc --no-deps \
+              cargo doc --profile ci --no-deps \
                 -p cashu \
                 -p cdk-common \
                 -p cdk-sql-common \
@@ -558,6 +724,7 @@
             '';
             doCheck = false;
             installPhaseCommand = "mkdir -p $out";
+            doInstallCargoArtifacts = false;
           }
         );
 
@@ -590,11 +757,12 @@
             '';
             doCheck = false;
             installPhaseCommand = "mkdir -p $out";
+            doInstallCargoArtifacts = false;
           }
         );
 
         # ========================================
-        # Language binding derivations (cached by Cachix)
+        # Language binding derivations
         # ========================================
 
         # Dart FFI bindings: builds cdk-ffi-dart cdylib + generates Dart source
@@ -609,12 +777,12 @@
 
               LIB_EXT="${if isDarwin then "dylib" else "so"}"
 
-              # Find the cdk-ffi-dart shared library in deps (contains UniFFI metadata)
-              CDK_FFI_LIB="target/release/deps/libcdk_ffi_dart.$LIB_EXT"
+              # Use the final cdk-ffi-dart shared library (contains UniFFI metadata)
+              CDK_FFI_LIB="target/release/libcdk_ffi_dart.$LIB_EXT"
 
               if [ ! -f "$CDK_FFI_LIB" ]; then
                 echo "ERROR: Could not find $CDK_FFI_LIB"
-                ls -la target/release/deps/libcdk_ffi* || true
+                ls -la target/release/libcdk_ffi* || true
                 exit 1
               fi
 
@@ -874,11 +1042,67 @@
           "cdk-wallet" = "-p cdk --no-default-features --features wallet";
         };
 
+        # wasm-bindgen refuses a CLI built for a different schema version, and
+        # nixpkgs only packages some versions, so the CLI comes from the crate at
+        # whatever version the lockfile resolved. On a bump, fetchCrate and then
+        # fetchCargoVendor each fail with the hash to paste in.
+        wasmBindgenCli =
+          let
+            lock = builtins.fromTOML (builtins.readFile ./Cargo.lock);
+            version =
+              (builtins.head
+                (builtins.filter (p: p.name == "wasm-bindgen") lock.package)
+              ).version;
+          in
+          pkgsUnstable.buildWasmBindgenCli rec {
+            src = pkgsUnstable.fetchCrate {
+              pname = "wasm-bindgen-cli";
+              inherit version;
+              hash = "sha256-9Og1O/6/VC3sc5hBjoIWBErmLW2UHGMsTQO+6+m/dng=";
+            };
+
+            cargoDeps = pkgsUnstable.rustPlatform.fetchCargoVendor {
+              inherit src;
+              inherit (src) pname version;
+              hash = "sha256-j81sUf1m5yXU4FJfGj7GV+hdqVCV8mRmNb0QIsMCjqw=";
+            };
+          };
+
+        # secp256k1-sys and minicov compile C for wasm32 and carry their own
+        # headers, but the native stdenv CC emits host objects that only fail once
+        # a wasm test binary is linked, which the library-only checks never do.
+        wasmEnv = {
+          CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+          AR_wasm32_unknown_unknown = "${pkgs.llvmPackages.llvm}/bin/llvm-ar";
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER = "wasm-bindgen-test-runner";
+        };
+
+        # Unlike the wasm build checks this links and runs a real wasm binary, so
+        # it needs the cross compiler settings and node.
+        wasmTests = craneLib.cargoTest (
+          {
+            inherit src version cargoVendorDir;
+            pname = "cdk-wasm-tests";
+            cargoArtifacts = workspaceDeps;
+            cargoExtraArgs = "-p cdk-common --target wasm32-unknown-unknown";
+            cargoTestExtraArgs = "--lib";
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.nodejs
+              wasmBindgenCli
+            ];
+            buildInputs = [ ];
+            doInstallCargoArtifacts = false;
+          }
+          // wasmEnv
+        );
+
         # Common inputs
         envVars = {
           # rust analyzer needs  NIX_PATH for some reason.
           NIX_PATH = "nixpkgs=${inputs.nixpkgs}";
-        };
+        }
+        // wasmEnv;
 
         baseBuildInputs =
           with pkgs;
@@ -900,6 +1124,10 @@
             cargo-mutants
             cargo-fuzz
             cargo-nextest
+
+            # wasm-bindgen-test-runner drives the wasm tests through node
+            nodejs
+            wasmBindgenCli
 
             # Database
             postgresql_16
@@ -923,19 +1151,7 @@
         regtestBuildInputs =
           (with pkgsUnstable; [
             lnd
-            # TODO: Drop this override once nixpkgs ships CLN >= 26.06.7.
-            (clightning.overrideAttrs (finalAttrs: old: {
-              version = "26.06.7";
-              src = fetchurl {
-                url = "https://github.com/ElementsProject/lightning/releases/download/v${finalAttrs.version}/clightning-v${finalAttrs.version}.zip";
-                hash = "sha256-sxPSB+U/Hi2/n7rHnVr0jDUuh0plM5C924G1J5WhU9w=";
-              };
-              # The release archive omits the executable bit on this doc helper.
-              postPatch = (old.postPatch or "") + ''
-                chmod +x devtools/blockreplace.py
-                patchShebangs devtools/blockreplace.py
-              '';
-            }))
+            clightning
             bitcoind
           ])
           ++ (with pkgs; [
@@ -1378,7 +1594,7 @@
           );
 
         # ========================================
-        # Integration test harness binaries (pre-built via Crane, cached by Cachix)
+        # Integration test harness binaries (pre-built via Crane, published to the Attic cache)
         # These are used by CI integration test scripts instead of cargo build/run
         # ========================================
         mkItestBinary =
@@ -1395,29 +1611,53 @@
             }
           );
 
-        itestBinaries = {
-          start-fake-mint = mkItestBinary "start-fake-mint" "--bin start_fake_mint";
-          start-regtest-mints = mkItestBinary "start-regtest-mints" "--bin start_regtest_mints";
-          start-fake-auth-mint = mkItestBinary "start-fake-auth-mint" "--bin start_fake_auth_mint";
-          start-regtest = mkItestBinary "start-regtest" "--bin start_regtest";
-          signatory = mkItestBinary "signatory" "--bin signatory";
-          cdk-payment-processor = mkItestBinary "cdk-payment-processor" "--bin cdk-payment-processor";
-          cdk-mintd-grpc = mkItestBinary "cdk-mintd-grpc" "--bin cdk-mintd --no-default-features --features grpc-processor";
+        # Harness binaries that share the default feature set, built by one
+        # cargo invocation so the workspace crates compile once instead of
+        # once per binary. A bare `--bin` selects every workspace member, so
+        # features resolve exactly as they did for the per-binary builds.
+        itestHarnessBins = {
+          start-fake-mint = "start_fake_mint";
+          start-regtest-mints = "start_regtest_mints";
+          start-fake-auth-mint = "start_fake_auth_mint";
+          start-regtest = "start_regtest";
+          signatory = "signatory";
+          cdk-payment-processor = "cdk-payment-processor";
         };
 
+        itestHarness = mkItestBinary "harness" (
+          lib.concatMapStringsSep " " (bin: "--bin ${bin}") (builtins.attrValues itestHarnessBins)
+        );
+
+        # Keep one package per binary for the dev shells, CI and `just`.
+        itestBinaries =
+          builtins.mapAttrs
+            (
+              name: bin:
+                pkgs.runCommandLocal "cdk-itest-${name}" { } ''
+                  mkdir -p $out/bin
+                  ln -s ${itestHarness}/bin/${bin} $out/bin/${bin}
+                ''
+            )
+            itestHarnessBins
+          // {
+            # Different feature set, so it stays a separate build.
+            cdk-mintd-grpc = mkItestBinary "cdk-mintd-grpc" "--bin cdk-mintd --no-default-features --features grpc-processor";
+          };
+
         # Nextest archive for integration tests (pre-compiled test binaries)
-        itestArchive = craneLib.mkCargoDerivation (
+        mkItestArchive = name: cargoExtraArgs: craneLib.mkCargoDerivation (
           commonCraneArgs
           // {
-            pname = "cdk-itest-archive";
-            cargoArtifacts = workspaceDeps;
+            pname = name;
+            cargoArtifacts = itestDepsCi;
             nativeBuildInputs = commonCraneArgs.nativeBuildInputs ++ [
               pkgs.cargo-nextest
             ];
             buildPhaseCargoCommand = ''
               mkdir -p $out
               cargo nextest archive \
-                -p cdk-integration-tests \
+                --cargo-profile ci \
+                ${cargoExtraArgs} \
                 --archive-file $out/itest-archive.tar.zst
             '';
             doCheck = false;
@@ -1430,6 +1670,16 @@
             doInstallCargoArtifacts = false;
           }
         );
+
+        itestArchive = mkItestArchive "cdk-itest-archive" "-p cdk-integration-tests";
+
+        # Reuse the integration dependency build without downloading and
+        # extracting every integration-test binary for the Nutshell jobs.
+        nutshellArchive = mkItestArchive "cdk-nutshell-archive" (
+          "-p cdk-integration-tests --test happy_path_mint_wallet --test nutshell_wallet --test test_fees"
+        );
+
+        nutshellMintd = mkItestBinary "nutshell-mintd" "--bin cdk-mintd";
 
         # Common arguments can be set here to avoid repeating them later
         nativeBuildInputs = [
@@ -1460,6 +1710,8 @@
           default = defaultPackage;
           attic-client = pkgs.attic-client;
           deps = workspaceDeps;
+          deps-ci = workspaceDepsCi;
+          itest-deps-ci = itestDepsCi;
           deps-msrv = workspaceDepsMsrv;
           # Language bindings (cached cdylib + uniffi codegen)
           dart-bindings = dartBindings;
@@ -1506,6 +1758,8 @@
         // itestBinaries
         // {
           itest-archive = itestArchive;
+          nutshell-archive = nutshellArchive;
+          nutshell-mintd = nutshellMintd;
         }
         # Example packages (binaries that can be run outside sandbox with network access)
         // (builtins.listToAttrs (
@@ -1515,8 +1769,12 @@
               value = mkExamplePackage name;
             })
             exampleChecks
-        ));
+        ))
+        # Per-check dependency layers (`deps-ci-<check>`) for cache pushes
+        // lib.mapAttrs' (name: layer: lib.nameValuePair "deps-ci-${name}" layer) ciDepsLayers;
         checks =
+          lib.mapAttrs' (endpoint: check: lib.nameValuePair "rusqlite-compat-${endpoint}" check) rusqliteCompatChecks
+          //
           # Generate clippy + test checks from clippyAndTestChecks attrset
           (builtins.mapAttrs (name: args: mkClippyAndTest name args) clippyAndTestChecks)
           # Generate MSRV build checks (prefixed with msrv-)
@@ -1557,31 +1815,21 @@
             map
               (name: {
                 name = "example-${name}";
-                value = mkExample name;
-              })
-              exampleChecks
-          ))
-          // (builtins.listToAttrs (
-            map
-              (name: {
-                name = "example-${name}";
-                value = mkExample name;
+                value = mkExamplePackage name;
               })
               exampleChecks
           ))
           // {
+            wasm-cdk-common-tests = wasmTests;
+
             # PRs run the default unit suite once; alternate feature combinations
             # remain in the full matrix. PostgreSQL has a separate service job.
             pr-unit-tests = craneLib.mkCargoDerivation (
               commonCraneArgs
               // {
                 pname = "cdk-pr-unit-tests";
-                cargoArtifacts = workspaceDeps;
-                buildPhaseCargoCommand = ''
-                  cargo test --lib --workspace --exclude cdk-postgres --exclude cdk-integration-tests
-                  cargo test --bins -p cdk-cli
-                  cargo test --lib -p cdk-nostr --all-features
-                '';
+                cargoArtifacts = ciDepsLayers.pr-unit-tests;
+                buildPhaseCargoCommand = builtins.concatStringsSep "\n" prUnitTestCommands;
                 doCheck = false;
                 installPhaseCommand = "mkdir -p $out";
                 doInstallCargoArtifacts = false;
@@ -1594,15 +1842,10 @@
               commonCraneArgs
               // {
                 pname = "cdk-pr-feature-tests";
-                cargoArtifacts = workspaceDeps;
+                cargoArtifacts = ciDepsLayers.pr-feature-tests;
                 buildPhaseCargoCommand = ''
-                  cargo test --lib -p cdk-sqlite --features sqlcipher
-                  cargo test --bins -p cdk-cli --features redb
-                  cargo check -p cdk-mintd --features redis
-                  cargo test --lib -p cdk-common --no-default-features --features wallet
-                  cargo test --lib -p cdk-common --no-default-features --features mint
-                  cargo test --lib -p cdk-sql-common --no-default-features --features wallet
-                  cargo test --lib -p cdk-sql-common --no-default-features --features mint
+                  ${builtins.concatStringsSep "\n" prFeatureTestCommands}
+                  ${prFeatureCheckCommand}
                 '';
                 doCheck = false;
                 installPhaseCommand = "mkdir -p $out";
@@ -1621,6 +1864,35 @@
 
             # FFI Python tests
             ffi-tests = ffiTests;
+          }
+          # Tests that need a live PostgreSQL server. The server runs inside the
+          # build sandbox, whose private network namespace keeps its fixed port
+          # from colliding with other builds; that isolation is Linux-only.
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            postgres-tests = craneLib.mkCargoDerivation (
+              commonCraneArgs
+              // {
+                pname = "cdk-postgres-tests";
+                cargoArtifacts = ciDepsLayers.postgres-tests;
+                nativeBuildInputs = commonCraneArgs.nativeBuildInputs ++ [
+                  startPostgres
+                  stopPostgres
+                ];
+                CDK_MINTD_DATABASE_URL = "postgresql://${postgresConf.pgUser}:${postgresConf.pgPassword}@localhost:${postgresConf.pgPort}/${postgresConf.pgDatabase}";
+                buildPhaseCargoCommand = ''
+                  cargo clippy --profile ci -p cdk-postgres -- -D warnings
+                  start-postgres
+                  cargo test --profile ci -p cdk-postgres -- --test-threads 8
+                  cargo test --profile ci -p cdk-integration-tests --test signatory_rotation
+                  stop-postgres
+                '';
+                # Unsandboxed builds would otherwise leave the server running.
+                failureHook = "stop-postgres || true";
+                doCheck = false;
+                installPhaseCommand = "mkdir -p $out";
+                doInstallCargoArtifacts = false;
+              }
+            );
           };
 
         devShells =
@@ -1697,7 +1969,6 @@
                     stable_toolchain
                     pkgs.docker-client
                     pkgs.python311
-                    pkgsUnstable.cargo-llvm-cov
                   ]
                   ++ builtins.attrValues itestBinaries;
                 inherit nativeBuildInputs;
@@ -1705,9 +1976,13 @@
               // envVars
             );
 
-            # Minimal shell for the Nutshell interoperability tests. These tests
-            # compile their own binaries with Cargo and do not use the pre-built
-            # integration-test harnesses from the full integration shell.
+            # Keep coverage tooling out of ordinary integration-test jobs.
+            coverage = integration.overrideAttrs (old: {
+              buildInputs = old.buildInputs ++ [ pkgs.cargo-llvm-cov ];
+            });
+
+            # Minimal shell for the Nutshell interoperability tests. CI supplies
+            # the cached archive and mintd explicitly; local runs can use Cargo.
             nutshell = pkgs.mkShell (
               {
                 shellHook = dockerShellHook + commonShellHook;
@@ -1784,7 +2059,7 @@
                 ndkHome = "${androidSdk}/libexec/android-sdk/ndk/27.0.12077973";
                 toolchainBin = "${ndkHome}/toolchains/llvm/prebuilt/linux-x86_64/bin";
                 androidRustFlags = "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384";
-                buildToolchain = pkgs.rust-bin.stable."1.99.0".default.override {
+                buildToolchain = pkgs.rust-bin.stable."1.100.0".default.override {
                   targets = [
                     "aarch64-linux-android"
                     "armv7-linux-androideabi"
@@ -1848,6 +2123,9 @@
 
           in
           {
+            merge-tools = pkgs.mkShell {
+              packages = [ pkgs.bash pkgs.git pkgs.jujutsu pkgs.openssh pkgs.python3 pkgs.just ];
+            };
             inherit
               msrv
               stable
@@ -1855,6 +2133,7 @@
               nightly
               nightly-regtest
               integration
+              coverage
               nutshell
               ffi
               bindings

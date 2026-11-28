@@ -2,10 +2,12 @@
 //!
 //! This module provides functionality for receiving ecash tokens and proofs.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use tracing::instrument;
 
+use crate::nuts::nut00::{self, ProofsMethods};
 use crate::nuts::{Proofs, Token};
 use crate::{ensure_cdk, Amount, Error, Wallet};
 
@@ -18,7 +20,8 @@ impl Wallet {
     /// Receive proofs using the saga pattern
     ///
     /// This is the internal implementation that uses the saga pattern
-    /// for proper crash recovery and compensation.
+    /// for proper crash recovery and compensation. Duplicate proof identifiers
+    /// are rejected before any mint requests or database writes.
     #[instrument(skip_all)]
     pub async fn receive_proofs(
         &self,
@@ -27,6 +30,12 @@ impl Wallet {
         memo: Option<String>,
         token: Option<String>,
     ) -> Result<Amount, Error> {
+        let ys = proofs.ys()?;
+        ensure_cdk!(
+            ys.iter().collect::<HashSet<_>>().len() == ys.len(),
+            nut00::Error::DuplicateProofs.into()
+        );
+
         self.retry_on_inactive_keyset(|| async {
             let saga = ReceiveSaga::new(self);
             let saga = saga

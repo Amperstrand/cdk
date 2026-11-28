@@ -335,7 +335,10 @@ competing operational configuration:
   `CDK_MINTD_DATABASE_URL`), and related PostgreSQL bootstrap variables.
 - SQLCipher password when an invocation opens the local encrypted database.
   Encrypted SQLite startup and database commands therefore require
-  `--password <password>`; `config validate` does not open the database.
+  `--password <password>`. `config validate` and `config migrate` do not open
+  the database, so they reject `--password`. mintd also rejects it when the
+  primary database is PostgreSQL, whose credentials belong in the connection
+  URL.
 
 `config validate` parses the supplied document, resolves its secret references,
 rejects unknown fields, and verifies its signer without opening the primary
@@ -366,6 +369,14 @@ Mintd rejects a remote-signatory configuration that also contains a non-empty
 local seed or mnemonic. During database-backed startup it retains the validated
 remote connection and checks its public identity again immediately before mint
 construction and keyset operations.
+
+Several mints can share one keys database (see the embedded signatory's periodic
+keyset reload). Set `[info].keyset_refresh_interval_ms` in the persisted
+document so each instance picks up a peer's rotation within one interval instead
+of at the next restart. It is off by default, which is correct for a single mint
+that owns its database. The key applies to the embedded signatory only: with
+`[signatory].enabled = true`, startup warns that it has no effect and the
+interval belongs on the signatory process's `--keyset-refresh-interval-ms`.
 
 ### Secret References
 
@@ -465,6 +476,7 @@ The mint supports rotating keysets to newer versions (e.g., migrating from V1 to
 **Policy Configuration:**
 By default, the mint will use V2 (Version01) for *new* keysets but will preserve existing V1 (Version00) keysets to avoid unnecessary rotation. You can force a specific policy in an initialization or apply document:
 
+- `keyset_version = "v1" | "v2"` (env `CDK_MINTD_KEYSET_VERSION`): Forces that version; an active keyset of another version is rotated on startup. Takes precedence over `use_keyset_v2`. Invalid values in either the file or environment cause configuration loading to fail.
 - `use_keyset_v2 = true`: Forces V2. If the current active keyset is V1, it will be rotated to V2 on startup.
 - `use_keyset_v2 = false`: Forces V1. If the current active keyset is V2, it will be rotated to V1 on startup.
 - **Unset (Default)**: Preserves the current keyset version. If no keyset exists, V2 is created.
@@ -473,9 +485,13 @@ By default, the mint will use V2 (Version01) for *new* keysets but will preserve
 You can manually trigger a rotation to a specific version using the CLI:
 
 ```bash
-cdk-mint-cli rotate-next-keyset --use-keyset-v2 true  # Rotate to V2
-cdk-mint-cli rotate-next-keyset --use-keyset-v2 false # Rotate to V1
+cdk-mint-cli rotate-next-keyset --keyset-version v2 # Rotate to V2
+cdk-mint-cli rotate-next-keyset --keyset-version v1 # Rotate to V1
 ```
+
+The selector accepts `v1` or `v2`. The legacy
+`--use-keyset-v2 true|false` flag remains supported, but cannot be combined with
+`--keyset-version`. Omitting both selects V2.
 
 ## Production Examples
 
@@ -488,8 +504,6 @@ backend = "ldk-node"
 bitcoin_network = "signet"  # Use "mainnet" for production
 chain_source_type = "esplora"  # esplora, electrum, or bitcoinrpc
 esplora_url = "https://mutinynet.com/api"
-rgs_url = "https://rgs.mutinynet.com/snapshot/0"
-gossip_source_type = "rgs"
 storage_dir_path = "/var/lib/cdk-mintd/ldk-node"
 ldk_node_mnemonic = "env:CDK_MINTD_LDK_NODE_MNEMONIC"
 ```
@@ -747,6 +761,22 @@ are rejected as normal startup inputs. `--seed-file` is accepted only by
 mnemonic override.
 
 For complete configuration options, see the [example configuration file](./example.config.toml).
+
+## PostgreSQL with Docker Compose
+
+For a new development mint with the fake payment backend, run from the repository root:
+
+```bash
+export POSTGRES_PASSWORD="$(openssl rand -hex 32)"
+export CDK_MINTD_POSTGRES_URL="postgresql://cdk_user:${POSTGRES_PASSWORD}@postgres:5432/cdk_mint"
+export CDK_MINTD_INIT_MODE=new
+export CDK_MINTD_MNEMONIC='your stable BIP39 mnemonic'
+docker compose -f docker-compose.postgres.yaml up -d
+```
+
+Save the password and mnemonic securely and reuse them on subsequent starts.
+If supplying your own password, percent-encode reserved characters in the URL.
+PostgreSQL is reachable at `postgres:5432` inside the Compose network only.
 
 ## Documentation
 

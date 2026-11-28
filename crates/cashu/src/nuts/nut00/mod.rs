@@ -448,13 +448,27 @@ pub struct ProofV4 {
     )]
     pub c: PublicKey,
     /// Witness
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// NUT-00 names this field `w`. Earlier versions wrote `witness`, which is
+    /// still accepted when decoding.
+    #[serde(
+        rename = "w",
+        alias = "witness",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub witness: Option<Witness>,
     /// DLEQ Proof
     #[serde(rename = "d")]
     pub dleq: Option<ProofDleq>,
     /// P2BK Ephemeral Public Key (NUT-28)
-    #[serde(rename = "pe", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "pe",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_v4_pubkey_option",
+        deserialize_with = "deserialize_v4_pubkey_option"
+    )]
     pub p2pk_e: Option<PublicKey>,
 }
 
@@ -591,6 +605,85 @@ where
 {
     let bytes = Vec::<u8>::deserialize(deserializer)?;
     PublicKey::from_slice(&bytes).map_err(serde::de::Error::custom)
+}
+
+/// NUT-28 V4 tokens carry `pe` as a 33-byte CBOR bstr, like `c`, not as the
+/// hex string used by human-readable formats.
+fn serialize_v4_pubkey_option<S>(key: &Option<PublicKey>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match key {
+        Some(key) => serializer.serialize_bytes(&key.to_bytes()),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_v4_pubkey_option<'de, D>(deserializer: D) -> Result<Option<PublicKey>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Older CDK releases emitted hex text. Dispatch on the wire type so that
+    // byte strings containing valid UTF-8 are still parsed as public key bytes.
+    struct PeVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for PeVisitor {
+        type Value = Option<PublicKey>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("public key bytes, a legacy hex public key, or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            PublicKey::from_slice(bytes).map(Some).map_err(E::custom)
+        }
+
+        fn visit_str<E>(self, hex: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            PublicKey::from_hex(hex).map(Some).map_err(E::custom)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut bytes = Vec::new();
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            PublicKey::from_slice(&bytes)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_option(PeVisitor)
 }
 
 /// Currency Unit

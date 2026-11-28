@@ -10,7 +10,7 @@ use cashu::nut00::KnownMethod;
 use cashu::quote_id::QuoteId;
 use cashu::{Amount, BlindSignature, CurrencyUnit, Id, SecretKey};
 
-use crate::database::mint::{Database, DynMintDatabase, Error, KeysDatabase};
+use crate::database::mint::{Acquired, Database, DynMintDatabase, Error, KeysDatabase};
 use crate::database::MintSignaturesDatabase;
 use crate::mint::{MeltPaymentRequest, MeltQuote, MintQuote, Operation};
 use crate::payment::PaymentIdentifier;
@@ -674,6 +674,210 @@ where
     tx.rollback().await.unwrap();
 }
 
+/// Payment details of a completed melt survive reading the operation back
+pub async fn completed_melt_operation_keeps_payment_details<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let mut melt = Operation::new_melt(
+        Amount::from(1_000u64),
+        Amount::from(2u64),
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+    );
+    melt.set_payment_details(Amount::from(990u64), Amount::from(8u64));
+    let swap = Operation::new_swap(Amount::from(10u64), Amount::from(10u64), Amount::ZERO);
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_completed_operation(&melt, &std::collections::HashMap::new())
+        .await
+        .unwrap();
+    tx.add_completed_operation(&swap, &std::collections::HashMap::new())
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let by_id = db
+        .get_completed_operation(melt.id())
+        .await
+        .unwrap()
+        .unwrap();
+    let by_kind = db
+        .get_completed_operations_by_kind(melt.kind())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|operation| operation.id() == melt.id())
+        .unwrap();
+    let all = db.get_completed_operations().await.unwrap();
+    let from_all = all
+        .iter()
+        .find(|operation| operation.id() == melt.id())
+        .unwrap();
+
+    for operation in [&by_id, &by_kind, from_all] {
+        assert_eq!(operation.payment_amount(), Some(Amount::from(990u64)));
+        assert_eq!(operation.payment_fee(), Some(Amount::from(8u64)));
+    }
+
+    // Operations without payment details still read back without them
+    let stored_swap = all
+        .iter()
+        .find(|operation| operation.id() == swap.id())
+        .unwrap();
+    assert_eq!(stored_swap.payment_amount(), None);
+    assert_eq!(stored_swap.payment_fee(), None);
+}
+
+/// Reusing a blinded message that is stored but not signed yet reports it as
+/// pending, not as a duplicate of an already-signed output
+pub async fn reject_pending_blinded_message_as_pending<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let blinded_messages = vec![cashu::BlindedMessage {
+        blinded_secret: SecretKey::generate().public_key(),
+        keyset_id: Id::from_str("001711afb1de20cb").unwrap(),
+        amount: Amount::from(100u64),
+        witness: None,
+    }];
+    let operation = Operation::new_mint(
+        Amount::ZERO,
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+    );
+
+    // Reserve the output without signing it (c stays NULL)
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_blinded_messages(None, &blinded_messages, &operation)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let result = tx
+        .add_blinded_messages(None, &blinded_messages, &operation)
+        .await;
+    assert!(
+        matches!(result, Err(Error::BlindedMessagePending)),
+        "unexpected result: {result:?}"
+    );
+    tx.rollback().await.unwrap();
+}
+
+/// A request that reuses both a signed and a pending output reports the
+/// signed one, even when the pending output is reached first
+pub async fn reject_signed_and_pending_blinded_messages_as_signed<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
+    let operation = Operation::new_mint(
+        Amount::ZERO,
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+    );
+    let blinded_message = || cashu::BlindedMessage {
+        blinded_secret: SecretKey::generate().public_key(),
+        keyset_id,
+        amount: Amount::from(100u64),
+        witness: None,
+    };
+
+    // Outputs are stored in blinded-secret order. Make the pending output
+    // sort first so its conflict is the one hit first; an implementation that
+    // only looks at the first conflict would then report it as pending.
+    let (mut pending, mut signed) = (blinded_message(), blinded_message());
+    if pending.blinded_secret.to_bytes() > signed.blinded_secret.to_bytes() {
+        std::mem::swap(&mut pending, &mut signed);
+    }
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_blinded_messages(None, &[pending.clone(), signed.clone()], &operation)
+        .await
+        .unwrap();
+    tx.add_blind_signatures(
+        &[signed.blinded_secret],
+        &[cashu::BlindSignature {
+            amount: Amount::from(100u64),
+            keyset_id,
+            c: SecretKey::generate().public_key(),
+            dleq: None,
+        }],
+        None,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let result = tx
+        .add_blinded_messages(None, &[pending, signed], &operation)
+        .await;
+    assert!(
+        matches!(result, Err(Error::Duplicate)),
+        "unexpected result: {result:?}"
+    );
+    tx.rollback().await.unwrap();
+}
+
+/// A request that reuses an output while another transaction is still
+/// reserving it waits for that transaction, then reports the output as
+/// pending rather than already signed.
+///
+/// `second_insert_waiting` must resolve only once the second request is
+/// blocked on the first transaction's uncommitted reservation, so the first
+/// transaction commits while the second one is waiting.
+pub async fn concurrent_reservation_of_output_reports_pending<F>(
+    db: DynMintDatabase,
+    second_insert_waiting: F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    let blinded_messages = vec![cashu::BlindedMessage {
+        blinded_secret: SecretKey::generate().public_key(),
+        keyset_id: Id::from_str("001711afb1de20cb").unwrap(),
+        amount: Amount::from(100u64),
+        witness: None,
+    }];
+    let operation = || {
+        Operation::new_mint(
+            Amount::ZERO,
+            cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        )
+    };
+
+    let mut first = db.begin_transaction().await.unwrap();
+    first
+        .add_blinded_messages(None, &blinded_messages, &operation())
+        .await
+        .unwrap();
+
+    let second_messages = blinded_messages.clone();
+    let second = tokio::spawn(async move {
+        let mut tx = db.begin_transaction().await?;
+        let result = tx
+            .add_blinded_messages(None, &second_messages, &operation())
+            .await;
+        tx.rollback().await?;
+        Ok::<_, Error>(result)
+    });
+
+    second_insert_waiting.await;
+    assert!(
+        !second.is_finished(),
+        "second request should wait for the reservation"
+    );
+    first.commit().await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), second)
+        .await
+        .expect("second request should finish once the reservation commits")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, Err(Error::BlindedMessagePending)),
+        "unexpected result: {result:?}"
+    );
+}
+
 /// Cleanup of melt request after processing
 pub async fn cleanup_melt_request_after_processing<DB>(db: DB)
 where
@@ -799,6 +1003,59 @@ where
     tx.rollback().await.unwrap();
 }
 
+/// An unpaid melt quote, already stored in the database.
+async fn stored_melt_quote<DB>(db: &DB) -> MeltQuote
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let melt_quote = MeltQuote::new(
+        None,
+        MeltPaymentRequest::Bolt11 {
+            bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap()
+        },
+        cashu::CurrencyUnit::Sat,
+        Amount::new(100, cashu::CurrencyUnit::Sat),
+        Amount::new(10, cashu::CurrencyUnit::Sat),
+        0,
+        Some(PaymentIdentifier::CustomId(unique_string())),
+        None,
+        cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+        None,
+        None,
+    );
+
+    let mut tx = Database::begin_transaction(db).await.unwrap();
+    tx.add_melt_quote(melt_quote.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+
+    melt_quote
+}
+
+/// Moves a stored melt quote to `new_state` in a transaction of its own.
+async fn move_melt_quote<DB>(db: &DB, quote_id: &QuoteId, new_state: cashu::MeltQuoteState)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let mut tx = Database::begin_transaction(db).await.unwrap();
+    let mut quote = tx.get_melt_quote(quote_id).await.unwrap().unwrap();
+    tx.update_melt_quote_state(&mut quote, new_state, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Loads a melt quote and ends the transaction, so the copy outlives its row lock.
+async fn stale_melt_quote<DB>(db: &DB, quote_id: &QuoteId) -> Acquired<MeltQuote>
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let mut tx = Database::begin_transaction(db).await.unwrap();
+    let quote = tx.get_melt_quote(quote_id).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+
+    quote
+}
+
 /// Test updating melt quote state
 pub async fn update_melt_quote_state_transition<DB>(db: DB)
 where
@@ -857,6 +1114,60 @@ where
     tx.commit().await.unwrap();
 }
 
+/// A melt quote kept past its transaction can't move a paid quote back to unpaid.
+pub async fn update_melt_quote_state_refuses_stale_state<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    use cashu::MeltQuoteState;
+
+    let quote_id = stored_melt_quote(&db).await.id;
+    move_melt_quote(&db, &quote_id, MeltQuoteState::Pending).await;
+    let mut stale = stale_melt_quote(&db, &quote_id).await;
+    move_melt_quote(&db, &quote_id, MeltQuoteState::Paid).await;
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let err = tx
+        .update_melt_quote_state(&mut stale, MeltQuoteState::Unpaid, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::ConcurrentUpdate), "{err}");
+    tx.rollback().await.unwrap();
+
+    let stored = db.get_melt_quote(&quote_id).await.unwrap().unwrap();
+    assert_eq!(stored.state, MeltQuoteState::Paid);
+}
+
+/// A melt quote kept past its transaction can't mark a quote paid after it was rolled back.
+pub async fn update_melt_quote_state_to_paid_refuses_stale_state<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    use cashu::MeltQuoteState;
+
+    let quote_id = stored_melt_quote(&db).await.id;
+    move_melt_quote(&db, &quote_id, MeltQuoteState::Pending).await;
+    let mut stale = stale_melt_quote(&db, &quote_id).await;
+    move_melt_quote(&db, &quote_id, MeltQuoteState::Unpaid).await;
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let err = tx
+        .update_melt_quote_state(
+            &mut stale,
+            MeltQuoteState::Paid,
+            Some("payment_proof".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::ConcurrentUpdate), "{err}");
+    tx.rollback().await.unwrap();
+
+    let stored = db.get_melt_quote(&quote_id).await.unwrap().unwrap();
+    assert_eq!(stored.state, MeltQuoteState::Unpaid);
+    assert_eq!(stored.paid_time, None);
+    assert_eq!(stored.payment_proof, None);
+}
+
 /// Test updating melt quote request lookup id
 pub async fn update_melt_quote_request_lookup_id<DB>(db: DB)
 where
@@ -899,6 +1210,30 @@ where
         retrieved.extra_json,
         Some(serde_json::json!({"lookup": "test"}))
     );
+}
+
+/// A melt quote kept past its transaction can't change the lookup id of a quote that moved on.
+pub async fn update_melt_quote_request_lookup_id_refuses_stale_state<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let melt_quote = stored_melt_quote(&db).await;
+    let mut stale = stale_melt_quote(&db, &melt_quote.id).await;
+    move_melt_quote(&db, &melt_quote.id, cashu::MeltQuoteState::Pending).await;
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let err = tx
+        .update_melt_quote_request_lookup_id(
+            &mut stale,
+            &PaymentIdentifier::CustomId(unique_string()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::ConcurrentUpdate), "{err}");
+    tx.rollback().await.unwrap();
+
+    let stored = db.get_melt_quote(&melt_quote.id).await.unwrap().unwrap();
+    assert_eq!(stored.request_lookup_id, melt_quote.request_lookup_id);
 }
 
 /// Test getting all mint quotes
@@ -1007,6 +1342,155 @@ where
     assert_eq!(retrieved_quote1.payment_method, quote1.payment_method);
     assert_eq!(retrieved_quote2.extra_json, quote2.extra_json);
     assert_eq!(retrieved_quote2.payment_method, quote2.payment_method);
+}
+
+/// Test melt execution lock storage and release semantics
+pub async fn melt_quote_execution_lock<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    use cashu::MeltQuoteState;
+
+    let new_melt_quote = || {
+        MeltQuote::new(
+            None,
+            MeltPaymentRequest::Bolt11 {
+                bolt11: "lnbc330n1p5d85skpp5344v3ktclujsjl3h09wgsfm7zytumr7h7zhrl857f5w8nv0a52zqdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5j3rrg8kvpemqxtf86j8tjm90wq77c7ende4e5qmrerq4xsg02vhq9qxpqysgqjltywgyk6uc5qcgwh8xnzmawl2tjlhz8d28tgp3yx8xwtz76x0jqkfh6mmq70hervjxs0keun7ur0spldgll29l0dnz3md50d65sfqqqwrwpsu".parse().unwrap()
+            },
+            cashu::CurrencyUnit::Sat,
+            Amount::new(100, cashu::CurrencyUnit::Sat),
+            Amount::new(10, cashu::CurrencyUnit::Sat),
+            0,
+            None,
+            None,
+            cashu::PaymentMethod::Known(KnownMethod::Bolt11),
+            None,
+            None,
+        )
+    };
+
+    async fn arm_lock<DB>(db: &DB, quote: &MeltQuote, token: &str)
+    where
+        DB: Database<Error> + KeysDatabase<Err = Error>,
+    {
+        let mut tx = Database::begin_transaction(db).await.unwrap();
+        let mut stored = tx.get_melt_quote(&quote.id).await.unwrap().unwrap();
+        stored.melt_lock = token.to_string();
+        stored.melt_lock_expires_at = tx.melt_lease_time().await.unwrap() + 60;
+        tx.update_melt_quote_state(&mut stored, MeltQuoteState::Pending, None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // A fresh quote is unlocked.
+    let quote = new_melt_quote();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_melt_quote(quote.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let retrieved = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    assert!(!retrieved.is_locked());
+    assert_eq!(retrieved.melt_lock, "");
+
+    // Arming persists the lock token.
+    arm_lock(&db, &quote, "token-a").await;
+    let retrieved = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    assert!(retrieved.is_locked());
+    assert_eq!(retrieved.melt_lock, "token-a");
+
+    // A non-matching token cannot release the lock.
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(!tx.unlock_melt_quote(&quote.id, "token-b").await.unwrap());
+    tx.commit().await.unwrap();
+    let retrieved = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    assert_eq!(retrieved.melt_lock, "token-a");
+
+    // The token holder releases the lock; a second release is a no-op.
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(tx.unlock_melt_quote(&quote.id, "token-a").await.unwrap());
+    assert!(!tx.unlock_melt_quote(&quote.id, "token-a").await.unwrap());
+    tx.commit().await.unwrap();
+    let retrieved = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    assert!(!retrieved.is_locked());
+
+    // Force unlock releases a lock without knowing the token.
+    let quote = new_melt_quote();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_melt_quote(quote.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+    arm_lock(&db, &quote, "token-c").await;
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(tx.force_unlock_melt_quote(&quote.id).await.unwrap());
+    assert!(!tx.force_unlock_melt_quote(&quote.id).await.unwrap());
+    tx.commit().await.unwrap();
+    let retrieved = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    assert!(!retrieved.is_locked());
+
+    // Only an unexpired owner can renew. Releasing or replacing it fences it.
+    let quote = new_melt_quote();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_melt_quote(quote.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+    arm_lock(&db, &quote, "old-owner").await;
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(tx
+        .renew_melt_quote_lease(&quote.id, "old-owner", 60)
+        .await
+        .unwrap());
+    assert!(!tx
+        .renew_melt_quote_lease(&quote.id, "other-owner", 60)
+        .await
+        .unwrap());
+    assert!(tx
+        .renew_melt_quote_lease(&quote.id, "old-owner", 0)
+        .await
+        .unwrap());
+    tx.commit().await.unwrap();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(!tx
+        .renew_melt_quote_lease(&quote.id, "old-owner", 60)
+        .await
+        .unwrap());
+    tx.commit().await.unwrap();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(tx
+        .claim_melt_quote_lease(&quote.id, "new-owner", 60)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(tx
+        .claim_melt_quote_lease(&quote.id, "another-owner", 60)
+        .await
+        .unwrap()
+        .is_none());
+    tx.commit().await.unwrap();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    assert!(!tx.unlock_melt_quote(&quote.id, "old-owner").await.unwrap());
+    assert!(!tx
+        .renew_melt_quote_lease(&quote.id, "old-owner", 60)
+        .await
+        .unwrap());
+    assert!(tx.unlock_melt_quote(&quote.id, "new-owner").await.unwrap());
+    tx.commit().await.unwrap();
+    let retrieved = db.get_melt_quote(&quote.id).await.unwrap().unwrap();
+    assert!(!retrieved.is_locked());
+    assert_eq!(retrieved.melt_lock_expires_at, 0);
+
+    // Concurrent recovery claimants must have exactly one winner.
+    let claim = |token: &'static str| async {
+        let mut tx = Database::begin_transaction(&db).await.unwrap();
+        let won = tx
+            .claim_melt_quote_lease(&quote.id, token, 60)
+            .await
+            .unwrap()
+            .is_some();
+        tx.commit().await.unwrap();
+        won
+    };
+    let (first, second) = tokio::join!(claim("first"), claim("second"));
+    assert_ne!(first, second);
 }
 
 /// Test getting mint quote by request
@@ -1913,6 +2397,206 @@ where
     assert_eq!(quotes[0].as_ref().unwrap().id, quote2.id);
     assert_eq!(quotes[1].as_ref().unwrap().id, quote1.id);
     tx.commit().await.unwrap();
+}
+
+/// A mint quote with no payments, already stored in the database.
+async fn stored_mint_quote<DB>(db: &DB) -> MintQuote
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let mint_quote = MintQuote::new(
+        None,
+        unique_string(),
+        cashu::CurrencyUnit::Sat,
+        None,
+        0,
+        PaymentIdentifier::CustomId(unique_string()),
+        None,
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+    );
+
+    let mut tx = Database::begin_transaction(db).await.unwrap();
+    tx.add_mint_quote(mint_quote.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+
+    mint_quote
+}
+
+/// A mint quote kept past its transaction can't overwrite a payment recorded since.
+pub async fn update_mint_quote_refuses_stale_amount_paid<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let quote_id = stored_mint_quote(&db).await.id;
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut stale = tx.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut current = tx.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    current
+        .add_payment(
+            Amount::from(100).with_unit(CurrencyUnit::Sat),
+            unique_string(),
+            None,
+        )
+        .unwrap();
+    tx.update_mint_quote(&mut current).await.unwrap();
+    tx.commit().await.unwrap();
+
+    stale
+        .add_payment(
+            Amount::from(50).with_unit(CurrencyUnit::Sat),
+            unique_string(),
+            None,
+        )
+        .unwrap();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let err = tx.update_mint_quote(&mut stale).await.unwrap_err();
+    assert!(matches!(err, Error::ConcurrentUpdate), "{err}");
+    tx.rollback().await.unwrap();
+
+    let stored = db.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    assert_eq!(stored.amount_paid().value(), 100);
+    assert_eq!(stored.payments.len(), 1);
+}
+
+/// A mint quote kept past its transaction can't overwrite an issuance recorded since.
+pub async fn update_mint_quote_refuses_stale_amount_issued<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let quote_id = stored_mint_quote(&db).await.id;
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut quote = tx.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    quote
+        .add_payment(
+            Amount::from(100).with_unit(CurrencyUnit::Sat),
+            unique_string(),
+            None,
+        )
+        .unwrap();
+    tx.update_mint_quote(&mut quote).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut stale = tx.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut current = tx.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    current
+        .add_issuance(Amount::from(40).with_unit(CurrencyUnit::Sat))
+        .unwrap();
+    tx.update_mint_quote(&mut current).await.unwrap();
+    tx.commit().await.unwrap();
+
+    stale
+        .add_issuance(Amount::from(10).with_unit(CurrencyUnit::Sat))
+        .unwrap();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let err = tx.update_mint_quote(&mut stale).await.unwrap_err();
+    assert!(matches!(err, Error::ConcurrentUpdate), "{err}");
+    tx.rollback().await.unwrap();
+
+    let stored = db.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    assert_eq!(stored.amount_issued().value(), 40);
+    assert_eq!(stored.issuance.len(), 1);
+}
+
+/// A stale write blocked by another writer's uncommitted update is refused once that writer commits.
+///
+/// Both writers load the quote in an earlier transaction, so neither holds the lock from that read.
+/// Both get past their foreign key checks and the second waits on the guarded `UPDATE`, so a guard
+/// that compared the totals before that `UPDATE` would let it through.
+///
+/// This holds a row lock while another transaction writes, so it needs a database that allows
+/// concurrent writers.
+pub async fn stale_mint_quote_write_waits_for_lock_then_is_refused(db: DynMintDatabase) {
+    let mint_quote = MintQuote::new(
+        None,
+        unique_string(),
+        cashu::CurrencyUnit::Sat,
+        None,
+        0,
+        PaymentIdentifier::CustomId(unique_string()),
+        None,
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        Amount::new(0, cashu::CurrencyUnit::Sat),
+        cashu::PaymentMethod::Known(KnownMethod::Bolt12),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+    );
+    let quote_id = mint_quote.id.clone();
+
+    let mut tx = db.begin_transaction().await.unwrap();
+    tx.add_mint_quote(mint_quote).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin_transaction().await.unwrap();
+    let mut stale = tx.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = db.begin_transaction().await.unwrap();
+    let mut current = tx.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+
+    let mut holder = db.begin_transaction().await.unwrap();
+    current
+        .add_payment(
+            Amount::from(100).with_unit(CurrencyUnit::Sat),
+            unique_string(),
+            None,
+        )
+        .unwrap();
+    holder.update_mint_quote(&mut current).await.unwrap();
+
+    let writer = tokio::spawn({
+        let db = db.clone();
+        async move {
+            stale
+                .add_payment(
+                    Amount::from(50).with_unit(CurrencyUnit::Sat),
+                    unique_string(),
+                    None,
+                )
+                .unwrap();
+            let mut tx = db.begin_transaction().await.unwrap();
+            let result = tx.update_mint_quote(&mut stale).await;
+            tx.rollback().await.unwrap();
+            result
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !writer.is_finished(),
+        "stale write did not wait for the transaction holding the row lock"
+    );
+
+    holder.commit().await.unwrap();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("stale write remained blocked")
+        .expect("writer task");
+    assert!(matches!(result, Err(Error::ConcurrentUpdate)));
+
+    let stored = db.get_mint_quote(&quote_id).await.unwrap().unwrap();
+    assert_eq!(stored.amount_paid().value(), 100);
+    assert_eq!(stored.payments.len(), 1);
 }
 
 /// Test concurrent quote batches acquire row locks in a consistent order.
